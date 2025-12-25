@@ -1,7 +1,9 @@
 [package]
 name = "dlp-sync"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Real-time synchronization of delegation records via Laserstream"
+readme = "README.md"
 
 [dependencies]
 futures = "0.3"
