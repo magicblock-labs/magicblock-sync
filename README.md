@@ -1,4 +1,4 @@
-# dlp-sync
+# magicblock-sync
 
 Real-time synchronization of delegation records states via Laserstream. 
 

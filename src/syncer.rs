@@ -6,7 +6,7 @@ use std::{
 
 use futures::StreamExt;
 use helius_laserstream::{
-    client, LaserstreamConfig, LaserstreamError,
+    client,
     grpc::{
         subscribe_request_filter_accounts_filter::Filter, subscribe_update::UpdateOneof,
         SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
@@ -14,6 +14,7 @@ use helius_laserstream::{
         SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
     solana::storage::confirmed_block::CompiledInstruction,
+    LaserstreamConfig, LaserstreamError,
 };
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
@@ -31,8 +32,8 @@ const DELEGATION_PROGRAM: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 
 /// Delegation program pubkey in bytes.
 const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
-    31, 53, 226, 191, 87, 11, 233, 198, 246, 12, 164, 36, 215, 66, 119, 191, 169, 92, 87, 72, 207,
-    12, 78, 46, 180, 166, 193, 92, 63, 34, 74, 41,
+    181, 183, 0, 225, 242, 87, 58, 192, 204, 6, 34, 1, 52, 74, 207, 151, 184, 53, 6, 235, 140, 229,
+    25, 152, 204, 98, 126, 24, 147, 128, 167, 62,
 ];
 
 /// Size of a delegation record account in bytes.
@@ -57,7 +58,8 @@ const MAX_PENDING_UPDATES: usize = 8192;
 const MAX_RECONNECT_ATTEMPTS: u32 = 16;
 
 /// Stream type alias for Laserstream updates.
-type LaserStream = Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
+type LaserStream =
+    Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
 
 /// Internal message types for sync requests.
 pub(crate) enum SyncRequest {
