@@ -1,8 +1,8 @@
 [package]
-name = "dlp-sync"
+name = "magicblock-sync"
 version = "0.1.0"
 edition = "2021"
-description = "Real-time synchronization of delegation records via Laserstream"
+description = "Real-time synchronization of magicblock delegation records"
 readme = "README.md"
 
 [dependencies]
