@@ -1,36 +1,26 @@
-use std::pin::Pin;
+use std::collections::HashMap;
 
 use futures::StreamExt;
 use helius_laserstream::{
-    grpc::{subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateTransaction},
+    grpc::{
+        subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterTransactions,
+        SubscribeUpdate, SubscribeUpdateTransaction,
+    },
     solana::storage::confirmed_block::CompiledInstruction,
-    LaserstreamError,
+    LaserstreamConfig, LaserstreamError,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
-use crate::types::{AccountUpdate, Pubkey};
+use crate::types::{AccountUpdate, DlpSyncError, Pubkey};
+use crate::{
+    connect,
+    consts::{
+        DELEGATION_PROGRAM, DELEGATION_PROGRAM_PUBKEY, DELEGATION_RECORD_ACCOUNT_INDEX,
+        DISCRIMINATOR_LEN, UNDELEGATE_DISCRIMINATOR,
+    },
+};
 
-/// Delegation program pubkey in bytes.
-const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
-    181, 183, 0, 225, 242, 87, 58, 192, 204, 6, 34, 1, 52, 74, 207, 151, 184, 53, 6, 235, 140, 229,
-    25, 152, 204, 98, 126, 24, 147, 128, 167, 62,
-];
-
-/// Instruction discriminator for undelegate operations.
-const UNDELEGATE_DISCRIMINATOR: u8 = 3;
-
-/// Length of an instruction discriminator (Anchor programs).
-const DISCRIMINATOR_LEN: usize = 8;
-
-/// Index of the delegation record account in undelegate instruction accounts.
-const DELEGATION_RECORD_ACCOUNT_INDEX: usize = 6;
-
-/// Maximum pending account/transaction updates.
-const MAX_PENDING_UPDATES: usize = 8192;
-
-/// Stream type alias for Laserstream updates.
-pub type LaserStream =
-    Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
+pub use crate::connect::LaserStream;
 
 /// Synchronization service for delegation program transactions.
 ///
@@ -44,24 +34,50 @@ pub struct DlpTransactionSyncer {
 }
 
 impl DlpTransactionSyncer {
-    /// Creates a new transaction syncer.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - The Laserstream update stream.
-    ///
-    /// # Returns
-    ///
-    /// Returns the syncer and a receiver for account updates.
-    pub fn new(stream: LaserStream) -> (Self, Receiver<AccountUpdate>) {
-        let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
+    /// Creates transaction filters for undelegation monitoring.
+    pub fn create_filters() -> HashMap<String, SubscribeRequestFilterTransactions> {
+        let mut transactions = HashMap::new();
 
-        let syncer = Self {
-            stream,
-            updates: updates_tx,
+        // Subscribe to undelegation transactions
+        let tx_filter = SubscribeRequestFilterTransactions {
+            account_include: vec![DELEGATION_PROGRAM.into()],
+            ..Default::default()
+        };
+        transactions.insert("undelegations".into(), tx_filter);
+
+        transactions
+    }
+
+    /// Establishes a connection to the Laserstream for transaction monitoring.
+    ///
+    /// Creates filters for undelegation transactions and establishes the connection
+    /// using the shared connect module.
+    pub async fn connect(
+        config: LaserstreamConfig,
+        sender: Sender<AccountUpdate>,
+    ) -> Result<Self, DlpSyncError> {
+        let transactions = Self::create_filters();
+
+        let request = SubscribeRequest {
+            accounts: HashMap::new(),
+            slots: HashMap::new(),
+            transactions,
+            ..Default::default()
         };
 
-        (syncer, updates_rx)
+        let stream = connect::connect(&config, request).await?;
+
+        Ok(Self {
+            stream,
+            updates: sender,
+        })
+    }
+
+    /// Processes a single transaction update.
+    ///
+    /// Extracts undelegation events and sends them via the update channel.
+    pub(crate) fn process(&self, txn: SubscribeUpdateTransaction) {
+        self.handle_transaction_update(txn);
     }
 
     /// Main event loop for the transaction synchronization service.

@@ -39,11 +39,14 @@
 //! ```
 
 mod channels;
+mod consts;
+mod connect;
 mod syncer;
 mod transaction_syncer;
 mod types;
 
 pub use channels::{DlpSyncChannelsInit, DlpSyncChannelsRequester};
+pub use connect::LaserStream;
 pub use syncer::DlpSyncer;
-pub use transaction_syncer::{DlpTransactionSyncer, LaserStream};
+pub use transaction_syncer::DlpTransactionSyncer;
 pub use types::{AccountUpdate, DlpSyncError, Pubkey, Slot};

@@ -1,65 +1,26 @@
-use std::{
-    collections::{HashMap, HashSet},
-    pin::Pin,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
 use helius_laserstream::{
-    client,
     grpc::{
         subscribe_request_filter_accounts_filter::Filter, subscribe_update::UpdateOneof,
         SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-        SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
-        SubscribeUpdateAccount, SubscribeUpdateTransaction,
+        SubscribeUpdate, SubscribeUpdateAccount,
     },
-    solana::storage::confirmed_block::CompiledInstruction,
     LaserstreamConfig, LaserstreamError,
 };
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
-    time,
 };
 
 use crate::channels::DlpSyncChannelsInit;
+use crate::connect;
+use crate::consts::{
+    DELEGATION_PROGRAM, DELEGATION_RECORD_SIZE, MAX_PENDING_REQUESTS, MAX_PENDING_UPDATES,
+    MAX_RECONNECT_ATTEMPTS, PUBKEY_LEN,
+};
+use crate::transaction_syncer::DlpTransactionSyncer;
 use crate::types::{AccountUpdate, DlpSyncError, Pubkey, Slot};
-
-/// Size of a Solana public key in bytes.
-const PUBKEY_LEN: usize = 32;
-
-/// Delegation program address.
-const DELEGATION_PROGRAM: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
-
-/// Delegation program pubkey in bytes.
-const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
-    181, 183, 0, 225, 242, 87, 58, 192, 204, 6, 34, 1, 52, 74, 207, 151, 184, 53, 6, 235, 140, 229,
-    25, 152, 204, 98, 126, 24, 147, 128, 167, 62,
-];
-
-/// Size of a delegation record account in bytes.
-const DELEGATION_RECORD_SIZE: u64 = 96;
-
-/// Instruction discriminator for undelegate operations.
-const UNDELEGATE_DISCRIMINATOR: u8 = 3;
-
-/// Length of an instruction discriminator (Anchor programs).
-const DISCRIMINATOR_LEN: usize = 8;
-
-/// Index of the delegation record account in undelegate instruction accounts.
-const DELEGATION_RECORD_ACCOUNT_INDEX: usize = 6;
-
-/// Maximum pending subscription/unsubscription requests.
-const MAX_PENDING_REQUESTS: usize = 256;
-
-/// Maximum pending account/transaction updates.
-const MAX_PENDING_UPDATES: usize = 8192;
-
-/// Maximum reconnection attempts to the Laserstream.
-const MAX_RECONNECT_ATTEMPTS: u32 = 16;
-
-/// Stream type alias for Laserstream updates.
-type LaserStream =
-    Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
 
 /// Internal message types for sync requests.
 pub(crate) enum SyncRequest {
@@ -82,13 +43,15 @@ pub struct DlpSyncer {
     /// Set of currently subscribed delegation records.
     subscriptions: HashSet<Pubkey>,
     /// The Laserstream update stream.
-    stream: LaserStream,
+    stream: connect::LaserStream,
     /// Receiver for incoming subscription requests.
     requests: Receiver<SyncRequest>,
     /// Sender for broadcasting updates to subscribers.
     updates: Sender<AccountUpdate>,
     /// Current slot number.
     slot: Slot,
+    /// Transaction syncer for handling undelegation events.
+    transaction_syncer: DlpTransactionSyncer,
 }
 
 impl DlpSyncer {
@@ -118,7 +81,8 @@ impl DlpSyncer {
         let (requests_tx, requests_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
         let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
 
-        let stream = Self::connect(config).await?;
+        let stream = Self::connect(&config).await?;
+        let transaction_syncer = DlpTransactionSyncer::connect(config, updates_tx.clone()).await?;
 
         let syncer = Self {
             subscriptions: HashSet::new(),
@@ -126,6 +90,7 @@ impl DlpSyncer {
             requests: requests_rx,
             updates: updates_tx,
             slot: 0,
+            transaction_syncer,
         };
 
         tokio::spawn(syncer.run());
@@ -183,7 +148,7 @@ impl DlpSyncer {
         match update {
             Account(acc) => self.handle_account_update(acc),
             Slot(slot) => self.slot = slot.slot,
-            Transaction(txn) => self.handle_transaction_update(txn),
+            Transaction(txn) => self.transaction_syncer.process(txn),
             _ => {}
         }
     }
@@ -215,57 +180,15 @@ impl DlpSyncer {
         }
     }
 
-    /// Handles a transaction update, extracting undelegations.
-    fn handle_transaction_update(&self, txn: SubscribeUpdateTransaction) {
-        let Some(message) = txn
-            .transaction
-            .and_then(|t| t.transaction.zip(t.meta))
-            .and_then(|(t, m)| m.err.is_none().then_some(t.message))
-            .flatten()
-        else {
-            return;
-        };
-
-        let accounts = &message.account_keys;
-
-        let is_undelegate = |ix: &CompiledInstruction| {
-            let program_id = accounts.get(ix.program_id_index as usize)?;
-            (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
-
-            let (discriminator, _) = ix.data.split_at_checked(DISCRIMINATOR_LEN)?;
-            (discriminator[0] == UNDELEGATE_DISCRIMINATOR).then_some(())?;
-
-            ix.accounts
-                .get(DELEGATION_RECORD_ACCOUNT_INDEX)
-                .and_then(|&idx| accounts.get(idx as usize))
-        };
-
-        for record_bytes in message.instructions.iter().filter_map(is_undelegate) {
-            let Ok(record) = Pubkey::try_from(record_bytes.as_slice()) else {
-                continue;
-            };
-
-            let update = AccountUpdate::Undelegated {
-                record,
-                slot: txn.slot,
-            };
-
-            if let Err(error) = self.updates.try_send(update) {
-                tracing::error!(%error, "failed to send undelegation update");
-            }
-        }
-    }
-
     /// Establishes a connection to the Laserstream and performs health check.
     ///
     /// Subscribes to:
     /// - Account updates for delegation records (by owner and data size)
-    /// - Transaction updates that touch the delegation program
     /// - Slot updates for tracking confirmed slots
-    async fn connect(config: LaserstreamConfig) -> Result<LaserStream, DlpSyncError> {
+    /// - Transaction filters from DlpTransactionSyncer
+    async fn connect(config: &LaserstreamConfig) -> Result<connect::LaserStream, DlpSyncError> {
         let mut accounts = HashMap::new();
         let mut slots = HashMap::new();
-        let mut transactions = HashMap::new();
 
         // Subscribe to delegation record accounts
         let account_filter = SubscribeRequestFilterAccounts {
@@ -277,15 +200,11 @@ impl DlpSyncer {
         };
         accounts.insert("delegations".into(), account_filter);
 
-        // Subscribe to undelegation transactions
-        let tx_filter = SubscribeRequestFilterTransactions {
-            account_include: vec![DELEGATION_PROGRAM.into()],
-            ..Default::default()
-        };
-        transactions.insert("undelegations".into(), tx_filter);
-
         // Subscribe to all slot updates
         slots.insert("slots".into(), Default::default());
+
+        // Get transaction filters from transaction syncer
+        let transactions = DlpTransactionSyncer::create_filters();
 
         let request = SubscribeRequest {
             accounts,
@@ -294,25 +213,6 @@ impl DlpSyncer {
             ..Default::default()
         };
 
-        let (stream, handle) = client::subscribe(config, request);
-        let mut stream = Box::pin(stream);
-
-        // Send ping to establish connection
-        handle
-            .write(SubscribeRequest {
-                ping: Some(SubscribeRequestPing { id: 0 }),
-                ..Default::default()
-            })
-            .await
-            .map_err(DlpSyncError::LaserStream)?;
-
-        // Health check: wait for first update with timeout
-        time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .map_err(|_| DlpSyncError::Connection("health check timed out"))?
-            .ok_or_else(|| DlpSyncError::Connection("stream closed before first update"))?
-            .map_err(DlpSyncError::LaserStream)?;
-
-        Ok(stream)
+        connect::connect(config, request).await
     }
 }
