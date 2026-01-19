@@ -40,8 +40,10 @@
 
 mod channels;
 mod syncer;
+mod transaction_syncer;
 mod types;
 
 pub use channels::{DlpSyncChannelsInit, DlpSyncChannelsRequester};
 pub use syncer::DlpSyncer;
+pub use transaction_syncer::{DlpTransactionSyncer, LaserStream};
 pub use types::{AccountUpdate, DlpSyncError, Pubkey, Slot};
