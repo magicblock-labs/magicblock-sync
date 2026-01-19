@@ -35,24 +35,11 @@ pub struct DlpTransactionSyncer {
 
 impl DlpTransactionSyncer {
     /// Creates transaction filters for undelegation monitoring.
-    pub fn create_filters() -> HashMap<String, SubscribeRequestFilterTransactions> {
-        let mut transactions = HashMap::new();
-
-        // Subscribe to undelegation transactions
-        let tx_filter = SubscribeRequestFilterTransactions {
-            account_include: vec![DELEGATION_PROGRAM.into()],
-            ..Default::default()
-        };
-        transactions.insert("undelegations".into(), tx_filter);
-
-        transactions
-    }
-
     /// Establishes a connection to the Laserstream for transaction monitoring.
     ///
     /// Creates filters for undelegation transactions and establishes the connection
     /// using the shared connect module.
-    pub async fn connect(
+    pub async fn new(
         config: LaserstreamConfig,
         sender: Sender<AccountUpdate>,
     ) -> Result<Self, DlpSyncError> {
@@ -73,13 +60,6 @@ impl DlpTransactionSyncer {
         })
     }
 
-    /// Processes a single transaction update.
-    ///
-    /// Extracts undelegation events and sends them via the update channel.
-    pub(crate) fn process(&self, txn: SubscribeUpdateTransaction) {
-        self.handle_transaction_update(txn);
-    }
-
     /// Main event loop for the transaction synchronization service.
     ///
     /// Processes updates from the Laserstream until the stream closes.
@@ -89,6 +69,19 @@ impl DlpTransactionSyncer {
         }
 
         let _ = self.updates.send(AccountUpdate::SyncTerminated).await;
+    }
+
+    fn create_filters() -> HashMap<String, SubscribeRequestFilterTransactions> {
+        let mut transactions = HashMap::new();
+
+        // Subscribe to undelegation transactions
+        let tx_filter = SubscribeRequestFilterTransactions {
+            account_include: vec![DELEGATION_PROGRAM.into()],
+            ..Default::default()
+        };
+        transactions.insert("undelegations".into(), tx_filter);
+
+        transactions
     }
 
     /// Handles an update from the Laserstream.

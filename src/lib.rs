@@ -39,8 +39,8 @@
 //! ```
 
 mod channels;
-mod consts;
 mod connect;
+mod consts;
 mod syncer;
 mod transaction_syncer;
 mod types;

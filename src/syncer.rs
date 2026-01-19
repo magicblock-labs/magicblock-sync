@@ -9,9 +9,7 @@ use helius_laserstream::{
     },
     LaserstreamConfig, LaserstreamError,
 };
-use tokio::{
-    sync::mpsc::{self, Receiver, Sender},
-};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::channels::DlpSyncChannelsInit;
 use crate::connect;
@@ -50,8 +48,6 @@ pub struct DlpSyncer {
     updates: Sender<AccountUpdate>,
     /// Current slot number.
     slot: Slot,
-    /// Transaction syncer for handling undelegation events.
-    transaction_syncer: DlpTransactionSyncer,
 }
 
 impl DlpSyncer {
@@ -82,7 +78,7 @@ impl DlpSyncer {
         let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
 
         let stream = Self::connect(&config).await?;
-        let transaction_syncer = DlpTransactionSyncer::connect(config, updates_tx.clone()).await?;
+        let transaction_syncer = DlpTransactionSyncer::new(config, updates_tx.clone()).await?;
 
         let syncer = Self {
             subscriptions: HashSet::new(),
@@ -90,9 +86,9 @@ impl DlpSyncer {
             requests: requests_rx,
             updates: updates_tx,
             slot: 0,
-            transaction_syncer,
         };
 
+        tokio::spawn(transaction_syncer.run());
         tokio::spawn(syncer.run());
 
         Ok(crate::channels::DlpSyncChannels {
@@ -148,7 +144,6 @@ impl DlpSyncer {
         match update {
             Account(acc) => self.handle_account_update(acc),
             Slot(slot) => self.slot = slot.slot,
-            Transaction(txn) => self.transaction_syncer.process(txn),
             _ => {}
         }
     }
@@ -203,13 +198,9 @@ impl DlpSyncer {
         // Subscribe to all slot updates
         slots.insert("slots".into(), Default::default());
 
-        // Get transaction filters from transaction syncer
-        let transactions = DlpTransactionSyncer::create_filters();
-
         let request = SubscribeRequest {
             accounts,
             slots,
-            transactions,
             ..Default::default()
         };
 

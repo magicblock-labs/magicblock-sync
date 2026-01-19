@@ -19,7 +19,10 @@ pub type LaserStream =
 ///
 /// Takes a config and subscription request, sends a ping to establish the connection,
 /// and performs a health check to ensure the stream is working.
-pub async fn connect(config: &LaserstreamConfig, request: SubscribeRequest) -> Result<LaserStream, DlpSyncError> {
+pub async fn connect(
+    config: &LaserstreamConfig,
+    request: SubscribeRequest,
+) -> Result<LaserStream, DlpSyncError> {
     let (stream, handle) = client::subscribe(config.clone(), request);
     let mut stream = Box::pin(stream);
 
