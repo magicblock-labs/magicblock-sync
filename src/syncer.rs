@@ -10,10 +10,8 @@ use helius_laserstream::{
     grpc::{
         subscribe_request_filter_accounts_filter::Filter, subscribe_update::UpdateOneof,
         SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-        SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
-        SubscribeUpdateAccount, SubscribeUpdateTransaction,
+        SubscribeRequestPing, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
-    solana::storage::confirmed_block::CompiledInstruction,
     LaserstreamConfig, LaserstreamError,
 };
 use tokio::{
@@ -23,10 +21,10 @@ use tokio::{
 
 use crate::channels::DlpSyncChannelsInit;
 use crate::consts::{
-    DELEGATION_PROGRAM, DELEGATION_PROGRAM_PUBKEY, DELEGATION_RECORD_ACCOUNT_INDEX,
-    DELEGATION_RECORD_SIZE, DISCRIMINATOR_LEN, MAX_PENDING_REQUESTS, MAX_PENDING_UPDATES,
-    MAX_RECONNECT_ATTEMPTS, PUBKEY_LEN, UNDELEGATE_DISCRIMINATOR,
+    DELEGATION_PROGRAM, DELEGATION_RECORD_SIZE, MAX_PENDING_REQUESTS, MAX_PENDING_UPDATES,
+    MAX_RECONNECT_ATTEMPTS, PUBKEY_LEN,
 };
+use crate::transaction_syncer;
 use crate::types::{AccountUpdate, DlpSyncError, Pubkey, Slot};
 
 /// Stream type alias for Laserstream updates.
@@ -189,38 +187,8 @@ impl DlpSyncer {
 
     /// Handles a transaction update, extracting undelegations.
     fn handle_transaction_update(&self, txn: SubscribeUpdateTransaction) {
-        let Some(message) = txn
-            .transaction
-            .and_then(|t| t.transaction.zip(t.meta))
-            .and_then(|(t, m)| m.err.is_none().then_some(t.message))
-            .flatten()
-        else {
-            return;
-        };
-
-        let accounts = &message.account_keys;
-
-        let is_undelegate = |ix: &CompiledInstruction| {
-            let program_id = accounts.get(ix.program_id_index as usize)?;
-            (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
-
-            let (discriminator, _) = ix.data.split_at_checked(DISCRIMINATOR_LEN)?;
-            (discriminator[0] == UNDELEGATE_DISCRIMINATOR).then_some(())?;
-
-            ix.accounts
-                .get(DELEGATION_RECORD_ACCOUNT_INDEX)
-                .and_then(|&idx| accounts.get(idx as usize))
-        };
-
-        for record_bytes in message.instructions.iter().filter_map(is_undelegate) {
-            let Ok(record) = Pubkey::try_from(record_bytes.as_slice()) else {
-                continue;
-            };
-
-            let update = AccountUpdate::Undelegated {
-                record,
-                slot: txn.slot,
-            };
+        for (record, slot) in transaction_syncer::process_update(&txn) {
+            let update = AccountUpdate::Undelegated { record, slot };
 
             if let Err(error) = self.updates.try_send(update) {
                 tracing::error!(%error, "failed to send undelegation update");
@@ -237,7 +205,6 @@ impl DlpSyncer {
     async fn connect(config: LaserstreamConfig) -> Result<LaserStream, DlpSyncError> {
         let mut accounts = HashMap::new();
         let mut slots = HashMap::new();
-        let mut transactions = HashMap::new();
 
         // Subscribe to delegation record accounts
         let account_filter = SubscribeRequestFilterAccounts {
@@ -250,11 +217,7 @@ impl DlpSyncer {
         accounts.insert("delegations".into(), account_filter);
 
         // Subscribe to undelegation transactions
-        let tx_filter = SubscribeRequestFilterTransactions {
-            account_include: vec![DELEGATION_PROGRAM.into()],
-            ..Default::default()
-        };
-        transactions.insert("undelegations".into(), tx_filter);
+        let transactions = transaction_syncer::create_filter();
 
         // Subscribe to all slot updates
         slots.insert("slots".into(), Default::default());

@@ -1,7 +1,5 @@
 //! Stateless helpers for processing undelegation transactions.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use helius_laserstream::{
