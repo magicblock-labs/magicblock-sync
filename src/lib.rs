@@ -41,7 +41,7 @@
 mod channels;
 mod consts;
 mod syncer;
-mod transaction_syncer;
+pub mod transaction_syncer;
 mod types;
 
 pub use channels::{DlpSyncChannelsInit, DlpSyncChannelsRequester};
