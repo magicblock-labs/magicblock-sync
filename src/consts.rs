@@ -34,3 +34,20 @@ pub(crate) const MAX_PENDING_UPDATES: usize = 8192;
 
 /// Maximum reconnection attempts to the Laserstream.
 pub(crate) const MAX_RECONNECT_ATTEMPTS: u32 = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegation_program_pubkey_matches_string() {
+        let decoded = bs58::decode(DELEGATION_PROGRAM)
+            .into_vec()
+            .expect("valid base58");
+        assert_eq!(
+            decoded.as_slice(),
+            DELEGATION_PROGRAM_PUBKEY,
+            "DELEGATION_PROGRAM base58 string does not match DELEGATION_PROGRAM_PUBKEY bytes"
+        );
+    }
+}
