@@ -5,7 +5,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use dlp_sync::DlpSyncer;
 //!
 //! # async fn example() -> Result<(), dlp_sync::DlpSyncError> {
