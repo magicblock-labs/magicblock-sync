@@ -39,6 +39,7 @@
 //! ```
 
 mod channels;
+mod consts;
 mod syncer;
 mod types;
 
