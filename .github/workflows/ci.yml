@@ -22,7 +22,7 @@ jobs:
       - name: Setup Rust nightly for formatting
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
