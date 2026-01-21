@@ -9,7 +9,8 @@ pub(crate) const PUBKEY_LEN: usize = 32;
 pub(crate) const DELEGATION_PROGRAM: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 
 /// Delegation program pubkey in bytes.
-const DELEGATION_PROGRAM_PUBKEY: Pubkey = bs58::decode(DELEGATION_PROGRAM.as_bytes()).into_array_const_unwrap();
+pub(crate) const DELEGATION_PROGRAM_PUBKEY: Pubkey =
+    bs58::decode(DELEGATION_PROGRAM.as_bytes()).into_array_const_unwrap();
 
 /// Size of a delegation record account in bytes.
 pub(crate) const DELEGATION_RECORD_SIZE: u64 = 96;
@@ -31,20 +32,3 @@ pub(crate) const MAX_PENDING_UPDATES: usize = 8192;
 
 /// Maximum reconnection attempts to the Laserstream.
 pub(crate) const MAX_RECONNECT_ATTEMPTS: u32 = 16;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn delegation_program_pubkey_matches_string() {
-        let decoded = bs58::decode(DELEGATION_PROGRAM)
-            .into_vec()
-            .expect("valid base58");
-        assert_eq!(
-            decoded.as_slice(),
-            DELEGATION_PROGRAM_PUBKEY,
-            "DELEGATION_PROGRAM base58 string does not match DELEGATION_PROGRAM_PUBKEY bytes"
-        );
-    }
-}

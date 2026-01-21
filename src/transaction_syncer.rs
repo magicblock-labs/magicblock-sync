@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use either::Either;
 use helius_laserstream::{
     grpc::{SubscribeRequestFilterTransactions, SubscribeUpdateTransaction},
     solana::storage::confirmed_block::CompiledInstruction,
@@ -43,7 +44,7 @@ pub fn process_update(txn: &SubscribeUpdateTransaction) -> impl Iterator<Item = 
 
     let is_undelegate = |ix: &CompiledInstruction| {
         let program_id = accounts.get(ix.program_id_index as usize)?;
-        (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
+        (program_id == &DELEGATION_PROGRAM_PUBKEY).then_some(())?;
 
         let (discriminator, _) = ix.data.split_at_checked(DISCRIMINATOR_LEN)?;
         (discriminator[0] == UNDELEGATE_DISCRIMINATOR).then_some(())?;
@@ -139,7 +140,7 @@ mod tests {
         let instructions = vec![create_undelegate_instruction(1, 2)];
         let txn = create_txn_update(100, account_keys, instructions, None);
 
-        let result = process_update(&txn);
+        let result = process_update(&txn).collect::<Vec<Pubkey>>();
 
         assert_eq!(result.len(), 1);
         let expected_record: Pubkey = record.as_slice().try_into().unwrap();
@@ -153,7 +154,7 @@ mod tests {
         let instructions = vec![create_other_instruction(1)];
         let txn = create_txn_update(100, account_keys, instructions, None);
 
-        let result = process_update(&txn);
+        let result = process_update(&txn).collect::<Vec<Pubkey>>();
 
         assert!(result.is_empty());
     }
@@ -169,7 +170,7 @@ mod tests {
         };
         let txn = create_txn_update(100, account_keys, vec![malformed_ix], None);
 
-        let result = process_update(&txn);
+        let result = process_update(&txn).collect::<Vec<Pubkey>>();
 
         assert!(result.is_empty());
     }
@@ -194,7 +195,7 @@ mod tests {
         ];
         let txn = create_txn_update(200, account_keys, instructions, None);
 
-        let result = process_update(&txn);
+        let result = process_update(&txn).collect::<Vec<Pubkey>>();
 
         assert_eq!(result.len(), 3);
         let expected1: Pubkey = record1.as_slice().try_into().unwrap();
@@ -223,7 +224,7 @@ mod tests {
         ];
         let txn = create_txn_update(300, account_keys, instructions, None);
 
-        let result = process_update(&txn);
+        let result = process_update(&txn).collect::<Vec<Pubkey>>();
 
         assert_eq!(result.len(), 1);
         let expected_record: Pubkey = record.as_slice().try_into().unwrap();
