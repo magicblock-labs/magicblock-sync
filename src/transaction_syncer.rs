@@ -28,8 +28,8 @@ pub fn create_filter() -> HashMap<String, SubscribeRequestFilterTransactions> {
 
 /// Processes a transaction update and extracts undelegated pubkeys.
 ///
-/// Returns a Vec of (record_pubkey, slot) tuples for each undelegation found.
-pub fn process_update(txn: &SubscribeUpdateTransaction) -> Vec<(Pubkey, u64)> {
+/// Returns a Vec of record_pubkeys for each undelegation found.
+pub fn process_update(txn: &SubscribeUpdateTransaction) -> Vec<Pubkey> {
     let mut undelegations = Vec::new();
 
     let Some(message) = txn
@@ -57,7 +57,7 @@ pub fn process_update(txn: &SubscribeUpdateTransaction) -> Vec<(Pubkey, u64)> {
 
     for record_bytes in message.instructions.iter().filter_map(is_undelegate) {
         if let Ok(record) = Pubkey::try_from(record_bytes.as_slice()) {
-            undelegations.push((record, txn.slot));
+            undelegations.push(record);
         }
     }
 
@@ -146,7 +146,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         let expected_record: Pubkey = record.as_slice().try_into().unwrap();
-        assert_eq!(result[0], (expected_record, 100));
+        assert_eq!(result[0], expected_record);
     }
 
     #[test]
@@ -203,9 +203,9 @@ mod tests {
         let expected1: Pubkey = record1.as_slice().try_into().unwrap();
         let expected2: Pubkey = record2.as_slice().try_into().unwrap();
         let expected3: Pubkey = record3.as_slice().try_into().unwrap();
-        assert_eq!(result[0], (expected1, 200));
-        assert_eq!(result[1], (expected2, 200));
-        assert_eq!(result[2], (expected3, 200));
+        assert_eq!(result[0], expected1);
+        assert_eq!(result[1], expected2);
+        assert_eq!(result[2], expected3);
     }
 
     #[test]
@@ -230,6 +230,6 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         let expected_record: Pubkey = record.as_slice().try_into().unwrap();
-        assert_eq!(result[0], (expected_record, 300));
+        assert_eq!(result[0], expected_record);
     }
 }

@@ -187,7 +187,8 @@ impl DlpSyncer {
 
     /// Handles a transaction update, extracting undelegations.
     fn handle_transaction_update(&self, txn: SubscribeUpdateTransaction) {
-        for (record, slot) in transaction_syncer::process_update(&txn) {
+        let slot = txn.slot;
+        for record in transaction_syncer::process_update(&txn) {
             let update = AccountUpdate::Undelegated { record, slot };
 
             if let Err(error) = self.updates.try_send(update) {
