@@ -9,10 +9,7 @@ pub(crate) const PUBKEY_LEN: usize = 32;
 pub(crate) const DELEGATION_PROGRAM: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 
 /// Delegation program pubkey in bytes.
-pub(crate) const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
-    181, 183, 0, 225, 242, 87, 58, 192, 204, 6, 34, 1, 52, 74, 207, 151, 184, 53, 6, 235, 140, 229,
-    25, 152, 204, 98, 126, 24, 147, 128, 167, 62,
-];
+const DELEGATION_PROGRAM_PUBKEY: Pubkey = bs58::decode(DELEGATION_PROGRAM.as_bytes()).into_array_const_unwrap();
 
 /// Size of a delegation record account in bytes.
 pub(crate) const DELEGATION_RECORD_SIZE: u64 = 96;

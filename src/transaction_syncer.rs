@@ -29,16 +29,14 @@ pub fn create_filter() -> HashMap<String, SubscribeRequestFilterTransactions> {
 /// Processes a transaction update and extracts undelegated pubkeys.
 ///
 /// Returns a Vec of record_pubkeys for each undelegation found.
-pub fn process_update(txn: &SubscribeUpdateTransaction) -> Vec<Pubkey> {
-    let mut undelegations = Vec::new();
-
+pub fn process_update(txn: &SubscribeUpdateTransaction) -> impl Iterator<Item = Pubkey> + '_ {
     let Some(message) = txn
         .transaction
         .as_ref()
         .and_then(|t| t.transaction.as_ref().zip(t.meta.as_ref()))
         .and_then(|(t, m)| m.err.is_none().then_some(t.message.as_ref()).flatten())
     else {
-        return undelegations;
+        return Either::Left(std::iter::empty());
     };
 
     let accounts = &message.account_keys;
@@ -55,13 +53,12 @@ pub fn process_update(txn: &SubscribeUpdateTransaction) -> Vec<Pubkey> {
             .and_then(|&idx| accounts.get(idx as usize))
     };
 
-    for record_bytes in message.instructions.iter().filter_map(is_undelegate) {
-        if let Ok(record) = Pubkey::try_from(record_bytes.as_slice()) {
-            undelegations.push(record);
-        }
-    }
-
-    undelegations
+    let undelegations = message
+        .instructions
+        .iter()
+        .filter_map(is_undelegate)
+        .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok());
+    Either::Right(undelegations)
 }
 
 #[cfg(test)]
