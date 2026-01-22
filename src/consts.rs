@@ -22,7 +22,7 @@ pub(crate) const UNDELEGATE_DISCRIMINATOR: u8 = 3;
 pub(crate) const DISCRIMINATOR_LEN: usize = 8;
 
 /// Index of the delegation record account in undelegate instruction accounts.
-pub(crate) const DELEGATION_RECORD_ACCOUNT_INDEX: usize = 6;
+pub(crate) const DELEGATION_RECORD_ACCOUNT_INDEX: usize = 7;
 
 /// Maximum pending subscription/unsubscription requests.
 pub(crate) const MAX_PENDING_REQUESTS: usize = 256;
