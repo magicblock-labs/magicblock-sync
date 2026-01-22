@@ -6,6 +6,8 @@ description = "Real-time synchronization of magicblock delegation records"
 readme = "README.md"
 
 [dependencies]
+bs58 = "0.5.1"
+either = "1.15.0"
 futures = "0.3"
 helius-laserstream = "0.1.5"
 tokio = { version = "1.0", features = ["sync", "macros"] }

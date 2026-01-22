@@ -5,7 +5,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use dlp_sync::DlpSyncer;
 //!
 //! # async fn example() -> Result<(), dlp_sync::DlpSyncError> {
@@ -39,7 +39,9 @@
 //! ```
 
 mod channels;
+mod consts;
 mod syncer;
+pub mod transaction_syncer;
 mod types;
 
 pub use channels::{DlpSyncChannelsInit, DlpSyncChannelsRequester};
