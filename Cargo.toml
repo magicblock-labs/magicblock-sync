@@ -7,6 +7,6 @@ readme = "README.md"
 
 [dependencies]
 futures = "0.3"
-helius-laserstream = "0.1.5"
+helius-laserstream = { git = "https://github.com/magicblock-labs/laserstream-sdk", branch = "v0.2.8+conn-fix" } # rust version "0.1.5" + conn fix
 tokio = { version = "1.0", features = ["sync", "macros"] }
 tracing = "0.1"
