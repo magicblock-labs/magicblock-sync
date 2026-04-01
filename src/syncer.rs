@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
     pin::Pin,
     time::Duration,
 };
@@ -14,7 +15,7 @@ use helius_laserstream::{
         SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
     solana::storage::confirmed_block::CompiledInstruction,
-    LaserstreamConfig, LaserstreamError,
+    LaserstreamConfig, LaserstreamError, StreamHandle,
 };
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
@@ -58,8 +59,24 @@ const MAX_PENDING_UPDATES: usize = 8192;
 const MAX_RECONNECT_ATTEMPTS: u32 = 16;
 
 /// Stream type alias for Laserstream updates.
-type LaserStream =
-    Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
+type Laser = Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
+
+pub struct LaserStream {
+    stream: Laser,
+    _handle: StreamHandle,
+}
+
+impl Deref for LaserStream {
+    type Target = Laser;
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+impl DerefMut for LaserStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
 
 /// Internal message types for sync requests.
 pub(crate) enum SyncRequest {
@@ -294,11 +311,11 @@ impl DlpSyncer {
             ..Default::default()
         };
 
-        let (stream, handle) = client::subscribe(config, request);
+        let (stream, _handle) = client::subscribe(config, request);
         let mut stream = Box::pin(stream);
 
         // Send ping to establish connection
-        handle
+        _handle
             .write(SubscribeRequest {
                 ping: Some(SubscribeRequestPing { id: 0 }),
                 ..Default::default()
@@ -312,6 +329,7 @@ impl DlpSyncer {
             .map_err(|_| DlpSyncError::Connection("health check timed out"))?
             .ok_or_else(|| DlpSyncError::Connection("stream closed before first update"))?
             .map_err(DlpSyncError::LaserStream)?;
+        let stream = LaserStream { stream, _handle };
 
         Ok(stream)
     }
