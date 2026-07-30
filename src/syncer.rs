@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::{Deref, DerefMut},
     pin::Pin,
     time::Duration,
@@ -58,6 +58,12 @@ const MAX_PENDING_UPDATES: usize = 8192;
 /// Maximum reconnection attempts to the Laserstream.
 const MAX_RECONNECT_ATTEMPTS: u32 = 16;
 
+/// Number of slots of recent updates retained for replay on subscribe.
+const REPLAY_RETENTION_SLOTS: u64 = 256;
+
+/// Maximum number of updates retained for replay.
+const REPLAY_BUFFER_CAPACITY: usize = 4096;
+
 /// Stream type alias for Laserstream updates.
 type Laser = Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, LaserstreamError>> + Send>>;
 
@@ -106,6 +112,8 @@ pub struct DlpSyncer {
     updates: Sender<AccountUpdate>,
     /// Current slot number.
     slot: Slot,
+    /// Recent updates kept for replay on subscribe.
+    replay: ReplayBuffer,
 }
 
 impl DlpSyncer {
@@ -143,6 +151,7 @@ impl DlpSyncer {
             requests: requests_rx,
             updates: updates_tx,
             slot: 0,
+            replay: ReplayBuffer::default(),
         };
 
         tokio::spawn(syncer.run());
@@ -175,6 +184,14 @@ impl DlpSyncer {
             SyncRequest::Subscribe { record, slot_tx } => {
                 self.subscriptions.insert(record);
                 let _ = slot_tx.send(self.slot);
+                // Replay buffered updates for this record: an update that landed
+                // just before the subscription was registered would otherwise be
+                // lost, leaving subscribers with a stale initial fetch forever.
+                for update in self.replay.updates_for(&record) {
+                    if let Err(error) = self.updates.try_send(update) {
+                        tracing::error!(%error, "failed to replay buffered update");
+                    }
+                }
             }
             SyncRequest::Unsubscribe(record) => {
                 self.subscriptions.remove(&record);
@@ -199,27 +216,35 @@ impl DlpSyncer {
 
         match update {
             Account(acc) => self.handle_account_update(acc),
-            Slot(slot) => self.slot = slot.slot,
+            Slot(slot) => {
+                self.slot = slot.slot;
+                self.replay.prune(self.slot);
+            }
             Transaction(txn) => self.handle_transaction_update(txn),
             _ => {}
         }
     }
 
     /// Handles an account (delegation record) update.
-    fn handle_account_update(&self, acc: SubscribeUpdateAccount) {
+    fn handle_account_update(&mut self, acc: SubscribeUpdateAccount) {
         let Some(account) = acc.account else { return };
 
         if account.pubkey.len() != PUBKEY_LEN {
             return;
         }
 
-        if !self.subscriptions.contains(account.pubkey.as_slice()) {
-            return;
-        }
-
         let Ok(record) = Pubkey::try_from(account.pubkey.as_slice()) else {
             return;
         };
+
+        // Buffer unconditionally: the subscription for this record may register
+        // moments from now, in which case the update is replayed on subscribe.
+        self.replay
+            .push(record, acc.slot, Some(account.data.clone()));
+
+        if !self.subscriptions.contains(&record) {
+            return;
+        }
 
         let update = AccountUpdate::Delegated {
             record,
@@ -233,7 +258,7 @@ impl DlpSyncer {
     }
 
     /// Handles a transaction update, extracting undelegations.
-    fn handle_transaction_update(&self, txn: SubscribeUpdateTransaction) {
+    fn handle_transaction_update(&mut self, txn: SubscribeUpdateTransaction) {
         let Some(message) = txn
             .transaction
             .and_then(|t| t.transaction.zip(t.meta))
@@ -257,10 +282,15 @@ impl DlpSyncer {
                 .and_then(|&idx| accounts.get(idx as usize))
         };
 
-        for record_bytes in message.instructions.iter().filter_map(is_undelegate) {
-            let Ok(record) = Pubkey::try_from(record_bytes.as_slice()) else {
-                continue;
-            };
+        let records: Vec<Pubkey> = message
+            .instructions
+            .iter()
+            .filter_map(is_undelegate)
+            .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
+            .collect();
+
+        for record in records {
+            self.replay.push(record, txn.slot, None);
 
             let update = AccountUpdate::Undelegated {
                 record,
@@ -332,5 +362,132 @@ impl DlpSyncer {
         let stream = LaserStream { stream, _handle };
 
         Ok(stream)
+    }
+}
+
+/// A single buffered delegation record update.
+struct BufferedUpdate {
+    /// The delegation record pubkey.
+    record: Pubkey,
+    /// The slot at which the update occurred.
+    slot: Slot,
+    /// The record account data, or `None` for an undelegation.
+    data: Option<Vec<u8>>,
+}
+
+/// A bounded buffer of recent delegation record updates.
+///
+/// The Laserstream subscription is global (filtered by owner and data size), so
+/// the syncer observes every delegation record update — including ones for
+/// records no subscriber has registered yet. Updates are buffered here and
+/// replayed on subscribe, closing the window in which an update lands on chain
+/// moments before its record's subscription is registered and would otherwise
+/// be dropped by the client-side filter.
+#[derive(Default)]
+struct ReplayBuffer {
+    updates: VecDeque<BufferedUpdate>,
+}
+
+impl ReplayBuffer {
+    /// Buffers an update, evicting the oldest one when at capacity.
+    fn push(&mut self, record: Pubkey, slot: Slot, data: Option<Vec<u8>>) {
+        if self.updates.len() == REPLAY_BUFFER_CAPACITY {
+            self.updates.pop_front();
+        }
+        self.updates.push_back(BufferedUpdate { record, slot, data });
+    }
+
+    /// Drops buffered updates older than the retention window.
+    fn prune(&mut self, current_slot: Slot) {
+        let cutoff = current_slot.saturating_sub(REPLAY_RETENTION_SLOTS);
+        while self.updates.front().is_some_and(|u| u.slot < cutoff) {
+            self.updates.pop_front();
+        }
+    }
+
+    /// Returns the buffered updates for a record, oldest first.
+    fn updates_for(&self, record: &Pubkey) -> impl Iterator<Item = AccountUpdate> + '_ {
+        let record = *record;
+        self.updates
+            .iter()
+            .filter(move |u| u.record == record)
+            .map(move |u| match &u.data {
+                Some(data) => AccountUpdate::Delegated {
+                    record,
+                    data: data.clone(),
+                    slot: u.slot,
+                },
+                None => AccountUpdate::Undelegated {
+                    record,
+                    slot: u.slot,
+                },
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RECORD_A: Pubkey = [1; 32];
+    const RECORD_B: Pubkey = [2; 32];
+
+    fn slots(buffer: &ReplayBuffer, record: &Pubkey) -> Vec<Slot> {
+        buffer
+            .updates_for(record)
+            .map(|u| match u {
+                AccountUpdate::Delegated { slot, .. } => slot,
+                AccountUpdate::Undelegated { slot, .. } => slot,
+                AccountUpdate::SyncTerminated => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replays_only_matching_records_in_order() {
+        let mut buffer = ReplayBuffer::default();
+        buffer.push(RECORD_A, 10, Some(vec![1]));
+        buffer.push(RECORD_B, 11, Some(vec![2]));
+        buffer.push(RECORD_A, 12, None);
+
+        assert_eq!(slots(&buffer, &RECORD_A), vec![10, 12]);
+        assert_eq!(slots(&buffer, &RECORD_B), vec![11]);
+        assert!(slots(&buffer, &[3; 32]).is_empty());
+    }
+
+    #[test]
+    fn replays_undelegations_as_undelegated() {
+        let mut buffer = ReplayBuffer::default();
+        buffer.push(RECORD_A, 10, None);
+
+        let updates: Vec<_> = buffer.updates_for(&RECORD_A).collect();
+        assert!(matches!(
+            updates.as_slice(),
+            [AccountUpdate::Undelegated { slot: 10, .. }]
+        ));
+    }
+
+    #[test]
+    fn prunes_updates_outside_retention_window() {
+        let mut buffer = ReplayBuffer::default();
+        buffer.push(RECORD_A, 10, Some(vec![]));
+        buffer.push(RECORD_A, 20, Some(vec![]));
+
+        buffer.prune(REPLAY_RETENTION_SLOTS + 15);
+        assert_eq!(slots(&buffer, &RECORD_A), vec![20]);
+
+        buffer.prune(REPLAY_RETENTION_SLOTS + 25);
+        assert!(slots(&buffer, &RECORD_A).is_empty());
+    }
+
+    #[test]
+    fn evicts_oldest_at_capacity() {
+        let mut buffer = ReplayBuffer::default();
+        for slot in 0..=REPLAY_BUFFER_CAPACITY as u64 {
+            buffer.push(RECORD_A, slot, Some(vec![]));
+        }
+
+        assert_eq!(buffer.updates.len(), REPLAY_BUFFER_CAPACITY);
+        assert_eq!(buffer.updates.front().unwrap().slot, 1);
     }
 }
