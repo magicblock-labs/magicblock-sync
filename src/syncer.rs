@@ -398,19 +398,27 @@ impl ReplayBuffer {
     }
 
     /// Drops buffered updates older than the retention window.
+    ///
+    /// Scans the whole buffer: entries arrive in stream order, which is not
+    /// guaranteed to match slot order, so expired entries may sit behind
+    /// retained ones.
     fn prune(&mut self, current_slot: Slot) {
         let cutoff = current_slot.saturating_sub(REPLAY_RETENTION_SLOTS);
-        while self.updates.front().is_some_and(|u| u.slot < cutoff) {
-            self.updates.pop_front();
-        }
+        self.updates.retain(|u| u.slot >= cutoff);
     }
 
-    /// Returns the buffered updates for a record, oldest first.
+    /// Returns the buffered updates for a record, oldest slot first.
+    ///
+    /// Matching entries are sorted by slot rather than replayed in arrival
+    /// order, so consumers that don't merge slot-monotonically still end up
+    /// with the newest state last.
     fn updates_for(&self, record: &Pubkey) -> impl Iterator<Item = AccountUpdate> + '_ {
         let record = *record;
-        self.updates
-            .iter()
-            .filter(move |u| u.record == record)
+        let mut matching: Vec<&BufferedUpdate> =
+            self.updates.iter().filter(|u| u.record == record).collect();
+        matching.sort_by_key(|u| u.slot);
+        matching
+            .into_iter()
             .map(move |u| match &u.data {
                 Some(data) => AccountUpdate::Delegated {
                     record,
@@ -478,6 +486,25 @@ mod tests {
 
         buffer.prune(REPLAY_RETENTION_SLOTS + 25);
         assert!(slots(&buffer, &RECORD_A).is_empty());
+    }
+
+    #[test]
+    fn replays_out_of_order_arrivals_sorted_by_slot() {
+        let mut buffer = ReplayBuffer::default();
+        buffer.push(RECORD_A, 12, Some(vec![]));
+        buffer.push(RECORD_A, 10, None);
+
+        assert_eq!(slots(&buffer, &RECORD_A), vec![10, 12]);
+    }
+
+    #[test]
+    fn prunes_expired_updates_behind_retained_ones() {
+        let mut buffer = ReplayBuffer::default();
+        buffer.push(RECORD_A, 20, Some(vec![]));
+        buffer.push(RECORD_A, 10, Some(vec![]));
+
+        buffer.prune(REPLAY_RETENTION_SLOTS + 15);
+        assert_eq!(slots(&buffer, &RECORD_A), vec![20]);
     }
 
     #[test]
