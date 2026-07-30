@@ -6,9 +6,9 @@
 //! # Usage
 //!
 //! ```no_run
-//! use dlp_sync::DlpSyncer;
+//! use magicblock_sync::DlpSyncer;
 //!
-//! # async fn example() -> Result<(), dlp_sync::DlpSyncError> {
+//! # async fn example() -> Result<(), magicblock_sync::DlpSyncError> {
 //! let channels = DlpSyncer::start(
 //!     "http://localhost:8000".to_string(),
 //!     "your-api-key".to_string()
@@ -25,13 +25,13 @@
 //! // Receive updates
 //! while let Some(update) = updates.recv().await {
 //!     match update {
-//!         dlp_sync::AccountUpdate::Delegated { record, slot, .. } => {
+//!         magicblock_sync::AccountUpdate::Delegated { record, slot, .. } => {
 //!             println!("Delegation at slot {}", slot);
 //!         }
-//!         dlp_sync::AccountUpdate::Undelegated { record, slot } => {
+//!         magicblock_sync::AccountUpdate::Undelegated { record, slot } => {
 //!             println!("Undelegation at slot {}", slot);
 //!         }
-//!         dlp_sync::AccountUpdate::SyncTerminated => break,
+//!         magicblock_sync::AccountUpdate::SyncTerminated => break,
 //!     }
 //! }
 //! # Ok(())
