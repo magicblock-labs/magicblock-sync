@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
     time::Duration,
@@ -9,8 +10,11 @@ use futures::StreamExt;
 use helius_laserstream::{
     client,
     grpc::{
-        subscribe_request_filter_accounts_filter::Filter, subscribe_update::UpdateOneof,
-        SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
+        subscribe_request_filter_accounts_filter::Filter,
+        subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
+        subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
+        SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
+        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterSlots,
         SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
         SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
@@ -37,8 +41,11 @@ const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
     25, 152, 204, 98, 126, 24, 147, 128, 167, 62,
 ];
 
-/// Size of a delegation record account in bytes.
-const DELEGATION_RECORD_SIZE: u64 = 96;
+/// Discriminator of a delegation record account (`AccountDiscriminator::DelegationRecord`),
+/// stored as a little-endian u64 at offset 0. Records carrying appended
+/// post-delegation actions exceed the base 96-byte size, so filtering by
+/// discriminator rather than datasize is required to observe them.
+const DELEGATION_RECORD_DISCRIMINATOR: u64 = 100;
 
 /// Instruction discriminator for undelegate operations.
 const UNDELEGATE_DISCRIMINATOR: u8 = 3;
@@ -57,6 +64,17 @@ const MAX_PENDING_UPDATES: usize = 8192;
 
 /// Maximum reconnection attempts to the Laserstream.
 const MAX_RECONNECT_ATTEMPTS: u32 = 16;
+
+/// Initial delay between stream re-establishment attempts.
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum delay between stream re-establishment attempts.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// Slots subtracted from the last observed slot when resuming a dropped
+/// stream: updates are not slot-ordered, so an update older than the latest
+/// slot notification may still have been in flight when the stream dropped.
+const RESUME_SAFETY_MARGIN_SLOTS: u64 = 32;
 
 /// Number of slots of recent updates retained for replay on subscribe.
 const REPLAY_RETENTION_SLOTS: u64 = 256;
@@ -106,8 +124,12 @@ pub struct DlpSyncer {
     subscriptions: HashSet<Pubkey>,
     /// The Laserstream update stream.
     stream: LaserStream,
+    /// Connection configuration, kept for stream re-establishment.
+    config: LaserstreamConfig,
     /// Receiver for incoming subscription requests.
     requests: Receiver<SyncRequest>,
+    /// Whether the request channel has been closed by all requesters.
+    requests_closed: bool,
     /// Sender for broadcasting updates to subscribers.
     updates: Sender<AccountUpdate>,
     /// Current slot number.
@@ -143,12 +165,14 @@ impl DlpSyncer {
         let (requests_tx, requests_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
         let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
 
-        let stream = Self::connect(config).await?;
+        let stream = Self::connect(config.clone(), None).await?;
 
         let syncer = Self {
             subscriptions: HashSet::new(),
             stream,
+            config,
             requests: requests_rx,
+            requests_closed: false,
             updates: updates_tx,
             slot: 0,
             replay: ReplayBuffer::default(),
@@ -164,18 +188,130 @@ impl DlpSyncer {
 
     /// Main event loop for the synchronization service.
     ///
-    /// Handles both incoming requests from subscribers and updates from the Laserstream.
+    /// Handles both incoming requests from subscribers and updates from the
+    /// Laserstream. When the stream ends it is re-established indefinitely
+    /// with backoff; the loop only exits once no subscriber can observe
+    /// further updates (the update channel is closed).
     async fn run(mut self) {
         loop {
+            if self.updates.is_closed() {
+                break;
+            }
+
             tokio::select! {
-                Some(update) = self.stream.next() => self.handle_update(update),
-                Some(request) = self.requests.recv() => self.handle_request(request),
-                else => break,
+                update = self.stream.next() => match update {
+                    Some(update) => self.handle_update(update),
+                    None => {
+                        if !self.reconnect().await {
+                            break;
+                        }
+                    }
+                },
+                request = self.requests.recv(), if !self.requests_closed => match request {
+                    Some(request) => self.handle_request(request),
+                    None => self.requests_closed = true,
+                },
             }
         }
 
         // Notify all subscribers that the sync has terminated.
         let _ = self.updates.send(AccountUpdate::SyncTerminated).await;
+    }
+
+    /// Re-establishes the Laserstream after the current stream ends.
+    ///
+    /// First tries to resume from behind the last observed slot so no record
+    /// update is lost. If the server cannot replay that far back, falls back
+    /// to a fresh subscription and emits [`AccountUpdate::SyncInterrupted`] so
+    /// subscribers know continuity was lost and cached delegation state must
+    /// be revalidated. Retries indefinitely with exponential backoff.
+    ///
+    /// Returns `false` only when the update channel is closed and no
+    /// subscriber can observe further updates.
+    async fn reconnect(&mut self) -> bool {
+        tracing::warn!("laserstream ended; re-establishing");
+        let mut delay = RECONNECT_BASE_DELAY;
+
+        loop {
+            if self.updates.is_closed() {
+                return false;
+            }
+
+            // Resume behind the last slot notification: the stream is not
+            // slot-ordered, so an update older than that slot may still have
+            // been in flight when the stream dropped. Re-delivered updates
+            // are covered by the idempotency contract.
+            let resume_slot = (self.slot > 0)
+                .then(|| self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS).max(1));
+            let connect = Self::connect(self.config.clone(), resume_slot);
+            match self.serve_requests_during(connect).await {
+                Ok(stream) => {
+                    self.stream = stream;
+                    tracing::info!(from_slot = ?resume_slot, "laserstream re-established");
+                    // Without a slot watermark continuity cannot be proven:
+                    // updates delivered before the first slot notification
+                    // may have had successors in the disconnected interval.
+                    if resume_slot.is_none() {
+                        return self.send_interrupted().await;
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(?error, from_slot = ?resume_slot, "resume failed")
+                }
+            }
+
+            // The server may no longer retain the resume slot; a fresh
+            // subscription loses the updates in between, which subscribers
+            // must learn about to invalidate cached state.
+            if resume_slot.is_some() {
+                let connect = Self::connect(self.config.clone(), None);
+                match self.serve_requests_during(connect).await {
+                    Ok(stream) => {
+                        self.stream = stream;
+                        tracing::warn!(
+                            "laserstream re-established without replay; continuity lost"
+                        );
+                        return self.send_interrupted().await;
+                    }
+                    Err(error) => tracing::warn!(?error, "fresh reconnect failed"),
+                }
+            }
+
+            self.serve_requests_during(time::sleep(delay)).await;
+            delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+        }
+    }
+
+    /// Delivers the continuity-loss notice. The send blocks under
+    /// backpressure because dropping it would leave subscribers trusting
+    /// stale state. Returns `false` when the update channel is closed and
+    /// no subscriber can observe further updates.
+    async fn send_interrupted(&mut self) -> bool {
+        // Pre-gap replay entries are no longer trustworthy: a record buffered
+        // as delegated may have been undelegated during the missed interval,
+        // and replaying it on a later subscribe would restore stale state.
+        self.replay.clear();
+        self.updates
+            .send(AccountUpdate::SyncInterrupted)
+            .await
+            .is_ok()
+    }
+
+    /// Awaits `fut` while continuing to service subscription requests.
+    /// Subscribe/unsubscribe only touch local state, so they must not stall
+    /// (or fill the request channel) while the stream is being re-established.
+    async fn serve_requests_during<F: Future>(&mut self, fut: F) -> F::Output {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                request = self.requests.recv(), if !self.requests_closed => match request {
+                    Some(request) => self.handle_request(request),
+                    None => self.requests_closed = true,
+                },
+            }
+        }
     }
 
     /// Handles a subscription or unsubscription request.
@@ -303,44 +439,71 @@ impl DlpSyncer {
         }
     }
 
-    /// Establishes a connection to the Laserstream and performs health check.
+    /// Builds the Laserstream subscription request.
     ///
     /// Subscribes to:
-    /// - Account updates for delegation records (by owner and data size)
+    /// - Account updates for delegation records, matched by owner and the
+    ///   record discriminator at offset 0. A datasize filter would miss
+    ///   records that carry appended post-delegation actions, while an
+    ///   owner-only filter would match every delegated account.
     /// - Transaction updates that touch the delegation program
     /// - Slot updates for tracking confirmed slots
-    async fn connect(config: LaserstreamConfig) -> Result<LaserStream, DlpSyncError> {
+    ///
+    /// Updates are requested at confirmed commitment: record state consumed
+    /// at processed level could be rolled back with a fork.
+    ///
+    /// `from_slot` requests server-side replay from that slot to resume
+    /// after a disconnect without losing updates.
+    fn subscribe_request(from_slot: Option<Slot>) -> SubscribeRequest {
         let mut accounts = HashMap::new();
         let mut slots = HashMap::new();
         let mut transactions = HashMap::new();
 
-        // Subscribe to delegation record accounts
         let account_filter = SubscribeRequestFilterAccounts {
             owner: vec![DELEGATION_PROGRAM.into()],
             filters: vec![SubscribeRequestFilterAccountsFilter {
-                filter: Some(Filter::Datasize(DELEGATION_RECORD_SIZE)),
+                filter: Some(Filter::Memcmp(SubscribeRequestFilterAccountsFilterMemcmp {
+                    offset: 0,
+                    data: Some(MemcmpData::Bytes(
+                        DELEGATION_RECORD_DISCRIMINATOR.to_le_bytes().to_vec(),
+                    )),
+                })),
             }],
             ..Default::default()
         };
         accounts.insert("delegations".into(), account_filter);
 
-        // Subscribe to undelegation transactions
         let tx_filter = SubscribeRequestFilterTransactions {
             account_include: vec![DELEGATION_PROGRAM.into()],
             ..Default::default()
         };
         transactions.insert("undelegations".into(), tx_filter);
 
-        // Subscribe to all slot updates
-        slots.insert("slots".into(), Default::default());
+        // Only slots at the subscription's commitment level: the slot
+        // watermark drives the resume point, so tracking processed slots
+        // would resume ahead of confirmed updates that never arrived.
+        let slot_filter = SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(true),
+            ..Default::default()
+        };
+        slots.insert("slots".into(), slot_filter);
 
-        let request = SubscribeRequest {
+        SubscribeRequest {
             accounts,
             slots,
             transactions,
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            from_slot,
             ..Default::default()
-        };
+        }
+    }
 
+    /// Establishes a connection to the Laserstream and performs health check.
+    async fn connect(
+        config: LaserstreamConfig,
+        from_slot: Option<Slot>,
+    ) -> Result<LaserStream, DlpSyncError> {
+        let request = Self::subscribe_request(from_slot);
         let (stream, _handle) = client::subscribe(config, request);
         let mut stream = Box::pin(stream);
 
@@ -354,11 +517,16 @@ impl DlpSyncer {
             .map_err(DlpSyncError::LaserStream)?;
 
         // Health check: wait for first update with timeout
-        time::timeout(Duration::from_secs(5), stream.next())
+        let first = time::timeout(Duration::from_secs(5), stream.next())
             .await
             .map_err(|_| DlpSyncError::Connection("health check timed out"))?
             .ok_or_else(|| DlpSyncError::Connection("stream closed before first update"))?
             .map_err(DlpSyncError::LaserStream)?;
+
+        // The health-check item can be a real update (e.g. the first replayed
+        // record on a resume), not just the pong — put it back in front of
+        // the stream so it reaches the event loop.
+        let stream = Box::pin(futures::stream::once(std::future::ready(Ok(first))).chain(stream));
         let stream = LaserStream { stream, _handle };
 
         Ok(stream)
@@ -389,12 +557,18 @@ struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
+    /// Drops all buffered updates.
+    fn clear(&mut self) {
+        self.updates.clear();
+    }
+
     /// Buffers an update, evicting the oldest one when at capacity.
     fn push(&mut self, record: Pubkey, slot: Slot, data: Option<Vec<u8>>) {
         if self.updates.len() == REPLAY_BUFFER_CAPACITY {
             self.updates.pop_front();
         }
-        self.updates.push_back(BufferedUpdate { record, slot, data });
+        self.updates
+            .push_back(BufferedUpdate { record, slot, data });
     }
 
     /// Drops buffered updates older than the retention window.
@@ -417,19 +591,17 @@ impl ReplayBuffer {
         let mut matching: Vec<&BufferedUpdate> =
             self.updates.iter().filter(|u| u.record == record).collect();
         matching.sort_by_key(|u| u.slot);
-        matching
-            .into_iter()
-            .map(move |u| match &u.data {
-                Some(data) => AccountUpdate::Delegated {
-                    record,
-                    data: data.clone(),
-                    slot: u.slot,
-                },
-                None => AccountUpdate::Undelegated {
-                    record,
-                    slot: u.slot,
-                },
-            })
+        matching.into_iter().map(move |u| match &u.data {
+            Some(data) => AccountUpdate::Delegated {
+                record,
+                data: data.clone(),
+                slot: u.slot,
+            },
+            None => AccountUpdate::Undelegated {
+                record,
+                slot: u.slot,
+            },
+        })
     }
 }
 
@@ -446,9 +618,43 @@ mod tests {
             .map(|u| match u {
                 AccountUpdate::Delegated { slot, .. } => slot,
                 AccountUpdate::Undelegated { slot, .. } => slot,
-                AccountUpdate::SyncTerminated => unreachable!(),
+                AccountUpdate::SyncInterrupted | AccountUpdate::SyncTerminated => unreachable!(),
             })
             .collect()
+    }
+
+    #[test]
+    fn subscribe_request_filters_records_by_discriminator_at_confirmed() {
+        let request = DlpSyncer::subscribe_request(Some(42));
+
+        assert_eq!(request.commitment, Some(CommitmentLevel::Confirmed as i32));
+        assert_eq!(request.from_slot, Some(42));
+        assert_eq!(DlpSyncer::subscribe_request(None).from_slot, None);
+
+        let accounts = &request.accounts["delegations"];
+        assert_eq!(accounts.owner, vec![DELEGATION_PROGRAM.to_string()]);
+        let [filter] = accounts.filters.as_slice() else {
+            panic!("expected exactly one account filter");
+        };
+        let Some(Filter::Memcmp(memcmp)) = &filter.filter else {
+            panic!("expected a memcmp filter, got {:?}", filter.filter);
+        };
+        assert_eq!(memcmp.offset, 0);
+        assert_eq!(
+            memcmp.data,
+            Some(MemcmpData::Bytes(100u64.to_le_bytes().to_vec()))
+        );
+
+        let transactions = &request.transactions["undelegations"];
+        assert_eq!(
+            transactions.account_include,
+            vec![DELEGATION_PROGRAM.to_string()]
+        );
+        assert_eq!(
+            request.slots["slots"].filter_by_commitment,
+            Some(true),
+            "slot watermark must track the subscription commitment level"
+        );
     }
 
     #[test]
