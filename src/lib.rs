@@ -3,6 +3,18 @@
 //! This crate provides [`DlpSyncer`], an async service that subscribes to delegation program
 //! events on Solana and streams account and transaction updates to subscribers.
 //!
+//! # Consistency contract
+//!
+//! The syncer is a fast path over the live record stream, not a store of
+//! record state: it observes updates from the moment it connects and retains
+//! a bounded replay window. The absence of an update for a record is never
+//! evidence that the record does not exist or was undelegated — consumers
+//! must fall back to fetching the record when the syncer has nothing for it.
+//! An [`AccountUpdate::SyncInterrupted`] event means updates were lost;
+//! delegation state cached from earlier updates must be revalidated at the
+//! source. Updates replayed after a resume can repeat slots already seen, so
+//! consumers must apply updates idempotently.
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -30,6 +42,9 @@
 //!         }
 //!         magicblock_sync::AccountUpdate::Undelegated { record, slot } => {
 //!             println!("Undelegation at slot {}", slot);
+//!         }
+//!         magicblock_sync::AccountUpdate::SyncInterrupted => {
+//!             println!("Updates lost; revalidate cached delegation state");
 //!         }
 //!         magicblock_sync::AccountUpdate::SyncTerminated => break,
 //!     }

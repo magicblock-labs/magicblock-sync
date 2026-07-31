@@ -34,6 +34,10 @@ pub enum AccountUpdate {
         /// The slot at which the undelegation occurred.
         slot: Slot,
     },
+    /// The stream was re-established without replay: updates in between were
+    /// lost, so cached delegation state derived from earlier updates must be
+    /// revalidated at the source.
+    SyncInterrupted,
     /// The sync service has terminated.
     SyncTerminated,
 }
