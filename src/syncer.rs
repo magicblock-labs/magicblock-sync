@@ -14,8 +14,9 @@ use helius_laserstream::{
         subscribe_request_filter_accounts_filter_memcmp::Data as MemcmpData,
         subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
         SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterTransactions,
-        SubscribeRequestPing, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateTransaction,
+        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterSlots,
+        SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+        SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
     solana::storage::confirmed_block::CompiledInstruction,
     LaserstreamConfig, LaserstreamError, StreamHandle,
@@ -474,7 +475,14 @@ impl DlpSyncer {
         };
         transactions.insert("undelegations".into(), tx_filter);
 
-        slots.insert("slots".into(), Default::default());
+        // Only slots at the subscription's commitment level: the slot
+        // watermark drives the resume point, so tracking processed slots
+        // would resume ahead of confirmed updates that never arrived.
+        let slot_filter = SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(true),
+            ..Default::default()
+        };
+        slots.insert("slots".into(), slot_filter);
 
         SubscribeRequest {
             accounts,
@@ -633,7 +641,11 @@ mod tests {
             transactions.account_include,
             vec![DELEGATION_PROGRAM.to_string()]
         );
-        assert!(request.slots.contains_key("slots"));
+        assert_eq!(
+            request.slots["slots"].filter_by_commitment,
+            Some(true),
+            "slot watermark must track the subscription commitment level"
+        );
     }
 
     #[test]
