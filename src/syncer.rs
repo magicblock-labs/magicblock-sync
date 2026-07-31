@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
     time::Duration,
@@ -241,10 +242,17 @@ impl DlpSyncer {
             // are covered by the idempotency contract.
             let resume_slot = (self.slot > 0)
                 .then(|| self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS).max(1));
-            match Self::connect(self.config.clone(), resume_slot).await {
+            let connect = Self::connect(self.config.clone(), resume_slot);
+            match self.serve_requests_during(connect).await {
                 Ok(stream) => {
                     self.stream = stream;
                     tracing::info!(from_slot = ?resume_slot, "laserstream re-established");
+                    // Without a slot watermark continuity cannot be proven:
+                    // updates delivered before the first slot notification
+                    // may have had successors in the disconnected interval.
+                    if resume_slot.is_none() {
+                        return self.send_interrupted().await;
+                    }
                     return true;
                 }
                 Err(error) => {
@@ -256,31 +264,48 @@ impl DlpSyncer {
             // subscription loses the updates in between, which subscribers
             // must learn about to invalidate cached state.
             if resume_slot.is_some() {
-                match Self::connect(self.config.clone(), None).await {
+                let connect = Self::connect(self.config.clone(), None);
+                match self.serve_requests_during(connect).await {
                     Ok(stream) => {
                         self.stream = stream;
                         tracing::warn!(
                             "laserstream re-established without replay; continuity lost"
                         );
-                        // The interruption notice is the only signal that
-                        // cached state went stale — it must not be dropped
-                        // under backpressure, so wait for channel capacity.
-                        if self
-                            .updates
-                            .send(AccountUpdate::SyncInterrupted)
-                            .await
-                            .is_err()
-                        {
-                            return false;
-                        }
-                        return true;
+                        return self.send_interrupted().await;
                     }
                     Err(error) => tracing::warn!(?error, "fresh reconnect failed"),
                 }
             }
 
-            time::sleep(delay).await;
+            self.serve_requests_during(time::sleep(delay)).await;
             delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+        }
+    }
+
+    /// Delivers the continuity-loss notice. The send blocks under
+    /// backpressure because dropping it would leave subscribers trusting
+    /// stale state. Returns `false` when the update channel is closed and
+    /// no subscriber can observe further updates.
+    async fn send_interrupted(&mut self) -> bool {
+        self.updates
+            .send(AccountUpdate::SyncInterrupted)
+            .await
+            .is_ok()
+    }
+
+    /// Awaits `fut` while continuing to service subscription requests.
+    /// Subscribe/unsubscribe only touch local state, so they must not stall
+    /// (or fill the request channel) while the stream is being re-established.
+    async fn serve_requests_during<F: Future>(&mut self, fut: F) -> F::Output {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                request = self.requests.recv(), if !self.requests_closed => match request {
+                    Some(request) => self.handle_request(request),
+                    None => self.requests_closed = true,
+                },
+            }
         }
     }
 
