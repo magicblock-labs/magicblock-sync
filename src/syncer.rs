@@ -288,6 +288,10 @@ impl DlpSyncer {
     /// stale state. Returns `false` when the update channel is closed and
     /// no subscriber can observe further updates.
     async fn send_interrupted(&mut self) -> bool {
+        // Pre-gap replay entries are no longer trustworthy: a record buffered
+        // as delegated may have been undelegated during the missed interval,
+        // and replaying it on a later subscribe would restore stale state.
+        self.replay.clear();
         self.updates
             .send(AccountUpdate::SyncInterrupted)
             .await
@@ -553,6 +557,11 @@ struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
+    /// Drops all buffered updates.
+    fn clear(&mut self) {
+        self.updates.clear();
+    }
+
     /// Buffers an update, evicting the oldest one when at capacity.
     fn push(&mut self, record: Pubkey, slot: Slot, data: Option<Vec<u8>>) {
         if self.updates.len() == REPLAY_BUFFER_CAPACITY {
