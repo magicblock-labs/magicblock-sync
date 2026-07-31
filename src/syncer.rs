@@ -69,6 +69,11 @@ const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum delay between stream re-establishment attempts.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
+/// Slots subtracted from the last observed slot when resuming a dropped
+/// stream: updates are not slot-ordered, so an update older than the latest
+/// slot notification may still have been in flight when the stream dropped.
+const RESUME_SAFETY_MARGIN_SLOTS: u64 = 32;
+
 /// Number of slots of recent updates retained for replay on subscribe.
 const REPLAY_RETENTION_SLOTS: u64 = 256;
 
@@ -213,9 +218,9 @@ impl DlpSyncer {
 
     /// Re-establishes the Laserstream after the current stream ends.
     ///
-    /// First tries to resume from the last observed slot so no record update
-    /// is lost. If the server cannot replay that far back, falls back to a
-    /// fresh subscription and emits [`AccountUpdate::SyncInterrupted`] so
+    /// First tries to resume from behind the last observed slot so no record
+    /// update is lost. If the server cannot replay that far back, falls back
+    /// to a fresh subscription and emits [`AccountUpdate::SyncInterrupted`] so
     /// subscribers know continuity was lost and cached delegation state must
     /// be revalidated. Retries indefinitely with exponential backoff.
     ///
@@ -230,7 +235,12 @@ impl DlpSyncer {
                 return false;
             }
 
-            let resume_slot = (self.slot > 0).then_some(self.slot);
+            // Resume behind the last slot notification: the stream is not
+            // slot-ordered, so an update older than that slot may still have
+            // been in flight when the stream dropped. Re-delivered updates
+            // are covered by the idempotency contract.
+            let resume_slot = (self.slot > 0)
+                .then(|| self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS).max(1));
             match Self::connect(self.config.clone(), resume_slot).await {
                 Ok(stream) => {
                     self.stream = stream;
@@ -252,8 +262,16 @@ impl DlpSyncer {
                         tracing::warn!(
                             "laserstream re-established without replay; continuity lost"
                         );
-                        if let Err(error) = self.updates.try_send(AccountUpdate::SyncInterrupted) {
-                            tracing::error!(%error, "failed to send interruption notice");
+                        // The interruption notice is the only signal that
+                        // cached state went stale — it must not be dropped
+                        // under backpressure, so wait for channel capacity.
+                        if self
+                            .updates
+                            .send(AccountUpdate::SyncInterrupted)
+                            .await
+                            .is_err()
+                        {
+                            return false;
                         }
                         return true;
                     }
@@ -462,11 +480,16 @@ impl DlpSyncer {
             .map_err(DlpSyncError::LaserStream)?;
 
         // Health check: wait for first update with timeout
-        time::timeout(Duration::from_secs(5), stream.next())
+        let first = time::timeout(Duration::from_secs(5), stream.next())
             .await
             .map_err(|_| DlpSyncError::Connection("health check timed out"))?
             .ok_or_else(|| DlpSyncError::Connection("stream closed before first update"))?
             .map_err(DlpSyncError::LaserStream)?;
+
+        // The health-check item can be a real update (e.g. the first replayed
+        // record on a resume), not just the pong — put it back in front of
+        // the stream so it reaches the event loop.
+        let stream = Box::pin(futures::stream::once(std::future::ready(Ok(first))).chain(stream));
         let stream = LaserStream { stream, _handle };
 
         Ok(stream)
