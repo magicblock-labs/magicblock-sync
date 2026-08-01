@@ -625,7 +625,14 @@ impl DlpSyncer {
                     if self.mode == DeliveryMode::Firehose {
                         Self::deliver(&self.updates, update).await;
                     } else {
+                        // Buffer unconditionally so a subscription that
+                        // registers moments later replays it; deliver live
+                        // only to active subscriptions, matching the
+                        // account-side contract.
                         self.replay.push(record, txn.slot, None);
+                        if !self.subscriptions.contains(&record) {
+                            continue;
+                        }
                         if let Err(error) = self.updates.try_send(update) {
                             tracing::error!(
                                 %error,
@@ -1168,6 +1175,28 @@ mod tests {
             updates.try_recv().is_err(),
             "subscribed consumers key on record updates alone"
         );
+    }
+
+    #[tokio::test]
+    async fn subscribed_mode_delivers_undelegations_only_for_subscriptions() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Subscribed);
+
+        syncer
+            .handle_update(Ok(undelegate_tx_update(RECORD_B, 8)))
+            .await;
+        assert!(
+            updates.try_recv().is_err(),
+            "unsubscribed undelegations must not reach subscribed consumers"
+        );
+
+        syncer.subscriptions.insert(RECORD_B);
+        syncer
+            .handle_update(Ok(undelegate_tx_update(RECORD_B, 9)))
+            .await;
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::Undelegated { record, slot: 9 }) if record == RECORD_B
+        ));
     }
 
     #[tokio::test]
