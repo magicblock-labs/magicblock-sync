@@ -71,9 +71,11 @@ const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum delay between stream re-establishment attempts.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
-/// Slots subtracted from the last observed slot when resuming a dropped
-/// stream: updates are not slot-ordered, so an update older than the latest
-/// slot notification may still have been in flight when the stream dropped.
+/// Skew bound for the stream not being slot-ordered: an update older than
+/// the latest slot notification may still be in flight. Applied when
+/// resuming a dropped stream (resume that many slots behind the last
+/// observation) and when publishing firehose watermarks (claim only slots
+/// that far behind the last observation).
 const RESUME_SAFETY_MARGIN_SLOTS: u64 = 32;
 
 /// Number of slots of recent updates retained for replay on subscribe.
@@ -400,10 +402,16 @@ impl DlpSyncer {
             Slot(slot) => {
                 self.slot = slot.slot;
                 self.replay.prune(self.slot);
-                // The watermark is only meaningful delivered in-band, after
-                // every record update of the slots it covers.
+                // The stream is not slot-ordered: a slot notification can
+                // precede data updates from at-or-before that slot. Publish
+                // the watermark behind the observed slot by the same skew
+                // margin the resume logic assumes, so `SlotAdvanced(w)` only
+                // claims slots whose updates have already drained.
                 if self.mode == DeliveryMode::Firehose {
-                    Self::deliver(&self.updates, AccountUpdate::SlotAdvanced(self.slot)).await;
+                    let watermark = self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS);
+                    if watermark > 0 {
+                        Self::deliver(&self.updates, AccountUpdate::SlotAdvanced(watermark)).await;
+                    }
                 }
             }
             Transaction(txn) => self.handle_transaction_update(txn).await,
@@ -759,6 +767,42 @@ mod tests {
         }
     }
 
+    fn undelegate_tx_update(record: Pubkey, slot: Slot) -> SubscribeUpdate {
+        use helius_laserstream::{
+            grpc::{SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo},
+            solana::storage::confirmed_block::{Message, Transaction, TransactionStatusMeta},
+        };
+        let account_keys = vec![
+            vec![9u8; PUBKEY_LEN],
+            DELEGATION_PROGRAM_PUBKEY.to_vec(),
+            record.to_vec(),
+        ];
+        let instruction = CompiledInstruction {
+            program_id_index: 1,
+            // The record sits at DELEGATION_RECORD_ACCOUNT_INDEX (6).
+            accounts: vec![0, 0, 0, 0, 0, 0, 2],
+            data: vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0],
+        };
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(SubscribeUpdateTransactionInfo {
+                    transaction: Some(Transaction {
+                        message: Some(Message {
+                            account_keys,
+                            instructions: vec![instruction],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    meta: Some(TransactionStatusMeta::default()),
+                    ..Default::default()
+                }),
+                slot,
+            })),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn firehose_delivers_all_records_and_inband_watermarks() {
         let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
@@ -766,7 +810,10 @@ mod tests {
         syncer
             .handle_update(Ok(account_update(RECORD_A, 7, vec![1, 2, 3])))
             .await;
-        syncer.handle_update(Ok(slot_update(9))).await;
+        syncer
+            .handle_update(Ok(undelegate_tx_update(RECORD_B, 8)))
+            .await;
+        syncer.handle_update(Ok(slot_update(100))).await;
 
         assert!(matches!(
             updates.try_recv(),
@@ -774,12 +821,33 @@ mod tests {
         ));
         assert!(matches!(
             updates.try_recv(),
-            Ok(AccountUpdate::SlotAdvanced(9))
+            Ok(AccountUpdate::Undelegated { record, slot: 8 }) if record == RECORD_B
+        ));
+        // The watermark trails the observed slot by the skew margin: the
+        // stream is not slot-ordered, so a bare slot notification cannot
+        // prove that updates at or before it have all been delivered.
+        let expected = 100 - RESUME_SAFETY_MARGIN_SLOTS;
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::SlotAdvanced(w)) if w == expected
         ));
         assert!(
             syncer.replay.updates.is_empty(),
             "firehose mode must not buffer for replay"
         );
+    }
+
+    #[tokio::test]
+    async fn firehose_emits_no_watermark_within_the_skew_margin() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        syncer.handle_update(Ok(slot_update(9))).await;
+
+        assert!(
+            updates.try_recv().is_err(),
+            "slots inside the skew margin prove nothing"
+        );
+        assert_eq!(syncer.slot, 9);
     }
 
     #[tokio::test]
