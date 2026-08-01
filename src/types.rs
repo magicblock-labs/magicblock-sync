@@ -51,6 +51,8 @@ pub enum AccountUpdate {
     /// an owner program asked for the account to be undelegated, which the
     /// delegating validator should honor promptly.
     UndelegationRequested {
+        /// The `UndelegationRequest` account that was written.
+        request_pda: Pubkey,
         /// The delegated account the request is for.
         delegated_account: Pubkey,
         /// The first slot at which timeout rollback is allowed.

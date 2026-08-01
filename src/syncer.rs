@@ -516,6 +516,7 @@ impl DlpSyncer {
             let update = match parse_undelegation_request(&account.data) {
                 Some((delegated_account, expires_at_slot)) => {
                     AccountUpdate::UndelegationRequested {
+                        request_pda: record,
                         delegated_account,
                         expires_at_slot,
                         slot: acc.slot,
@@ -1147,10 +1148,11 @@ mod tests {
         assert!(matches!(
             updates.try_recv(),
             Ok(AccountUpdate::UndelegationRequested {
+                request_pda,
                 delegated_account,
                 expires_at_slot: 250,
                 slot: 9,
-            }) if delegated_account == RECORD_A
+            }) if request_pda == RECORD_B && delegated_account == RECORD_A
         ));
     }
 
