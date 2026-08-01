@@ -153,6 +153,8 @@ pub struct DlpSyncer {
     updates: Sender<AccountUpdate>,
     /// Current slot number.
     slot: Slot,
+    /// Highest watermark published to firehose consumers; 0 before the first.
+    watermark: Slot,
     /// Recent updates kept for replay on subscribe.
     replay: ReplayBuffer,
 }
@@ -225,6 +227,7 @@ impl DlpSyncer {
             requests_closed,
             updates: updates_tx,
             slot: 0,
+            watermark: 0,
             replay: ReplayBuffer::default(),
         };
 
@@ -409,7 +412,8 @@ impl DlpSyncer {
                 // claims slots whose updates have already drained.
                 if self.mode == DeliveryMode::Firehose {
                     let watermark = self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS);
-                    if watermark > 0 {
+                    if watermark > self.watermark {
+                        self.watermark = watermark;
                         Self::deliver(&self.updates, AccountUpdate::SlotAdvanced(watermark)).await;
                     }
                 }
@@ -426,6 +430,26 @@ impl DlpSyncer {
         if updates.send(update).await.is_err() {
             // Consumer gone; the run loop exits on the next iteration.
             tracing::warn!("update channel closed; dropping update");
+        }
+    }
+
+    /// Detects a violation of a published watermark: an update landing at or
+    /// before an already-claimed slot means the skew margin was insufficient
+    /// for this delivery, so the watermark contract was broken. Restore it by
+    /// voiding everything delivered so far -- consumers rebuild from live
+    /// updates and fall back to fetching in the meantime.
+    async fn check_watermark_violation(
+        watermark: Slot,
+        updates: &Sender<AccountUpdate>,
+        slot: Slot,
+    ) {
+        if watermark > 0 && slot <= watermark {
+            tracing::warn!(
+                slot,
+                watermark,
+                "update arrived at or before the published watermark; voiding delivered state"
+            );
+            Self::deliver(updates, AccountUpdate::SyncInterrupted).await;
         }
     }
 
@@ -451,6 +475,7 @@ impl DlpSyncer {
                 },
             )
             .await;
+            Self::check_watermark_violation(self.watermark, &self.updates, acc.slot).await;
             return;
         }
 
@@ -476,19 +501,28 @@ impl DlpSyncer {
 
     /// Handles a transaction update, extracting undelegations.
     async fn handle_transaction_update(&mut self, txn: SubscribeUpdateTransaction) {
-        let Some(message) = txn
-            .transaction
-            .and_then(|t| t.transaction.zip(t.meta))
-            .and_then(|(t, m)| m.err.is_none().then_some(t.message))
-            .flatten()
-        else {
+        let Some(info) = txn.transaction else { return };
+        let (Some(transaction), Some(meta)) = (info.transaction, info.meta) else {
+            return;
+        };
+        if meta.err.is_some() {
+            return;
+        }
+        let Some(message) = transaction.message else {
             return;
         };
 
-        let accounts = &message.account_keys;
+        // Instruction indexes resolve against the runtime account ordering:
+        // static keys, then lookup-table loaded writable, then readonly.
+        let accounts: Vec<&Vec<u8>> = message
+            .account_keys
+            .iter()
+            .chain(meta.loaded_writable_addresses.iter())
+            .chain(meta.loaded_readonly_addresses.iter())
+            .collect();
 
         let is_undelegate = |ix: &CompiledInstruction| {
-            let program_id = accounts.get(ix.program_id_index as usize)?;
+            let program_id = *accounts.get(ix.program_id_index as usize)?;
             (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
 
             let (discriminator, _) = ix.data.split_at_checked(DISCRIMINATOR_LEN)?;
@@ -496,7 +530,7 @@ impl DlpSyncer {
 
             ix.accounts
                 .get(DELEGATION_RECORD_ACCOUNT_INDEX)
-                .and_then(|&idx| accounts.get(idx as usize))
+                .and_then(|&idx| accounts.get(idx as usize).copied())
         };
 
         let records: Vec<Pubkey> = message
@@ -514,6 +548,7 @@ impl DlpSyncer {
 
             if self.mode == DeliveryMode::Firehose {
                 Self::deliver(&self.updates, update).await;
+                Self::check_watermark_violation(self.watermark, &self.updates, txn.slot).await;
                 continue;
             }
 
@@ -735,6 +770,7 @@ mod tests {
             requests_closed: true,
             updates: updates_tx,
             slot: 0,
+            watermark: 0,
             replay: ReplayBuffer::default(),
         };
         (syncer, updates_rx)
@@ -803,6 +839,44 @@ mod tests {
         }
     }
 
+    /// Same undelegation, but the delegation program and record are loaded
+    /// through an address lookup table (present only in the tx meta).
+    fn undelegate_tx_update_via_lookup_table(record: Pubkey, slot: Slot) -> SubscribeUpdate {
+        use helius_laserstream::{
+            grpc::{SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo},
+            solana::storage::confirmed_block::{Message, Transaction, TransactionStatusMeta},
+        };
+        // Static keys hold only the payer; program and record are ALT-loaded:
+        // runtime ordering is static, then writable-loaded, then readonly.
+        let instruction = CompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![0, 0, 0, 0, 0, 0, 1],
+            data: vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0],
+        };
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(SubscribeUpdateTransactionInfo {
+                    transaction: Some(Transaction {
+                        message: Some(Message {
+                            account_keys: vec![vec![9u8; PUBKEY_LEN]],
+                            instructions: vec![instruction],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    meta: Some(TransactionStatusMeta {
+                        loaded_writable_addresses: vec![record.to_vec()],
+                        loaded_readonly_addresses: vec![DELEGATION_PROGRAM_PUBKEY.to_vec()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                slot,
+            })),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn firehose_delivers_all_records_and_inband_watermarks() {
         let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
@@ -835,6 +909,56 @@ mod tests {
             syncer.replay.updates.is_empty(),
             "firehose mode must not buffer for replay"
         );
+    }
+
+    #[tokio::test]
+    async fn firehose_voids_state_when_an_update_lands_behind_the_watermark() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        syncer.handle_update(Ok(slot_update(100))).await;
+        let watermark = 100 - RESUME_SAFETY_MARGIN_SLOTS;
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::SlotAdvanced(w)) if w == watermark
+        ));
+
+        // A late update at a slot the watermark already claimed breaks the
+        // contract: it must be delivered AND all prior state voided.
+        syncer
+            .handle_update(Ok(account_update(RECORD_A, watermark, vec![1])))
+            .await;
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::Delegated { slot, .. }) if slot == watermark
+        ));
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::SyncInterrupted)
+        ));
+
+        // Updates ahead of the watermark do not trigger a violation.
+        syncer
+            .handle_update(Ok(account_update(RECORD_A, watermark + 1, vec![2])))
+            .await;
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::Delegated { .. })
+        ));
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn firehose_detects_undelegations_behind_lookup_tables() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        syncer
+            .handle_update(Ok(undelegate_tx_update_via_lookup_table(RECORD_B, 8)))
+            .await;
+
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::Undelegated { record, slot: 8 }) if record == RECORD_B
+        ));
     }
 
     #[tokio::test]
