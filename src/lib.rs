@@ -43,6 +43,7 @@
 //!         magicblock_sync::AccountUpdate::Undelegated { record, slot } => {
 //!             println!("Undelegation at slot {}", slot);
 //!         }
+//!         magicblock_sync::AccountUpdate::SlotAdvanced(_) => {} // firehose mode only
 //!         magicblock_sync::AccountUpdate::SyncInterrupted => {
 //!             println!("Updates lost; revalidate cached delegation state");
 //!         }
@@ -52,6 +53,18 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Firehose mode
+//!
+//! [`DlpSyncer::start_firehose`] delivers **every** delegation-record update
+//! on chain — no per-record subscriptions — interleaved with in-band
+//! [`AccountUpdate::SlotAdvanced`] watermarks: receiving `SlotAdvanced(s)`
+//! proves all record updates up to slot `s` were already delivered on the
+//! channel. Delivery is lossless (a slow consumer backpressures the stream
+//! instead of dropping updates), which lets a consumer maintain a mirror of
+//! record state: an entry unchanged while the watermark advances past slot
+//! `s` is the record's state at `s`. [`AccountUpdate::SyncInterrupted`]
+//! still voids all previously delivered state.
 
 mod channels;
 mod syncer;

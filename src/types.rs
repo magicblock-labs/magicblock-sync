@@ -34,6 +34,10 @@ pub enum AccountUpdate {
         /// The slot at which the undelegation occurred.
         slot: Slot,
     },
+    /// The confirmed slot advanced. Only emitted in firehose mode, in-band
+    /// with record updates: receiving `SlotAdvanced(s)` proves every record
+    /// update up to slot `s` has already been delivered on this channel.
+    SlotAdvanced(Slot),
     /// The stream was re-established without replay: updates in between were
     /// lost, so cached delegation state derived from earlier updates must be
     /// revalidated at the source.

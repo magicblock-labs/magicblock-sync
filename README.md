@@ -28,4 +28,8 @@ The syncer is a fast path over the live record stream, not a store of record
 state: absence of an update for a record is never evidence the record does
 not exist or was undelegated — fall back to fetching in that case.
 
+`DlpSyncer::start_firehose` instead delivers every record update on chain
+(no subscriptions) with in-band `SlotAdvanced` watermarks and lossless
+backpressure, for consumers that maintain a full record mirror.
+
 See `src/lib.rs` for API docs.

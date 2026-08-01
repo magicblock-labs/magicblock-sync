@@ -87,7 +87,8 @@ type Laser = Pin<Box<dyn futures::Stream<Item = Result<SubscribeUpdate, Laserstr
 
 pub struct LaserStream {
     stream: Laser,
-    _handle: StreamHandle,
+    /// Kept for the stream's lifetime; `None` only in tests.
+    _handle: Option<StreamHandle>,
 }
 
 impl Deref for LaserStream {
@@ -115,11 +116,27 @@ pub(crate) enum SyncRequest {
     Unsubscribe(Pubkey),
 }
 
+/// How updates are delivered to the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryMode {
+    /// Only updates for explicitly subscribed records are delivered;
+    /// updates are buffered for replay-on-subscribe and dropped (with an
+    /// error log) under backpressure.
+    Subscribed,
+    /// Every record update is delivered, plus in-band
+    /// [`AccountUpdate::SlotAdvanced`] watermarks. Delivery is lossless:
+    /// sends wait for channel capacity, because a silently dropped update
+    /// would let a mirror consumer serve stale state forever.
+    Firehose,
+}
+
 /// The main DLP synchronization service.
 ///
 /// Manages a connection to Laserstream and handles subscription requests
 /// from multiple subscribers. Updates are broadcast via an MPSC channel.
 pub struct DlpSyncer {
+    /// How updates are delivered to the consumer.
+    mode: DeliveryMode,
     /// Set of currently subscribed delegation records.
     subscriptions: HashSet<Pubkey>,
     /// The Laserstream update stream.
@@ -154,6 +171,37 @@ impl DlpSyncer {
     /// The service is spawned onto the current tokio runtime and will run
     /// until either the stream disconnects or all channel senders are dropped.
     pub async fn start(endpoint: String, key: String) -> Result<DlpSyncChannelsInit, DlpSyncError> {
+        let (requests_tx, requests_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
+        let updates_rx =
+            Self::launch(endpoint, key, DeliveryMode::Subscribed, requests_rx, false).await?;
+
+        Ok(crate::channels::DlpSyncChannels {
+            requests: requests_tx,
+            updates: updates_rx,
+        })
+    }
+
+    /// Starts the service in firehose mode: the returned channel carries
+    /// every delegation-record update on chain (no per-record subscriptions)
+    /// interleaved with [`AccountUpdate::SlotAdvanced`] watermarks. Delivery
+    /// is lossless — a slow consumer backpressures the stream instead of
+    /// dropping updates.
+    pub async fn start_firehose(
+        endpoint: String,
+        key: String,
+    ) -> Result<Receiver<AccountUpdate>, DlpSyncError> {
+        // The request sender is dropped: firehose mode has no subscriptions.
+        let (_requests_tx, requests_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
+        Self::launch(endpoint, key, DeliveryMode::Firehose, requests_rx, true).await
+    }
+
+    async fn launch(
+        endpoint: String,
+        key: String,
+        mode: DeliveryMode,
+        requests: Receiver<SyncRequest>,
+        requests_closed: bool,
+    ) -> Result<Receiver<AccountUpdate>, DlpSyncError> {
         let config = LaserstreamConfig {
             api_key: key,
             endpoint,
@@ -162,17 +210,17 @@ impl DlpSyncer {
             replay: true,
         };
 
-        let (requests_tx, requests_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
         let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
 
         let stream = Self::connect(config.clone(), None).await?;
 
         let syncer = Self {
+            mode,
             subscriptions: HashSet::new(),
             stream,
             config,
-            requests: requests_rx,
-            requests_closed: false,
+            requests,
+            requests_closed,
             updates: updates_tx,
             slot: 0,
             replay: ReplayBuffer::default(),
@@ -180,10 +228,7 @@ impl DlpSyncer {
 
         tokio::spawn(syncer.run());
 
-        Ok(crate::channels::DlpSyncChannels {
-            requests: requests_tx,
-            updates: updates_rx,
-        })
+        Ok(updates_rx)
     }
 
     /// Main event loop for the synchronization service.
@@ -200,7 +245,7 @@ impl DlpSyncer {
 
             tokio::select! {
                 update = self.stream.next() => match update {
-                    Some(update) => self.handle_update(update),
+                    Some(update) => self.handle_update(update).await,
                     None => {
                         if !self.reconnect().await {
                             break;
@@ -336,7 +381,7 @@ impl DlpSyncer {
     }
 
     /// Handles an update from the Laserstream.
-    fn handle_update(&mut self, result: Result<SubscribeUpdate, LaserstreamError>) {
+    async fn handle_update(&mut self, result: Result<SubscribeUpdate, LaserstreamError>) {
         use UpdateOneof::*;
 
         let update = match result {
@@ -351,18 +396,33 @@ impl DlpSyncer {
         };
 
         match update {
-            Account(acc) => self.handle_account_update(acc),
+            Account(acc) => self.handle_account_update(acc).await,
             Slot(slot) => {
                 self.slot = slot.slot;
                 self.replay.prune(self.slot);
+                // The watermark is only meaningful delivered in-band, after
+                // every record update of the slots it covers.
+                if self.mode == DeliveryMode::Firehose {
+                    Self::deliver(&self.updates, AccountUpdate::SlotAdvanced(self.slot)).await;
+                }
             }
-            Transaction(txn) => self.handle_transaction_update(txn),
+            Transaction(txn) => self.handle_transaction_update(txn).await,
             _ => {}
         }
     }
 
+    /// Delivers an update losslessly: waits for channel capacity instead of
+    /// dropping. Only used in firehose mode, where a dropped update would
+    /// let the consumer serve stale record state forever.
+    async fn deliver(updates: &Sender<AccountUpdate>, update: AccountUpdate) {
+        if updates.send(update).await.is_err() {
+            // Consumer gone; the run loop exits on the next iteration.
+            tracing::warn!("update channel closed; dropping update");
+        }
+    }
+
     /// Handles an account (delegation record) update.
-    fn handle_account_update(&mut self, acc: SubscribeUpdateAccount) {
+    async fn handle_account_update(&mut self, acc: SubscribeUpdateAccount) {
         let Some(account) = acc.account else { return };
 
         if account.pubkey.len() != PUBKEY_LEN {
@@ -372,6 +432,19 @@ impl DlpSyncer {
         let Ok(record) = Pubkey::try_from(account.pubkey.as_slice()) else {
             return;
         };
+
+        if self.mode == DeliveryMode::Firehose {
+            Self::deliver(
+                &self.updates,
+                AccountUpdate::Delegated {
+                    record,
+                    data: account.data,
+                    slot: acc.slot,
+                },
+            )
+            .await;
+            return;
+        }
 
         // Buffer unconditionally: the subscription for this record may register
         // moments from now, in which case the update is replayed on subscribe.
@@ -394,7 +467,7 @@ impl DlpSyncer {
     }
 
     /// Handles a transaction update, extracting undelegations.
-    fn handle_transaction_update(&mut self, txn: SubscribeUpdateTransaction) {
+    async fn handle_transaction_update(&mut self, txn: SubscribeUpdateTransaction) {
         let Some(message) = txn
             .transaction
             .and_then(|t| t.transaction.zip(t.meta))
@@ -426,12 +499,17 @@ impl DlpSyncer {
             .collect();
 
         for record in records {
-            self.replay.push(record, txn.slot, None);
-
             let update = AccountUpdate::Undelegated {
                 record,
                 slot: txn.slot,
             };
+
+            if self.mode == DeliveryMode::Firehose {
+                Self::deliver(&self.updates, update).await;
+                continue;
+            }
+
+            self.replay.push(record, txn.slot, None);
 
             if let Err(error) = self.updates.try_send(update) {
                 tracing::error!(%error, "failed to send undelegation update");
@@ -527,7 +605,10 @@ impl DlpSyncer {
         // record on a resume), not just the pong — put it back in front of
         // the stream so it reaches the event loop.
         let stream = Box::pin(futures::stream::once(std::future::ready(Ok(first))).chain(stream));
-        let stream = LaserStream { stream, _handle };
+        let stream = LaserStream {
+            stream,
+            _handle: Some(_handle),
+        };
 
         Ok(stream)
     }
@@ -618,9 +699,104 @@ mod tests {
             .map(|u| match u {
                 AccountUpdate::Delegated { slot, .. } => slot,
                 AccountUpdate::Undelegated { slot, .. } => slot,
-                AccountUpdate::SyncInterrupted | AccountUpdate::SyncTerminated => unreachable!(),
+                AccountUpdate::SlotAdvanced(_)
+                | AccountUpdate::SyncInterrupted
+                | AccountUpdate::SyncTerminated => unreachable!(),
             })
             .collect()
+    }
+
+    fn test_syncer(mode: DeliveryMode) -> (DlpSyncer, Receiver<AccountUpdate>) {
+        let (_requests_tx, requests) = mpsc::channel(1);
+        let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
+        let syncer = DlpSyncer {
+            mode,
+            subscriptions: HashSet::new(),
+            stream: LaserStream {
+                stream: Box::pin(futures::stream::pending()),
+                _handle: None,
+            },
+            config: LaserstreamConfig {
+                api_key: String::new(),
+                endpoint: String::new(),
+                channel_options: Default::default(),
+                max_reconnect_attempts: Some(1),
+                replay: true,
+            },
+            requests,
+            requests_closed: true,
+            updates: updates_tx,
+            slot: 0,
+            replay: ReplayBuffer::default(),
+        };
+        (syncer, updates_rx)
+    }
+
+    fn account_update(record: Pubkey, slot: Slot, data: Vec<u8>) -> SubscribeUpdate {
+        use helius_laserstream::grpc::SubscribeUpdateAccountInfo;
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
+                account: Some(SubscribeUpdateAccountInfo {
+                    pubkey: record.to_vec(),
+                    data,
+                    ..Default::default()
+                }),
+                slot,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn slot_update(slot: Slot) -> SubscribeUpdate {
+        use helius_laserstream::grpc::SubscribeUpdateSlot;
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn firehose_delivers_all_records_and_inband_watermarks() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        syncer
+            .handle_update(Ok(account_update(RECORD_A, 7, vec![1, 2, 3])))
+            .await;
+        syncer.handle_update(Ok(slot_update(9))).await;
+
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::Delegated { record, slot: 7, ref data }) if record == RECORD_A && data == &[1, 2, 3]
+        ));
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::SlotAdvanced(9))
+        ));
+        assert!(
+            syncer.replay.updates.is_empty(),
+            "firehose mode must not buffer for replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribed_mode_filters_and_emits_no_watermarks() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Subscribed);
+
+        syncer
+            .handle_update(Ok(account_update(RECORD_A, 7, vec![1])))
+            .await;
+        syncer.handle_update(Ok(slot_update(9))).await;
+
+        assert!(
+            updates.try_recv().is_err(),
+            "unsubscribed record updates and slot updates must not be delivered"
+        );
+        assert_eq!(slots(&syncer.replay, &RECORD_A), vec![7]);
+        assert_eq!(syncer.slot, 9);
     }
 
     #[test]
