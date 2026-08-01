@@ -297,6 +297,13 @@ impl DlpSyncer {
             match self.serve_requests_during(connect).await {
                 Ok(stream) => {
                     self.stream = stream;
+                    // Replay redelivers updates from the resume slot, which
+                    // sits at the last published watermark: suspend violation
+                    // checks until a fresh slot notification re-establishes
+                    // it, so expected duplicates are not misread as skew.
+                    // Consumers merge watermarks monotonically, so the brief
+                    // regression is invisible to them.
+                    self.watermark = 0;
                     tracing::info!(from_slot = ?resume_slot, "laserstream re-established");
                     // Without a slot watermark continuity cannot be proven:
                     // updates delivered before the first slot notification
@@ -319,6 +326,7 @@ impl DlpSyncer {
                 match self.serve_requests_during(connect).await {
                     Ok(stream) => {
                         self.stream = stream;
+                        self.watermark = 0;
                         tracing::warn!(
                             "laserstream re-established without replay; continuity lost"
                         );
