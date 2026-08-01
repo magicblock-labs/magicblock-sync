@@ -18,7 +18,6 @@ use helius_laserstream::{
         SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
         SubscribeUpdateAccount, SubscribeUpdateTransaction,
     },
-    solana::storage::confirmed_block::CompiledInstruction,
     LaserstreamConfig, LaserstreamError, StreamHandle,
 };
 use tokio::{
@@ -47,14 +46,33 @@ const DELEGATION_PROGRAM_PUBKEY: &Pubkey = &[
 /// discriminator rather than datasize is required to observe them.
 const DELEGATION_RECORD_DISCRIMINATOR: u64 = 100;
 
-/// Instruction discriminator for undelegate operations.
-const UNDELEGATE_DISCRIMINATOR: u8 = 3;
+/// Instruction discriminator for undelegate operations (u64 LE).
+const UNDELEGATE_DISCRIMINATOR: u64 = 3;
 
-/// Length of an instruction discriminator (Anchor programs).
+/// Instruction discriminators for delegate operations (u64 LE):
+/// `Delegate` and `DelegateWithAnyValidator`, which share one account layout.
+const DELEGATE_DISCRIMINATORS: [u64; 2] = [0, 19];
+
+/// Length of an instruction discriminator.
 const DISCRIMINATOR_LEN: usize = 8;
 
 /// Index of the delegation record account in undelegate instruction accounts.
 const DELEGATION_RECORD_ACCOUNT_INDEX: usize = 6;
+
+/// Index of the delegated account in delegate instruction accounts.
+const DELEGATE_DELEGATED_ACCOUNT_INDEX: usize = 1;
+
+/// Index of the delegation record account in delegate instruction accounts.
+const DELEGATE_RECORD_ACCOUNT_INDEX: usize = 4;
+
+/// Discriminator of an `UndelegationRequest` account
+/// (`AccountDiscriminator::UndelegationRequest`), little-endian u64 at
+/// offset 0.
+const UNDELEGATION_REQUEST_DISCRIMINATOR: u64 = 104;
+
+/// Minimum size of an `UndelegationRequest` account:
+/// discriminator + delegated account + expires-at slot.
+const UNDELEGATION_REQUEST_MIN_LEN: usize = 8 + 32 + 8;
 
 /// Maximum pending subscription/unsubscription requests.
 const MAX_PENDING_REQUESTS: usize = 256;
@@ -116,6 +134,17 @@ pub(crate) enum SyncRequest {
     },
     /// Unsubscribe from a delegation record.
     Unsubscribe(Pubkey),
+}
+
+/// A DLP instruction observed in the transaction stream.
+enum DlpInstruction {
+    Delegate {
+        delegated_account: Pubkey,
+        record: Pubkey,
+    },
+    Undelegate {
+        record: Pubkey,
+    },
 }
 
 /// How updates are delivered to the consumer.
@@ -216,7 +245,7 @@ impl DlpSyncer {
 
         let (updates_tx, updates_rx) = mpsc::channel(MAX_PENDING_UPDATES);
 
-        let stream = Self::connect(config.clone(), None).await?;
+        let stream = Self::connect(config.clone(), None, mode == DeliveryMode::Firehose).await?;
 
         let syncer = Self {
             mode,
@@ -293,7 +322,11 @@ impl DlpSyncer {
             // are covered by the idempotency contract.
             let resume_slot = (self.slot > 0)
                 .then(|| self.slot.saturating_sub(RESUME_SAFETY_MARGIN_SLOTS).max(1));
-            let connect = Self::connect(self.config.clone(), resume_slot);
+            let connect = Self::connect(
+                self.config.clone(),
+                resume_slot,
+                self.mode == DeliveryMode::Firehose,
+            );
             match self.serve_requests_during(connect).await {
                 Ok(stream) => {
                     self.stream = stream;
@@ -322,7 +355,11 @@ impl DlpSyncer {
             // subscription loses the updates in between, which subscribers
             // must learn about to invalidate cached state.
             if resume_slot.is_some() {
-                let connect = Self::connect(self.config.clone(), None);
+                let connect = Self::connect(
+                    self.config.clone(),
+                    None,
+                    self.mode == DeliveryMode::Firehose,
+                );
                 match self.serve_requests_during(connect).await {
                     Ok(stream) => {
                         self.stream = stream;
@@ -474,15 +511,23 @@ impl DlpSyncer {
         };
 
         if self.mode == DeliveryMode::Firehose {
-            Self::deliver(
-                &self.updates,
-                AccountUpdate::Delegated {
+            // Two account filters feed this stream in firehose mode;
+            // payloads are told apart by their account discriminator.
+            let update = match parse_undelegation_request(&account.data) {
+                Some((delegated_account, expires_at_slot)) => {
+                    AccountUpdate::UndelegationRequested {
+                        delegated_account,
+                        expires_at_slot,
+                        slot: acc.slot,
+                    }
+                }
+                None => AccountUpdate::Delegated {
                     record,
                     data: account.data,
                     slot: acc.slot,
                 },
-            )
-            .await;
+            };
+            Self::deliver(&self.updates, update).await;
             Self::check_watermark_violation(self.watermark, &self.updates, acc.slot).await;
             return;
         }
@@ -529,42 +574,87 @@ impl DlpSyncer {
             .chain(meta.loaded_readonly_addresses.iter())
             .collect();
 
-        let is_undelegate = |ix: &CompiledInstruction| {
-            let program_id = *accounts.get(ix.program_id_index as usize)?;
-            (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
-
-            let (discriminator, _) = ix.data.split_at_checked(DISCRIMINATOR_LEN)?;
-            (discriminator[0] == UNDELEGATE_DISCRIMINATOR).then_some(())?;
-
-            ix.accounts
-                .get(DELEGATION_RECORD_ACCOUNT_INDEX)
-                .and_then(|&idx| accounts.get(idx as usize).copied())
+        let account_at = |ix_accounts: &[u8], index: usize| -> Option<Pubkey> {
+            ix_accounts
+                .get(index)
+                .and_then(|&idx| accounts.get(idx as usize))
+                .and_then(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
         };
 
-        let records: Vec<Pubkey> = message
-            .instructions
-            .iter()
-            .filter_map(is_undelegate)
-            .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
-            .collect();
+        let parse = |program_id_index: usize,
+                     ix_accounts: &[u8],
+                     data: &[u8]|
+         -> Option<DlpInstruction> {
+            let program_id = *accounts.get(program_id_index)?;
+            (program_id == DELEGATION_PROGRAM_PUBKEY).then_some(())?;
 
-        for record in records {
-            let update = AccountUpdate::Undelegated {
-                record,
-                slot: txn.slot,
-            };
-
-            if self.mode == DeliveryMode::Firehose {
-                Self::deliver(&self.updates, update).await;
-                Self::check_watermark_violation(self.watermark, &self.updates, txn.slot).await;
-                continue;
+            let discriminator = u64::from_le_bytes(data.get(..DISCRIMINATOR_LEN)?.try_into().ok()?);
+            match discriminator {
+                UNDELEGATE_DISCRIMINATOR => Some(DlpInstruction::Undelegate {
+                    record: account_at(ix_accounts, DELEGATION_RECORD_ACCOUNT_INDEX)?,
+                }),
+                d if DELEGATE_DISCRIMINATORS.contains(&d) => Some(DlpInstruction::Delegate {
+                    delegated_account: account_at(ix_accounts, DELEGATE_DELEGATED_ACCOUNT_INDEX)?,
+                    record: account_at(ix_accounts, DELEGATE_RECORD_ACCOUNT_INDEX)?,
+                }),
+                _ => None,
             }
+        };
 
-            self.replay.push(record, txn.slot, None);
-
-            if let Err(error) = self.updates.try_send(update) {
-                tracing::error!(%error, "failed to send undelegation update");
+        // Delegation and undelegation are typically CPI-invoked from the
+        // owner program, so walk inner instructions as well as top-level.
+        let mut observed: Vec<DlpInstruction> = Vec::new();
+        for ix in &message.instructions {
+            observed.extend(parse(ix.program_id_index as usize, &ix.accounts, &ix.data));
+        }
+        for inner in &meta.inner_instructions {
+            for ix in &inner.instructions {
+                observed.extend(parse(ix.program_id_index as usize, &ix.accounts, &ix.data));
             }
+        }
+
+        for op in observed {
+            match op {
+                DlpInstruction::Undelegate { record } => {
+                    let update = AccountUpdate::Undelegated {
+                        record,
+                        slot: txn.slot,
+                    };
+
+                    if self.mode == DeliveryMode::Firehose {
+                        Self::deliver(&self.updates, update).await;
+                    } else {
+                        self.replay.push(record, txn.slot, None);
+                        if let Err(error) = self.updates.try_send(update) {
+                            tracing::error!(
+                                %error,
+                                "failed to send undelegation update"
+                            );
+                        }
+                        continue;
+                    }
+                }
+                DlpInstruction::Delegate {
+                    delegated_account,
+                    record,
+                } => {
+                    // Only firehose consumers do discovery; subscribed-mode
+                    // consumers key on record updates alone.
+                    if self.mode != DeliveryMode::Firehose {
+                        continue;
+                    }
+                    Self::deliver(
+                        &self.updates,
+                        AccountUpdate::DelegationObserved {
+                            delegated_account,
+                            record,
+                            slot: txn.slot,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Self::check_watermark_violation(self.watermark, &self.updates, txn.slot).await;
         }
     }
 
@@ -583,7 +673,11 @@ impl DlpSyncer {
     ///
     /// `from_slot` requests server-side replay from that slot to resume
     /// after a disconnect without losing updates.
-    fn subscribe_request(from_slot: Option<Slot>) -> SubscribeRequest {
+    ///
+    /// Firehose subscriptions additionally stream `UndelegationRequest`
+    /// accounts so delegating validators observe undelegation requests in
+    /// real time.
+    fn subscribe_request(from_slot: Option<Slot>, firehose: bool) -> SubscribeRequest {
         let mut accounts = HashMap::new();
         let mut slots = HashMap::new();
         let mut transactions = HashMap::new();
@@ -601,6 +695,22 @@ impl DlpSyncer {
             ..Default::default()
         };
         accounts.insert("delegations".into(), account_filter);
+
+        if firehose {
+            let request_filter = SubscribeRequestFilterAccounts {
+                owner: vec![DELEGATION_PROGRAM.into()],
+                filters: vec![SubscribeRequestFilterAccountsFilter {
+                    filter: Some(Filter::Memcmp(SubscribeRequestFilterAccountsFilterMemcmp {
+                        offset: 0,
+                        data: Some(MemcmpData::Bytes(
+                            UNDELEGATION_REQUEST_DISCRIMINATOR.to_le_bytes().to_vec(),
+                        )),
+                    })),
+                }],
+                ..Default::default()
+            };
+            accounts.insert("undelegation-requests".into(), request_filter);
+        }
 
         let tx_filter = SubscribeRequestFilterTransactions {
             account_include: vec![DELEGATION_PROGRAM.into()],
@@ -631,8 +741,9 @@ impl DlpSyncer {
     async fn connect(
         config: LaserstreamConfig,
         from_slot: Option<Slot>,
+        firehose: bool,
     ) -> Result<LaserStream, DlpSyncError> {
-        let request = Self::subscribe_request(from_slot);
+        let request = Self::subscribe_request(from_slot, firehose);
         let (stream, _handle) = client::subscribe(config, request);
         let mut stream = Box::pin(stream);
 
@@ -663,6 +774,19 @@ impl DlpSyncer {
 
         Ok(stream)
     }
+}
+
+/// Decodes an `UndelegationRequest` account payload:
+/// discriminator, delegated account, expires-at slot.
+fn parse_undelegation_request(data: &[u8]) -> Option<(Pubkey, Slot)> {
+    if data.len() < UNDELEGATION_REQUEST_MIN_LEN
+        || data[..DISCRIMINATOR_LEN] != UNDELEGATION_REQUEST_DISCRIMINATOR.to_le_bytes()
+    {
+        return None;
+    }
+    let delegated_account = Pubkey::try_from(&data[8..40]).ok()?;
+    let expires_at_slot = u64::from_le_bytes(data[40..48].try_into().ok()?);
+    Some((delegated_account, expires_at_slot))
 }
 
 /// A single buffered delegation record update.
@@ -739,6 +863,8 @@ impl ReplayBuffer {
 
 #[cfg(test)]
 mod tests {
+    use helius_laserstream::solana::storage::confirmed_block::CompiledInstruction;
+
     use super::*;
 
     const RECORD_A: Pubkey = [1; 32];
@@ -750,7 +876,9 @@ mod tests {
             .map(|u| match u {
                 AccountUpdate::Delegated { slot, .. } => slot,
                 AccountUpdate::Undelegated { slot, .. } => slot,
-                AccountUpdate::SlotAdvanced(_)
+                AccountUpdate::DelegationObserved { .. }
+                | AccountUpdate::UndelegationRequested { .. }
+                | AccountUpdate::SlotAdvanced(_)
                 | AccountUpdate::SyncInterrupted
                 | AccountUpdate::SyncTerminated => unreachable!(),
             })
@@ -825,7 +953,7 @@ mod tests {
             program_id_index: 1,
             // The record sits at DELEGATION_RECORD_ACCOUNT_INDEX (6).
             accounts: vec![0, 0, 0, 0, 0, 0, 2],
-            data: vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0],
+            data: UNDELEGATE_DISCRIMINATOR.to_le_bytes().to_vec(),
         };
         SubscribeUpdate {
             update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
@@ -859,7 +987,7 @@ mod tests {
         let instruction = CompiledInstruction {
             program_id_index: 2,
             accounts: vec![0, 0, 0, 0, 0, 0, 1],
-            data: vec![UNDELEGATE_DISCRIMINATOR, 0, 0, 0, 0, 0, 0, 0],
+            data: UNDELEGATE_DISCRIMINATOR.to_le_bytes().to_vec(),
         };
         SubscribeUpdate {
             update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
@@ -883,6 +1011,161 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    /// A delegate instruction (top-level or CPI-invoked) with the standard
+    /// account layout: payer, delegated account, owner, buffer, record, ...
+    fn delegate_tx_update(
+        delegated_account: Pubkey,
+        record: Pubkey,
+        slot: Slot,
+        inner: bool,
+        discriminator: u64,
+    ) -> SubscribeUpdate {
+        use helius_laserstream::{
+            grpc::{SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo},
+            solana::storage::confirmed_block::{
+                InnerInstruction, InnerInstructions, Message, Transaction, TransactionStatusMeta,
+            },
+        };
+        let account_keys = vec![
+            vec![9u8; PUBKEY_LEN],
+            delegated_account.to_vec(),
+            vec![7u8; PUBKEY_LEN],
+            vec![6u8; PUBKEY_LEN],
+            record.to_vec(),
+            vec![5u8; PUBKEY_LEN],
+            DELEGATION_PROGRAM_PUBKEY.to_vec(),
+        ];
+        let (program_id_index, ix_accounts, data) = (
+            6u32,
+            vec![0u8, 1, 2, 3, 4, 5],
+            discriminator.to_le_bytes().to_vec(),
+        );
+        let (instructions, inner_instructions) = if inner {
+            (
+                vec![],
+                vec![InnerInstructions {
+                    index: 0,
+                    instructions: vec![InnerInstruction {
+                        program_id_index,
+                        accounts: ix_accounts,
+                        data,
+                        ..Default::default()
+                    }],
+                }],
+            )
+        } else {
+            (
+                vec![CompiledInstruction {
+                    program_id_index,
+                    accounts: ix_accounts,
+                    data,
+                }],
+                vec![],
+            )
+        };
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(SubscribeUpdateTransactionInfo {
+                    transaction: Some(Transaction {
+                        message: Some(Message {
+                            account_keys,
+                            instructions,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    meta: Some(TransactionStatusMeta {
+                        inner_instructions,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                slot,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn undelegation_request_update(
+        request_pda: Pubkey,
+        delegated_account: Pubkey,
+        expires_at_slot: Slot,
+        slot: Slot,
+    ) -> SubscribeUpdate {
+        let mut data = UNDELEGATION_REQUEST_DISCRIMINATOR.to_le_bytes().to_vec();
+        data.extend_from_slice(&delegated_account);
+        data.extend_from_slice(&expires_at_slot.to_le_bytes());
+        account_update(request_pda, slot, data)
+    }
+
+    #[tokio::test]
+    async fn firehose_observes_delegations_from_top_and_inner_instructions() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        // Top-level Delegate, inner-ix Delegate, inner-ix
+        // DelegateWithAnyValidator must all be observed.
+        for (inner, discriminator) in [(false, 0), (true, 0), (true, 19)] {
+            syncer
+                .handle_update(Ok(delegate_tx_update(
+                    RECORD_A,
+                    RECORD_B,
+                    7,
+                    inner,
+                    discriminator,
+                )))
+                .await;
+            assert!(
+                matches!(
+                    updates.try_recv(),
+                    Ok(AccountUpdate::DelegationObserved {
+                        delegated_account,
+                        record,
+                        slot: 7,
+                    }) if delegated_account == RECORD_A && record == RECORD_B
+                ),
+                "inner={inner} discriminator={discriminator}"
+            );
+        }
+
+        // Unknown discriminators are not observed.
+        syncer
+            .handle_update(Ok(delegate_tx_update(RECORD_A, RECORD_B, 7, false, 5)))
+            .await;
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn firehose_delivers_undelegation_requests() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Firehose);
+
+        syncer
+            .handle_update(Ok(undelegation_request_update(RECORD_B, RECORD_A, 250, 9)))
+            .await;
+
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AccountUpdate::UndelegationRequested {
+                delegated_account,
+                expires_at_slot: 250,
+                slot: 9,
+            }) if delegated_account == RECORD_A
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribed_mode_ignores_delegate_observations() {
+        let (mut syncer, mut updates) = test_syncer(DeliveryMode::Subscribed);
+
+        syncer
+            .handle_update(Ok(delegate_tx_update(RECORD_A, RECORD_B, 7, true, 0)))
+            .await;
+
+        assert!(
+            updates.try_recv().is_err(),
+            "subscribed consumers key on record updates alone"
+        );
     }
 
     #[tokio::test]
@@ -1001,11 +1284,29 @@ mod tests {
 
     #[test]
     fn subscribe_request_filters_records_by_discriminator_at_confirmed() {
-        let request = DlpSyncer::subscribe_request(Some(42));
+        let request = DlpSyncer::subscribe_request(Some(42), false);
 
         assert_eq!(request.commitment, Some(CommitmentLevel::Confirmed as i32));
         assert_eq!(request.from_slot, Some(42));
-        assert_eq!(DlpSyncer::subscribe_request(None).from_slot, None);
+        assert_eq!(DlpSyncer::subscribe_request(None, false).from_slot, None);
+        assert!(
+            !request.accounts.contains_key("undelegation-requests"),
+            "subscribed mode must not stream undelegation requests"
+        );
+
+        let firehose = DlpSyncer::subscribe_request(None, true);
+        let requests_filter = &firehose.accounts["undelegation-requests"];
+        let [filter] = requests_filter.filters.as_slice() else {
+            panic!("expected exactly one undelegation-request filter");
+        };
+        let Some(Filter::Memcmp(memcmp)) = &filter.filter else {
+            panic!("expected a memcmp filter, got {:?}", filter.filter);
+        };
+        assert_eq!(memcmp.offset, 0);
+        assert_eq!(
+            memcmp.data,
+            Some(MemcmpData::Bytes(104u64.to_le_bytes().to_vec()))
+        );
 
         let accounts = &request.accounts["delegations"];
         assert_eq!(accounts.owner, vec![DELEGATION_PROGRAM.to_string()]);

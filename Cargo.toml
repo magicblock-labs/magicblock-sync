@@ -1,6 +1,6 @@
 [package]
 name = "magicblock-sync"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Real-time synchronization of magicblock delegation records"
 readme = "README.md"

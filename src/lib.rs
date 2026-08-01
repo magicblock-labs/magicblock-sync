@@ -43,6 +43,8 @@
 //!         magicblock_sync::AccountUpdate::Undelegated { record, slot } => {
 //!             println!("Undelegation at slot {}", slot);
 //!         }
+//!         magicblock_sync::AccountUpdate::DelegationObserved { .. } => {} // firehose mode only
+//!         magicblock_sync::AccountUpdate::UndelegationRequested { .. } => {} // firehose mode only
 //!         magicblock_sync::AccountUpdate::SlotAdvanced(_) => {} // firehose mode only
 //!         magicblock_sync::AccountUpdate::SyncInterrupted => {
 //!             println!("Updates lost; revalidate cached delegation state");
@@ -65,6 +67,15 @@
 //! record state: an entry unchanged while the watermark advances past slot
 //! `s` is the record's state at `s`. [`AccountUpdate::SyncInterrupted`]
 //! still voids all previously delivered state.
+//!
+//! Firehose consumers additionally receive
+//! [`AccountUpdate::DelegationObserved`] — parsed from delegate
+//! instructions (including CPI-invoked ones), naming the delegated account
+//! that a record PDA alone cannot reveal — and
+//! [`AccountUpdate::UndelegationRequested`] from `UndelegationRequest`
+//! account writes, so a delegating validator can discover new delegations
+//! and honor undelegation requests in real time without subscribing to the
+//! full DLP account firehose.
 
 mod channels;
 mod syncer;

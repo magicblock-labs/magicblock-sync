@@ -34,6 +34,30 @@ pub enum AccountUpdate {
         /// The slot at which the undelegation occurred.
         slot: Slot,
     },
+    /// A delegate instruction was observed on chain (firehose mode only),
+    /// parsed from the transaction stream including CPI-invoked delegations.
+    /// Unlike [`AccountUpdate::Delegated`] — whose record PDA cannot be
+    /// reversed — this names the delegated account, so consumers can
+    /// discover new delegations without an account-side firehose.
+    DelegationObserved {
+        /// The account being delegated.
+        delegated_account: Pubkey,
+        /// The delegation record PDA written by the same instruction.
+        record: Pubkey,
+        /// The slot the delegation landed in.
+        slot: Slot,
+    },
+    /// An `UndelegationRequest` account was written (firehose mode only):
+    /// an owner program asked for the account to be undelegated, which the
+    /// delegating validator should honor promptly.
+    UndelegationRequested {
+        /// The delegated account the request is for.
+        delegated_account: Pubkey,
+        /// The first slot at which timeout rollback is allowed.
+        expires_at_slot: Slot,
+        /// The slot the request account was written in.
+        slot: Slot,
+    },
     /// The confirmed slot advanced. Only emitted in firehose mode, in-band
     /// with record updates: receiving `SlotAdvanced(s)` proves every record
     /// update up to slot `s` has already been delivered on this channel.
