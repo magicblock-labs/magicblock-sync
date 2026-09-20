@@ -1,39 +1,152 @@
-use helius_laserstream::LaserstreamError;
+use std::io;
 
-/// Pubkey type alias for Solana public keys (32 bytes).
-pub type Pubkey = [u8; 32];
+use derive_more::Display;
+use fastwebsockets::WebSocketError;
+use hyper::http;
+use serde::Deserialize;
+use sonic_rs::Value;
+use tokio_rustls::rustls::pki_types::InvalidDnsNameError;
 
-/// Solana slot number.
-pub type Slot = u64;
+use crate::{Pubkey, UiAccount, Url};
 
-/// Errors that can occur during DLP synchronization.
-#[derive(Debug)]
-pub enum DlpSyncError {
-    /// Connection-related error.
-    Connection(&'static str),
-    /// Laserstream error.
-    LaserStream(LaserstreamError),
+/// A provider's independent hard limits. Its index in the configuration is its identity.
+#[derive(Clone, Debug)]
+pub struct Provider {
+    /// WebSocket endpoint; must be a `ws` or `wss` URL with a host.
+    pub url: Url,
+    /// Positive hard socket limit, including connecting and reconnecting attempts.
+    pub max_connections: usize,
+    /// Positive per-socket reservation limit, including pending and releasing subscriptions.
+    pub subs_per_connection: usize,
 }
 
-/// Account updates from the Laserstream.
+/// Providers for a pool; all subscriptions use confirmed commitment.
+/// Callers must supply at least one valid provider with positive limits.
+/// These requirements are assumed, not checked at construction.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    /// Nonempty ordered provider list; its indices become stable connection identities.
+    pub providers: Vec<Provider>,
+}
+
+/// A socket incarnation. Replacement sockets never reuse this identity within a pool.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Connection {
+    /// Index of the provider in the pool's original configuration.
+    pub provider: usize,
+    /// Stable pool slot reused by successive socket incarnations.
+    pub(crate) index: usize,
+    /// Incremented on replacement to distinguish lost coverage from the new socket.
+    pub(crate) generation: u64,
+}
+
+/// An opaque reservation, unique within the pool that issued it, even after release.
+/// Do not pass handles between pools. Copying a handle does not acquire another lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Subscription {
+    /// Account reserved exclusively within the issuing pool.
+    pub(crate) account: Pubkey,
+    /// Socket incarnation responsible for this reservation's coverage.
+    pub(crate) connection: Connection,
+    /// Pool-local sequence distinguishing successive reservations for the same account.
+    pub(crate) id: u64,
+}
+
+impl Subscription {
+    /// Identifies the reserved account without implying that remote coverage is established.
+    pub fn account(self) -> Pubkey {
+        self.account
+    }
+
+    /// Identifies the exact socket incarnation used to correlate coverage and loss events.
+    pub fn connection(self) -> Connection {
+        self.connection
+    }
+}
+
+/// Events are ordered per socket, not across providers. Slots are observations, not a watermark.
 #[derive(Debug)]
-pub enum AccountUpdate {
-    /// A delegation record was updated.
-    Delegated {
-        /// The delegation record pubkey.
-        record: Pubkey,
-        /// The account data.
-        data: Vec<u8>,
-        /// The slot at which the update occurred.
-        slot: Slot,
+pub enum Event {
+    /// An empty socket is ready to accept reservations.
+    Connected(Connection),
+    /// The provider acknowledged accountSubscribe. No initial snapshot is implied.
+    Established(Subscription),
+    /// Account data remains in the requested base64 wire representation for caller-side decoding.
+    Update {
+        /// Reservation whose remote subscription produced this update.
+        subscription: Subscription,
+        /// Provider observation slot, not a global ordering guarantee.
+        slot: u64,
+        /// Base64 wire account, or `None` when the provider explicitly reports absence.
+        account: Option<UiAccount>,
     },
-    /// A delegation record was undelegated.
-    Undelegated {
-        /// The delegation record pubkey.
-        record: Pubkey,
-        /// The slot at which the undelegation occurred.
-        slot: Slot,
+    /// The provider acknowledged release, or a cancelled pending subscription was rejected.
+    Released(Subscription),
+    /// A subscription was rejected; its reservation has been freed.
+    Rejected {
+        /// Reservation freed by the failed subscribe request.
+        subscription: Subscription,
+        /// Provider explanation for rejecting establishment.
+        error: RpcError,
     },
-    /// The sync service has terminated.
-    SyncTerminated,
+    /// All pending, active, and releasing reservations on this incarnation are invalid.
+    /// Already queued updates precede this event. The replacement starts empty.
+    Dropped {
+        /// Failed incarnation; its replacement has a distinct generation.
+        connection: Connection,
+        /// All reservations still held on this incarnation when the pool consumes the event.
+        subscriptions: Vec<Subscription>,
+        /// Failure that invalidated coverage, including undeliverable events.
+        error: Error,
+    },
+}
+
+/// The provider's JSON-RPC error, including optional diagnostic data.
+#[derive(Debug, Deserialize, Display, derive_more::Error)]
+#[display("RPC {code}: {message}")]
+pub struct RpcError {
+    /// Provider's JSON-RPC error code, retained without reclassification.
+    pub code: i64,
+    /// Provider's human-readable explanation.
+    pub message: String,
+    /// Optional provider-specific diagnostics preserved for the caller.
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("invalid subscription configuration: {0}")]
+    Config(&'static str),
+    #[error("all provider subscription limits are exhausted")]
+    Capacity,
+    #[error("capacity is connecting or unavailable; wait for connection events")]
+    Unavailable,
+    #[error("available socket command queues are full; retry after draining events")]
+    Busy,
+    #[error("this account already has reservation {0:?}")]
+    Duplicate(Subscription),
+    #[error("subscription is no longer current")]
+    Stale,
+    #[error("event queue overflow invalidated socket coverage")]
+    DeliveryFull,
+    #[error("event receiver closed")]
+    Closed,
+    #[error("peer closed the socket")]
+    Disconnected,
+    #[error("{0} timed out")]
+    Timeout(&'static str),
+    #[error("invalid provider message: {0}")]
+    Protocol(&'static str),
+    #[error(transparent)]
+    Json(#[from] sonic_rs::Error),
+    #[error(transparent)]
+    Rpc(#[from] RpcError),
+    #[error(transparent)]
+    Socket(#[from] WebSocketError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Http(#[from] http::Error),
+    #[error(transparent)]
+    ServerName(#[from] InvalidDnsNameError),
 }
