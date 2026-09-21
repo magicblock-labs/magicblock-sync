@@ -9,7 +9,7 @@ version = "0.1.0"
 [dependencies]
 ahash = "0.8"
 base64 = "0.22"
-derive_more = { version = "2.1.1", features = ["deref", "display", "error"] }
+derive_more = { version = "2.1.1", features = ["debug", "deref", "display", "error"] }
 fastwebsockets = { version = "0.10", features = ["unstable-split", "upgrade"] }
 futures = "0.3"
 http-body-util = "0.1"
@@ -18,11 +18,14 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 json = { version = "0.5.8", package = "sonic-rs" }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
-solana-account-decoder-client-types = { version = "=4.2.2", features = ["agave-unstable-api"] }
-solana-pubkey = "=4.2.1"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+solana-account = { version = "=4.3.1", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.10.0" }
+solana-pubkey = "=4.2.0"
+solana-sdk-ids = "3.1.0"
 thiserror = "2"
 tokio = { version = "1.0", features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 url = "2.5"
 webpki-roots = "1"
+zstd = "0.13"

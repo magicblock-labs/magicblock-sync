@@ -19,35 +19,36 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{Error, Url};
 
+/// Inbound half that assembles fragmented frames before session-level validation.
 pub(crate) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
 
 /// Outbound half; writes rely on the peer continuing to read rather than a local deadline.
 pub(crate) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 
-// Enough for a maximum-size Solana account encoded as base64, including its envelope.
+/// Enough for a maximum-size Solana account encoded as base64, including its envelope.
 pub(crate) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// Shares TLS configuration across connections without initializing it for plain WebSockets.
-static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
+static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLock::new(|| {
     let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports default TLS versions")
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned()))
         .with_no_client_auth();
-    TlsConnector::from(Arc::new(config))
+    Ok(TlsConnector::from(Arc::new(config)))
 });
 
 /// Opens a valid provider URL; the caller bounds connection setup with one deadline.
 pub(crate) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
-    let host = match url.host().expect("provider URL must have a host") {
+    let host = match url.host().ok_or(Error::Protocol("provider URL has no host"))? {
         Host::Ipv6(ip) => ip.to_string(),
         host => host.to_string(),
     };
-    let port = url.port_or_known_default().expect("provider ws/wss URL has a default port");
+    let port = url.port_or_known_default().ok_or(Error::Protocol("provider URL has no port"))?;
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true)?;
     let mut socket = if url.scheme() == "wss" {
-        upgrade(url, TLS.connect(ServerName::try_from(host)?, tcp).await?).await?
+        let tls = TLS.as_ref().map_err(|error| Error::Tls(error.clone()))?;
+        upgrade(url, tls.connect(ServerName::try_from(host)?, tcp).await?).await?
     } else {
         upgrade(url, tcp).await?
     };

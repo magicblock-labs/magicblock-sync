@@ -1,9 +1,62 @@
 # magicblock-sync
 
-Base-layer account synchronization for MagicBlock. The current implementation is
-the [WebSocket subscription layer](https://github.com/magicblock-labs/magicblock-validator/issues/1721)
-of the [Chainlink rewrite](https://github.com/magicblock-labs/magicblock-validator/issues/1698).
-HTTP snapshots, reconciliation, gRPC redundancy, and Engine integration are separate work.
+Fetch account snapshots over HTTP and follow changes over WebSocket, with decoded
+Engine accounts from both transports. Provider failover and a shared confirmed
+account-update watermark keep fetching independent of any one endpoint.
+
+Part of the [Chainlink rewrite](https://github.com/magicblock-labs/magicblock-validator/issues/1698).
+Companion discovery, subscription-before-fetch coordination, reconciliation, and
+materialization remain caller responsibilities; classify each account's default
+`Uninit` mode before submitting it to Engine.
+
+## Fetching
+
+Create a `Fetcher` with a nonempty list of valid HTTP(S) endpoints and the pool's
+shared watermark. Endpoint validity is a caller contract, not a constructor check.
+All HTTP and WebSocket providers must belong to the same chain.
+
+```rust
+use magicblock_sync::Fetcher;
+
+let fetcher = Fetcher::new(
+    vec!["https://api.devnet.solana.com".parse()?],
+    pool.slot(),
+)?;
+// After establishing coverage, fetch while continuing to drive pool.next().
+let snapshot = fetcher.fetch(&[account], None).await?;
+// snapshot.accounts follows input order, including duplicates.
+```
+
+Each call accepts 1–100 keys and sends one
+[`getMultipleAccounts`](https://solana.com/docs/rpc/http/getmultipleaccounts) request
+per attempt. Every endpoint must support the standard 100-key limit. There is no
+splitting or coalescing. Put related accounts in the same batch when they need one
+response context; separate fetches may return different slots. Only explicit JSON
+`null` produces `None`; invalid account data fails the operation, never a partial snapshot.
+
+At entry, fetching captures the greater of the caller's `min_slot` and the shared
+watermark. It never relaxes that floor during retries. The watermark starts at
+zero and records the highest observed confirmed account-update context slot, not a guaranteed
+current chain head. Disconnects retain it; HTTP responses do not advance it.
+Every valid WebSocket account update advances it, including explicit absence.
+Malformed account data does not advance it.
+
+Concurrent calls share a pooled Rustls client, round-robin provider selection, and
+approximate provider cooldowns. Each attempt gets up to two seconds within a
+ten-second overall budget. Retryable failures cool the provider for a fixed 100 ms;
+an in-flight success does not clear that cooldown early. Other eligible
+providers are tried immediately, or the call waits for the earliest cooldown.
+Transport failures, timeouts, HTTP 408/429/5xx, node-unhealthy and minimum-slot RPC
+errors retry. Parsing and account-decoding failures, malformed responses, wrong
+result lengths, below-floor responses, and other HTTP/RPC errors return immediately.
+Errors retain the provider index and cause; deadline exhaustion
+retains the latest failure when available. Redirects and client-level retries are disabled.
+
+Deadlines are cooperative: synchronous account decoding cannot be interrupted,
+but a response that finishes decoding after its attempt budget is not returned as success.
+
+Callers bound concurrency: there is no semaphore, account cache, or background
+health probing. Dropping a fetch future cancels its I/O without detached work.
 
 ## Subscriptions
 
@@ -22,7 +75,7 @@ let mut pool = Pool::new(Config {
     }],
 });
 
-// Wait for an empty socket to become available; failures are observable and retried.
+// Wait for a socket to become available; failures are observable and retried.
 loop {
     match pool.next().await {
         Event::Connected(_) => break,
@@ -30,7 +83,7 @@ loop {
         _ => {}
     }
 }
-let account: Pubkey = "SysvarC1ock11111111111111111111111111111111".parse()?;
+let account: Pubkey = "11111111111111111111111111111111".parse()?;
 let reservation = pool.subscribe(account)?;
 
 loop {
@@ -79,8 +132,17 @@ can still arrive during release.
 
 ## Pooling and loss
 
-The pool starts with one socket per provider. New accounts take the first healthy
-socket with room, starting from a rotating cursor. This approximates balance;
+The pool starts with one socket per provider. Each initial socket reserves one
+subscription for internal confirmed Clock tracking before user admission, including
+when reconnecting. Growth sockets do not subscribe to Clock. This reservation counts
+toward hard capacity and utilization, but its establishment and updates are hidden.
+Clock keeps the watermark advancing even when there are no user subscriptions;
+its updates follow the same decoding and watermark path as other accounts.
+Public `subscribe(Clock)` is rejected. Clock rejection or an invalid notification
+closes that socket through the normal `Dropped` and reconnect path.
+
+New accounts take the first healthy socket with room, starting from a rotating
+cursor. This approximates balance;
 existing subscriptions never move just to balance load, even after uneven releases.
 
 Growth uses a fixed pool-wide threshold of 75%: live reservations divided by the
@@ -103,7 +165,7 @@ object. No delay is added to fill a batch. Each account still has its own reques
 and acknowledgement. Allocation stops at the first eligible socket. Successful admission
 uses constant-time pool accounting and scans for growth only at a threshold crossing. Growth rounds
 scan sockets once per provider; updates use direct subscription-ID lookup. There is
-no per-account task or lock, transport trait, or automatic resubscription.
+no per-account task or lock, transport trait, or automatic user resubscription.
 
 `fastwebsockets` handles framing and fragment collection; its client helper performs
 the Hyper upgrade. TLS configuration is shared across reconnects. Socket reads stay
@@ -114,8 +176,9 @@ fully decodes account updates before awaiting event delivery. Requests reuse a
 serialization buffer. Invalid messages still report errors; lazy parsing does not
 introduce silent update dropping.
 
-All subscriptions request `base64+zstd` encoding with confirmed commitment; account
-values stay encoded for caller-side decoding. Connection setup and RPC
+All subscriptions request `base64+zstd` encoding with confirmed commitment;
+account values are decoded into Engine `OwnedAccount`s using the response context slot.
+Only base64+zstd responses are accepted. Connection setup and RPC
 acknowledgements have fixed 10-second budgets. Acknowledgement timers are driven by
 `FuturesUnordered` and cancelled on response. The pool pings every 15 seconds
 and requires a pong by the next tick. Writes are untimed, assuming peers continue reading.
@@ -134,15 +197,16 @@ deadline budgets still elapse. Keep draining `next` to let socket processing pro
 
 Disconnects, protocol errors, and acknowledgement/heartbeat timeouts produce
 `Dropped` with the old connection identity and all affected
-reservations, including queued requests and pending establishment. Only the affected
+user reservations, including queued requests and pending establishment; internal
+Clock reservations are omitted. Only the affected
 socket's reservation map is drained. The socket closes before this terminal event
 waits for queue space.
 Already queued events from that socket precede its loss notification. Replacements
-are empty, have new identities, and retry with exponential backoff from one to
-thirty seconds. A rejected unsubscribe also closes the socket because its remote
+restore only their internal Clock reservation, have new identities, and retry with
+exponential backoff from one to thirty seconds. A rejected unsubscribe also closes the socket because its remote
 capacity cannot safely be reclaimed.
 
-Updates preserve context slots and encoded account values. Different providers
+Updates preserve context slots and return decoded account values. Different providers
 have no shared event order; this layer neither deduplicates updates nor interprets
 absence as undelegation. Stale subscription handles cannot release replacement
 coverage. Handles belong to the pool that issued them.

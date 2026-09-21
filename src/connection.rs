@@ -1,8 +1,19 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::{
+    account::WireAccount,
+    rpc::{
+        AccountConfig, ContextValue, Request, ACCOUNT_NOTIFICATION, ACCOUNT_SUBSCRIBE,
+        ACCOUNT_UNSUBSCRIBE, VERSION,
+    },
     websocket::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event, Reservation, RpcError, Subscription, UiAccount, Url,
+    Connection, Error, Event, Reservation, RpcError, Subscription, Url,
 };
 use ahash::AHashMap;
 use fastwebsockets::{Frame, OpCode, Payload};
@@ -18,11 +29,18 @@ use tokio::{
     time::{self, Instant, MissedTickBehavior, Sleep},
 };
 
+/// Work admitted by the pool for this socket incarnation.
 pub(crate) enum Command {
     /// Requests remote coverage for an already admitted reservation.
-    Subscribe(Reservation),
+    Subscribe(
+        /// Capacity already reserved by the pool.
+        Reservation,
+    ),
     /// Unsubscribes acknowledged coverage using its provider ID.
-    Release(Subscription),
+    Release(
+        /// Established coverage whose capacity remains held until acknowledgement.
+        Subscription,
+    ),
 }
 
 /// Connection and RPC acknowledgement budget; writes are intentionally untimed.
@@ -32,6 +50,7 @@ const COMMAND_CAP: usize = 256;
 /// Ping cadence; a missing pong at the next tick invalidates coverage.
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
+/// A sent request whose acknowledgement still owns a deadline and reservation.
 struct Pending {
     /// Retains the admission identity and, for release, the provider subscription ID.
     command: Command,
@@ -54,6 +73,9 @@ pub(crate) struct Session {
     output: Vec<u8>,
     /// Bounded delivery applies backpressure to this socket's protocol processing.
     events: Sender<Event>,
+    /// Pool-wide freshness floor for HTTP fetches. Valid confirmed updates only
+    /// raise it; it survives this socket's replacement and is not a chain-head guarantee.
+    slot: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -64,6 +86,7 @@ impl Session {
         mut commands: UnboundedReceiver<Command>,
         events: Sender<Event>,
         delay: Duration,
+        slot: Arc<AtomicU64>,
     ) {
         let result = async {
             time::sleep_until(Instant::now() + delay).await;
@@ -77,6 +100,7 @@ impl Session {
                 active: AHashMap::new(),
                 output: Vec::new(),
                 events: events.clone(),
+                slot,
             };
             session.emit(Event::Connected(id)).await?;
             session.run(reader, &mut commands).await
@@ -196,11 +220,7 @@ impl Session {
 
     /// Requests compressed account notifications; coverage begins only after acknowledgement.
     fn subscribe(&mut self, reservation: Reservation) -> Result<(), Error> {
-        let config = AccountConfig {
-            encoding: "base64+zstd",
-            commitment: "confirmed",
-        };
-        let request = (reservation.account.to_string(), config);
+        let request = (reservation.account.to_string(), AccountConfig::new(None));
         self.request(Command::Subscribe(reservation), request)
     }
 
@@ -209,18 +229,13 @@ impl Session {
         let (timer, registration) = AbortHandle::new_pair();
         self.timers.push(Abortable::new(time::sleep(TIMEOUT), registration));
         let (id, method) = match &command {
-            Command::Subscribe(reservation) => (reservation.id * 2, "accountSubscribe"),
+            Command::Subscribe(reservation) => (reservation.id * 2, ACCOUNT_SUBSCRIBE),
             Command::Release(subscription) => {
-                (subscription.reservation.id * 2 + 1, "accountUnsubscribe")
+                (subscription.reservation.id * 2 + 1, ACCOUNT_UNSUBSCRIBE)
             }
         };
         self.pending.insert(id, Pending { command, timer });
-        let request = Request {
-            jsonrpc: "2.0",
-            id,
-            method,
-            params,
-        };
+        let request = Request::new(id, method, params);
         json::to_writer(&mut self.output, &request)?;
         Ok(())
     }
@@ -247,23 +262,35 @@ impl Session {
     /// Validates routing before decoding an update, then waits for delivery capacity.
     async fn envelope(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let message: Envelope<'_> = json::from_slice(bytes)?;
+        if message.jsonrpc != VERSION {
+            return Err(Error::Protocol("invalid RPC version"));
+        }
         if let Some(id) = message.id {
+            if message.result.is_some() == message.error.is_some() {
+                return Err(Error::Protocol("invalid RPC response envelope"));
+            }
             let pending = self.pending.remove(&id).ok_or(Error::Protocol("unknown request ID"))?;
             pending.timer.abort();
             return self.response(pending, message.result, message.error).await;
+        }
+        if message.method != Some(ACCOUNT_NOTIFICATION) {
+            return Err(Error::Protocol("invalid notification method"));
         }
         let notification = message.params.ok_or(Error::Protocol("missing notification params"))?;
         let subscription = *self
             .active
             .get(&notification.subscription)
             .ok_or(Error::Protocol("unknown remote subscription"))?;
-        let account: Account = json::from_str(notification.result.as_raw_str())?;
-        self.emit(Event::Update {
-            subscription,
-            slot: account.context.slot,
-            account: account.value,
-        })
-        .await
+        let account: ContextValue<Option<WireAccount<'_>>> =
+            json::from_str(notification.result.as_raw_str())?;
+        let slot = account.context.slot;
+        let account = account.value.map(|value| value.decode(slot)).transpose()?;
+        // Every valid confirmed update contributes, including explicit absence.
+        self.slot.fetch_max(slot, Relaxed);
+        if subscription.reservation.id == 0 {
+            return Ok(());
+        }
+        self.emit(Event::Update { subscription, slot, account }).await
     }
 
     /// Applies a correlated acknowledgement to subscription state and emits its outcome.
@@ -279,6 +306,7 @@ impl Session {
             // instead of pretending the reservation is free or leaking it indefinitely.
             return match pending.command {
                 Command::Release(_) => Err(Error::Rpc(error)),
+                Command::Subscribe(reservation) if reservation.id == 0 => Err(Error::Rpc(error)),
                 Command::Subscribe(reservation) => {
                     self.emit(Event::Rejected { reservation, error }).await
                 }
@@ -299,7 +327,12 @@ impl Session {
                 let remote =
                     result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
                 let subscription = Subscription { reservation, remote };
-                self.active.insert(remote, subscription);
+                if self.active.insert(remote, subscription).is_some() {
+                    return Err(Error::Protocol("duplicate remote subscription ID"));
+                }
+                if reservation.id == 0 {
+                    return Ok(());
+                }
                 Event::Established(subscription)
             }
         };
@@ -312,31 +345,16 @@ impl Session {
     }
 }
 
-#[derive(Serialize)]
-struct Request<P> {
-    /// Protocol version emitted for all outbound requests.
-    jsonrpc: &'static str,
-    /// Correlation key pairing this request with its pending acknowledgement.
-    id: u64,
-    /// Subscription operation understood by the provider.
-    method: &'static str,
-    /// Operation-specific positional arguments, serialized without an intermediate JSON tree.
-    params: P,
-}
-
-#[derive(Serialize)]
-struct AccountConfig {
-    /// Base64+zstd keeps compressed notification data in the wire representation for callers.
-    encoding: &'static str,
-    /// Always confirmed; this does not guarantee ordering between notifications.
-    commitment: &'static str,
-}
-
 // Providers are assumed to send standard JSON-RPC envelopes and unique active IDs.
 // Borrow payloads until their routing identity has passed validation.
 // Accepted account updates still use full typed decoding; no intermediate Value tree.
+/// Borrowed routing envelope, validated before interpreting its operation-specific payload.
 #[derive(Deserialize)]
 struct Envelope<'a> {
+    /// Protocol version checked before routing acknowledgements or updates.
+    jsonrpc: &'a str,
+    /// Account-notification method for messages without a request ID.
+    method: Option<&'a str>,
     /// Presence selects response handling; absence selects notification handling.
     id: Option<u64>,
     /// Borrowed success payload, decoded according to the pending request's operation.
@@ -350,6 +368,7 @@ struct Envelope<'a> {
     params: Option<Notification<'a>>,
 }
 
+/// Account update tied to an established remote subscription.
 #[derive(Deserialize)]
 struct Notification<'a> {
     /// Provider-issued ID scoped to this socket incarnation.
@@ -357,19 +376,4 @@ struct Notification<'a> {
     /// Account payload left borrowed until routing is validated.
     #[serde(borrow)]
     result: LazyValue<'a>,
-}
-
-#[derive(Deserialize)]
-struct Account {
-    /// Provider observation context accompanying the account value.
-    context: Context,
-    /// Explicit null denotes absence; a missing field is a protocol error.
-    #[serde(deserialize_with = "Deserialize::deserialize")]
-    value: Option<UiAccount>,
-}
-
-#[derive(Deserialize)]
-struct Context {
-    /// Observation slot reported to the caller, not a cross-provider watermark.
-    slot: u64,
 }

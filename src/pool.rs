@@ -1,6 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
 
 use ahash::AHashMap;
+use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::mpsc::{self, Receiver, Sender, UnboundedSender},
     task::JoinHandle,
@@ -14,6 +18,7 @@ use crate::{
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
 
+/// One provisioned slot, with capacity held across its current connection attempt.
 struct Socket {
     /// Current incarnation; replacing the task advances its generation.
     id: Connection,
@@ -31,22 +36,42 @@ struct Socket {
 }
 
 impl Socket {
-    /// Starts an empty incarnation with a fresh command queue after the requested delay.
-    fn spawn(id: Connection, config: &Config, events: Sender<Event>, backoff: Duration) -> Self {
+    /// Starts an incarnation with a fresh queue, restoring Clock before user admission.
+    fn spawn(
+        id: Connection,
+        config: &Config,
+        events: Sender<Event>,
+        backoff: Duration,
+        clock: bool,
+        slot: Arc<AtomicU64>,
+    ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
+        let mut reservations = AHashMap::new();
+        if clock {
+            // Queue before spawning or exposing admission, ahead of every user command.
+            let reservation = Reservation {
+                account: clock::ID,
+                connection: id,
+                id: 0,
+            };
+            // The receiver remains local until Session::start takes ownership.
+            let _ = commands.send(Command::Subscribe(reservation));
+            reservations.insert(0, clock::ID);
+        }
         let session = Session::start(
             id,
             config.providers[id.provider].url.clone(),
             receiver,
             events,
             backoff,
+            slot,
         );
         let task = tokio::spawn(session);
         Self {
             id,
             commands,
             task,
-            reservations: AHashMap::new(),
+            reservations,
             ready: false,
             backoff,
         }
@@ -91,6 +116,8 @@ pub struct Pool {
     capacity: usize,
     /// First socket considered next time, rotating first-eligible allocation.
     cursor: usize,
+    /// Highest confirmed account-update context observed; retained across reconnects.
+    slot: Arc<AtomicU64>,
 }
 
 impl Pool {
@@ -108,11 +135,19 @@ impl Pool {
             reservations: 0,
             capacity: 0,
             cursor: 0,
+            slot: Arc::new(AtomicU64::new(0)),
         };
         for provider in 0..pool.config.providers.len() {
-            pool.open(provider);
+            pool.open(provider, true);
         }
         pool
+    }
+
+    /// Shared highest confirmed account-update slot, initially zero; not a chain-head guarantee.
+    /// Drive `next` continuously so socket processing and reconnection can progress.
+    /// Callers must not lower or otherwise modify this watermark.
+    pub fn slot(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.slot)
     }
 
     /// Reserves one account on the first eligible socket from a rotating cursor.
@@ -121,6 +156,9 @@ impl Pool {
     /// at most one live subscription per account; the pool does not deduplicate accounts.
     /// Success is admission only: wait for `Established` before fetching a snapshot.
     pub fn subscribe(&mut self, account: Pubkey) -> Result<Reservation, Error> {
+        if account == clock::ID {
+            return Err(Error::Clock);
+        }
         let len = self.sockets.len();
         let candidate = (self.cursor..len).chain(0..self.cursor).find(|&i| {
             let socket = &self.sockets[i];
@@ -174,10 +212,13 @@ impl Pool {
 
     /// Advances the registry and returns the next event. Cancellation-safe.
     /// Call continuously: a full event queue pauses socket processing until drained.
-    /// There is no automatic account resubscription.
+    /// Only the internal Clock subscription is automatically restored.
     pub async fn next(&mut self) -> Event {
         // The registry retains a sender; only its owner can close this receiver.
-        let mut event = self.events.recv().await.expect("registry owns event sender");
+        let Some(mut event) = self.events.recv().await else {
+            // Unreachable while the registry retains its sender; never spin on closure.
+            return futures::future::pending().await;
+        };
         match &mut event {
             Event::Connected(connection) => {
                 let socket = &mut self.sockets[connection.index];
@@ -192,22 +233,32 @@ impl Pool {
             }
             Event::Dropped { connection, reservations, .. } => {
                 let socket = &mut self.sockets[connection.index];
+                // ID zero is retained until loss, even if Clock establishment fails.
+                let clock = socket.reservations.contains_key(&0);
                 self.reservations -= socket.reservations.len();
-                reservations.extend(
-                    socket.reservations.drain().map(|(id, account)| Reservation {
+                reservations.extend(socket.reservations.drain().filter(|(id, _)| *id != 0).map(
+                    |(id, account)| Reservation {
                         account,
                         connection: socket.id,
                         id,
-                    }),
-                );
+                    },
+                ));
                 let id = Connection {
                     generation: connection.generation + 1,
                     ..*connection
                 };
                 let delay =
                     (socket.backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
-                self.sockets[connection.index] =
-                    Socket::spawn(id, &self.config, self.sender.clone(), delay);
+                let replacement = Socket::spawn(
+                    id,
+                    &self.config,
+                    self.sender.clone(),
+                    delay,
+                    clock,
+                    Arc::clone(&self.slot),
+                );
+                self.reservations += replacement.reservations.len();
+                self.sockets[connection.index] = replacement;
             }
             Event::Established(_) | Event::Update { .. } => {}
         }
@@ -248,18 +299,26 @@ impl Pool {
         // A full provider or one without healthy sockets naturally opens an empty batch.
         let batch = healthy.min(config.max_connections - count);
         for _ in 0..batch {
-            self.open(provider);
+            self.open(provider, false);
         }
     }
 
     /// Allocates a fresh socket slot and starts its first connection attempt immediately.
-    fn open(&mut self, provider: usize) {
+    fn open(&mut self, provider: usize, clock: bool) {
         let id = Connection {
             provider,
             index: self.sockets.len(),
             generation: 0,
         };
-        let socket = Socket::spawn(id, &self.config, self.sender.clone(), Duration::ZERO);
+        let socket = Socket::spawn(
+            id,
+            &self.config,
+            self.sender.clone(),
+            Duration::ZERO,
+            clock,
+            Arc::clone(&self.slot),
+        );
+        self.reservations += socket.reservations.len();
         self.sockets.push(socket);
         self.capacity += self.config.providers[provider].subs_per_connection;
     }
