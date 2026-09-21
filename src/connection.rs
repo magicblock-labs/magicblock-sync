@@ -1,24 +1,29 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    time::Duration,
-};
+use std::time::Duration;
 
 use crate::{
+    pool::COMMAND_CAP,
     websocket::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event, RpcError, Subscription, UiAccount, Url,
+    Connection, Error, Event, Reservation, RpcError, Subscription, UiAccount, Url,
 };
+use ahash::AHashMap;
+use derive_more::{Deref, DerefMut};
 use fastwebsockets::{Frame, OpCode, Payload};
+use futures::{
+    future::{self, AbortHandle, Abortable},
+    stream::FuturesUnordered,
+    StreamExt,
+};
+use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
-use sonic_rs::{JsonValueTrait, LazyValue};
 use tokio::{
-    sync::mpsc::{error::TrySendError, Permit, Receiver, Sender},
-    time::{self, Instant, MissedTickBehavior},
+    sync::mpsc::{Receiver, Sender},
+    time::{self, Instant, MissedTickBehavior, Sleep},
 };
 
 pub(crate) enum Command {
     /// Requests remote coverage for an already admitted reservation.
-    Subscribe(Subscription),
-    /// Cancels pending establishment or unsubscribes acknowledged coverage.
+    Subscribe(Reservation),
+    /// Unsubscribes acknowledged coverage using its provider ID.
     Release(Subscription),
 }
 
@@ -28,30 +33,34 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
 struct Pending {
-    /// Reservation whose subscribe or unsubscribe acknowledgement is outstanding.
-    subscription: Subscription,
-    /// Absolute acknowledgement deadline, also indexed in `Session::deadlines`.
-    deadline: Instant,
-    /// A release arrived before subscribe acknowledgement; suppress establishment.
-    cancelled: bool,
+    /// Retains the admission identity and, for release, the provider subscription ID.
+    command: Command,
+    /// Cancels the acknowledgement timer once a response is correlated.
+    timer: AbortHandle,
 }
 
-/// Subscription protocol state scoped to one connected socket incarnation.
+/// Owns subscription transitions, request batching, and event delivery for one incarnation.
+pub(crate) struct Orchestrator {
+    /// Wire request IDs: even for subscribe, odd for release.
+    pending: AHashMap<u64, Pending>,
+    /// Outstanding acknowledgement deadlines, cancelled as responses arrive.
+    timers: FuturesUnordered<Abortable<Sleep>>,
+    /// Provider IDs route notifications to established handles.
+    active: AHashMap<u64, Subscription>,
+    /// Reused by serialization and transport masking for objects and request batches.
+    output: Vec<u8>,
+    /// Bounded delivery applies backpressure to this socket's protocol processing.
+    events: Sender<Event>,
+}
+
+/// Drives socket I/O without cancelling partial reads when commands or timers become ready.
+#[derive(Deref, DerefMut)]
 pub(crate) struct Session {
     /// Exclusive outbound half for requests and control replies.
     writer: Writer,
-    /// Reusable serialization buffer, also borrowed mutably for client frame masking.
-    output: Vec<u8>,
-    /// Delivery must reserve space before decoding account payloads.
-    events: Sender<Event>,
-    /// Wire request IDs awaiting acknowledgement: even for subscribe, odd for release.
-    pending: HashMap<u64, Pending>,
-    /// Ordered deadline/request pairs avoid scanning pending requests to find the next timeout.
-    deadlines: BTreeSet<(Instant, u64)>,
-    /// Provider subscription IDs mapped to local reservations for notification routing.
-    active: HashMap<u64, Subscription>,
-    /// Reverse index from local reservation IDs to provider IDs for unsubscribe requests.
-    remote: HashMap<u64, u64>,
+    #[deref]
+    #[deref_mut]
+    orchestrator: Orchestrator,
 }
 
 impl Session {
@@ -70,28 +79,21 @@ impl Session {
                 .map_err(|_| Error::Timeout("connect"))??;
             let mut session = Self {
                 writer,
-                output: Vec::new(),
-                events: events.clone(),
-                pending: HashMap::new(),
-                deadlines: BTreeSet::new(),
-                active: HashMap::new(),
-                remote: HashMap::new(),
+                orchestrator: Orchestrator::new(events.clone()),
             };
-            session.emit(Event::Connected(id))?;
+            session.emit(Event::Connected(id)).await?;
             session.run(reader, &mut commands).await
         }
         .await;
-        // Stop admission and drop the socket before waiting for space. This final event
-        // cannot use try_send: it explains any update lost to a full delivery queue.
+        // Stop admission and drop the socket before waiting to report coverage loss.
         commands.close();
         if let Err(error) = result {
-            let _ = events
-                .send(Event::Dropped {
-                    connection: id,
-                    subscriptions: Vec::new(),
-                    error,
-                })
-                .await;
+            let msg = Event::Dropped {
+                connection: id,
+                reservations: Vec::new(),
+                error,
+            };
+            let _ = events.send(msg).await;
         }
     }
 
@@ -102,12 +104,12 @@ impl Session {
         commands: &mut Receiver<Command>,
     ) -> Result<(), Error> {
         let mut heartbeat = time::interval_at(Instant::now() + HEARTBEAT, HEARTBEAT);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut awaiting_pong = false;
-        let mut fragments = None;
+        let mut batch = Vec::with_capacity(COMMAND_CAP);
         // Automatic replies are disabled; the session sends them through its writer.
-        // Peers are assumed to keep reading. Writes have no deadline, so a stalled
-        // write would also suspend this session's heartbeat and acknowledgement timers.
+        // Writes and event delivery are untimed. While either waits, this socket cannot
+        // read or check heartbeat/acknowledgement deadlines; their budgets still elapse.
         let mut send = |_| async { Err::<(), _>(Error::Protocol("unexpected automatic reply")) };
         loop {
             // fastwebsockets consumes header bytes before awaiting the payload. Keep
@@ -116,13 +118,19 @@ impl Session {
             let read = reader.read_frame(&mut send);
             tokio::pin!(read);
             loop {
-                let deadline = self.deadlines.first().map(|(at, _)| *at);
                 tokio::select! {
                     // Socket reads and deadlines must progress even under command pressure.
                     frame = &mut read => {
                         let frame = frame?;
                         match frame.opcode {
-                            OpCode::Text | OpCode::Binary | OpCode::Continuation => self.data(frame, &mut fragments).await?,
+                            OpCode::Text | OpCode::Binary => {
+                                // The collector has already allocated the complete message.
+                                if frame.payload.len() > MAX_MESSAGE {
+                                    return Err(Error::Protocol("message exceeds size limit"));
+                                }
+                                self.message(&frame.payload).await?;
+                            }
+                            OpCode::Continuation => return Err(Error::Protocol("unexpected continuation")),
                             OpCode::Ping | OpCode::Pong if frame.payload.len() > 125 => {
                                 return Err(Error::Protocol("oversized control frame"));
                             }
@@ -135,19 +143,34 @@ impl Session {
                         }
                         break;
                     }
-                    command = commands.recv() => {
-                        match command {
-                            Some(Command::Subscribe(subscription)) => self.subscribe(subscription).await?,
-                            Some(Command::Release(subscription)) => self.release(subscription).await?,
-                            None => return Ok(()),
+                    count = commands.recv_many(&mut batch, COMMAND_CAP) => {
+                        if count == 0 {
+                            return Ok(());
                         }
+                        if count > 1 {
+                            self.output.push(b'[');
+                        }
+                        for (index, command) in batch.drain(..).enumerate() {
+                            if index > 0 {
+                                self.output.push(b',');
+                            }
+                            match command {
+                                Command::Subscribe(sub) => self.subscribe(sub)?,
+                                Command::Release(sub) => self.release(sub)?,
+                            }
+                        }
+                        if count > 1 {
+                            self.output.push(b']');
+                        }
+                        self.flush().await?;
                     }
-                    _ = time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                    _ = self.expired() => {
                         return Err(Error::Timeout("RPC acknowledgement"));
                     }
                     _ = heartbeat.tick() => {
                         if awaiting_pong { return Err(Error::Timeout("heartbeat")); }
-                        self.writer.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(b""))).await?;
+                        let frame = Frame::new(true, OpCode::Ping, None, Payload::Borrowed(b""));
+                        self.writer.write_frame(frame).await?;
                         awaiting_pong = true;
                     }
                 }
@@ -155,174 +178,168 @@ impl Session {
         }
     }
 
-    /// Routes a complete data message or assembles fragments within the message-size bound.
-    async fn data(
-        &mut self,
-        frame: Frame<'_>,
-        fragments: &mut Option<Vec<u8>>,
-    ) -> Result<(), Error> {
-        if frame.opcode == OpCode::Continuation {
-            let data = fragments.as_mut().ok_or(Error::Protocol("unexpected continuation"))?;
-            if frame.payload.len() > MAX_MESSAGE - data.len() {
-                return Err(Error::Protocol("fragmented message exceeds size limit"));
-            }
-            data.extend_from_slice(&frame.payload);
-            if frame.fin {
-                self.message(data).await?;
-                *fragments = None;
-            }
+    /// Sends ready requests, reusing the buffer for serialization and client masking.
+    async fn flush(&mut self) -> Result<(), Error> {
+        if self.output.is_empty() {
             return Ok(());
         }
-        if fragments.is_some() {
-            return Err(Error::Protocol("interleaved data messages"));
-        }
-        if frame.fin {
-            return self.message(&frame.payload).await;
-        }
-        *fragments = Some(frame.payload.into());
+        let payload = self.orchestrator.output.as_mut_slice().into();
+        self.writer.write_frame(Frame::text(payload)).await?;
+        self.output.clear();
         Ok(())
     }
+}
 
-    /// Requests base64 account notifications; coverage begins only after acknowledgement.
-    async fn subscribe(&mut self, subscription: Subscription) -> Result<(), Error> {
-        let id = subscription.id * 2;
+impl Orchestrator {
+    fn new(events: Sender<Event>) -> Self {
+        Self {
+            pending: AHashMap::new(),
+            timers: FuturesUnordered::new(),
+            active: AHashMap::new(),
+            output: Vec::new(),
+            events,
+        }
+    }
+
+    /// Acknowledged requests wake only to discard their timers; an empty set stays idle.
+    async fn expired(&mut self) {
+        while let Some(result) = self.timers.next().await {
+            if result.is_ok() {
+                return;
+            }
+        }
+        future::pending().await
+    }
+
+    /// Requests compressed account notifications; coverage begins only after acknowledgement.
+    fn subscribe(&mut self, reservation: Reservation) -> Result<(), Error> {
         let config = AccountConfig {
-            encoding: "base64",
+            encoding: "base64+zstd",
             commitment: "confirmed",
         };
         self.request(
-            id,
-            subscription,
+            Command::Subscribe(reservation),
             "accountSubscribe",
-            (subscription.account.to_string(), config),
+            (reservation.account.to_string(), config),
         )
-        .await
     }
 
-    /// Cancels a reservation without freeing remote capacity prematurely.
-    async fn release(&mut self, subscription: Subscription) -> Result<(), Error> {
-        if let Some(pending) = self.pending.get_mut(&(subscription.id * 2)) {
-            // The remote ID does not exist until the subscribe acknowledgement arrives.
-            pending.cancelled = true;
-            return Ok(());
-        }
-        let Some(&remote) = self.remote.get(&subscription.id) else {
-            // A rejection can race a queued release; its terminal event is already sent.
-            return Ok(());
-        };
-        let id = subscription.id * 2 + 1;
-        self.request(id, subscription, "accountUnsubscribe", [remote]).await
+    /// Requests release without freeing remote capacity before acknowledgement.
+    fn release(&mut self, subscription: Subscription) -> Result<(), Error> {
+        self.request(
+            Command::Release(subscription),
+            "accountUnsubscribe",
+            [subscription.remote],
+        )
     }
 
-    /// Sends an RPC request and tracks its acknowledgement deadline.
-    async fn request(
+    /// Appends to the current wire batch; serialization and writing count toward the budget.
+    fn request(
         &mut self,
-        id: u64,
-        subscription: Subscription,
+        command: Command,
         method: &'static str,
         params: impl Serialize,
     ) -> Result<(), Error> {
-        // Time spent writing counts toward the acknowledgement budget.
-        let deadline = Instant::now() + TIMEOUT;
+        let (timer, registration) = AbortHandle::new_pair();
+        self.timers.push(Abortable::new(time::sleep(TIMEOUT), registration));
+        let id = match &command {
+            Command::Subscribe(reservation) => reservation.id * 2,
+            Command::Release(subscription) => subscription.reservation.id * 2 + 1,
+        };
+        self.pending.insert(id, Pending { command, timer });
         let request = Request {
             jsonrpc: "2.0",
             id,
             method,
             params,
         };
-        // Separate fields let the writer borrow the buffer for masking without moving it out.
-        self.output.clear();
-        sonic_rs::to_writer(&mut self.output, &request)?;
-        self.writer.write_frame(Frame::text(self.output.as_mut_slice().into())).await?;
-        self.pending.insert(
-            id,
-            Pending {
-                subscription,
-                deadline,
-                cancelled: false,
-            },
-        );
-        self.deadlines.insert((deadline, id));
+        json::to_writer(&mut self.output, &request)?;
         Ok(())
     }
 
-    /// Routes a complete provider message to its local reservation.
+    /// Batch responses may be reordered; each envelope follows the same correlation path.
     async fn message(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let message: Envelope<'_> = sonic_rs::from_slice(bytes)?;
+        if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
+            // The lazy iterator stops at `]`; validate the whole message to reject trailing data.
+            let batch: LazyValue<'_> = json::from_slice(bytes)?;
+            let mut messages = json::to_array_iter(batch.as_raw_str()).peekable();
+            if messages.peek().is_none() {
+                return Err(Error::Protocol("empty RPC batch"));
+            }
+            for message in messages {
+                self.envelope(message?.as_raw_str().as_bytes()).await?;
+            }
+        } else {
+            self.envelope(bytes).await?;
+        }
+        Ok(())
+    }
+
+    /// Validates routing before decoding an update, then waits for delivery capacity.
+    async fn envelope(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let message: Envelope<'_> = json::from_slice(bytes)?;
         if let Some(id) = message.id {
             let pending = self.pending.remove(&id).ok_or(Error::Protocol("unknown request ID"))?;
-            self.deadlines.remove(&(pending.deadline, id));
-            return self.response(id, pending, message.result, message.error).await;
+            pending.timer.abort();
+            return self.response(pending, message.result, message.error).await;
         }
         let notification = message.params.ok_or(Error::Protocol("missing notification params"))?;
         let subscription = *self
             .active
             .get(&notification.subscription)
             .ok_or(Error::Protocol("unknown remote subscription"))?;
-        // Reserve delivery before decoding account data: overflow invalidates coverage
-        // without allocating a payload that cannot be delivered.
-        let permit = self.reserve()?;
-        let account: Account = sonic_rs::from_str(notification.result.as_raw_str())?;
-        permit.send(Event::Update {
+        let account: Account = json::from_str(notification.result.as_raw_str())?;
+        self.emit(Event::Update {
             subscription,
             slot: account.context.slot,
             account: account.value,
-        });
-        Ok(())
+        })
+        .await
     }
 
     /// Applies a correlated acknowledgement to subscription state and emits its outcome.
     async fn response(
         &mut self,
-        id: u64,
         pending: Pending,
         result: Option<LazyValue<'_>>,
         error: Option<LazyValue<'_>>,
     ) -> Result<(), Error> {
-        let subscription = pending.subscription;
         if let Some(error) = error {
-            let error: RpcError = sonic_rs::from_str(error.as_raw_str())?;
+            let error: RpcError = json::from_str(error.as_raw_str())?;
             // A rejected unsubscribe leaves remote capacity ambiguous. Close the socket
             // instead of pretending the reservation is free or leaking it indefinitely.
-            if id % 2 == 1 {
-                return Err(Error::Rpc(error));
-            }
-            return self.emit(if pending.cancelled {
-                Event::Released(subscription)
-            } else {
-                Event::Rejected { subscription, error }
-            });
+            return match pending.command {
+                Command::Release(_) => Err(Error::Rpc(error)),
+                Command::Subscribe(reservation) => {
+                    self.emit(Event::Rejected { reservation, error }).await
+                }
+            };
         }
         let result = result.ok_or(Error::Protocol("missing RPC result"))?;
-        if id % 2 == 1 {
-            if result.as_bool() != Some(true) {
-                return Err(Error::Protocol("unsubscribe was not acknowledged"));
+        let event = match pending.command {
+            Command::Release(subscription) => {
+                if result.as_bool() != Some(true) {
+                    return Err(Error::Protocol("unsubscribe was not acknowledged"));
+                }
+                self.active
+                    .remove(&subscription.remote)
+                    .ok_or(Error::Protocol("release has no active subscription"))?;
+                Event::Released(subscription)
             }
-            let remote = self.remote.remove(&subscription.id).expect("release has a remote ID");
-            self.active.remove(&remote).expect("release has an active subscription");
-            return self.emit(Event::Released(subscription));
-        }
-        let remote = result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
-        self.active.insert(remote, subscription);
-        self.remote.insert(subscription.id, remote);
-        if pending.cancelled {
-            return self.release(subscription).await;
-        }
-        self.emit(Event::Established(subscription))
+            Command::Subscribe(reservation) => {
+                let remote =
+                    result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
+                let subscription = Subscription { reservation, remote };
+                self.active.insert(remote, subscription);
+                Event::Established(subscription)
+            }
+        };
+        self.emit(event).await
     }
 
-    /// Delivers without waiting; queue pressure becomes explicit coverage loss in the caller.
-    fn emit(&self, event: Event) -> Result<(), Error> {
-        self.reserve()?.send(event);
-        Ok(())
-    }
-
-    /// Claims delivery capacity without allocating an account payload or blocking socket progress.
-    fn reserve(&self) -> Result<Permit<'_, Event>, Error> {
-        self.events.try_reserve().map_err(|error| match error {
-            TrySendError::Full(_) => Error::DeliveryFull,
-            TrySendError::Closed(_) => Error::Closed,
-        })
+    /// Preserves event order and waits for the consumer rather than dropping a full queue's update.
+    async fn emit(&self, event: Event) -> Result<(), Error> {
+        self.events.send(event).await.map_err(|_| Error::Closed)
     }
 }
 
@@ -340,7 +357,7 @@ struct Request<P> {
 
 #[derive(Serialize)]
 struct AccountConfig {
-    /// Base64 keeps notification data in the wire representation exposed to callers.
+    /// Base64+zstd keeps compressed notification data in the wire representation for callers.
     encoding: &'static str,
     /// Always confirmed; this does not guarantee ordering between notifications.
     commitment: &'static str,
@@ -368,7 +385,7 @@ struct Envelope<'a> {
 struct Notification<'a> {
     /// Provider-issued ID scoped to this socket incarnation.
     subscription: u64,
-    /// Account payload left borrowed until routing and delivery capacity are checked.
+    /// Account payload left borrowed until routing is validated.
     #[serde(borrow)]
     result: LazyValue<'a>,
 }

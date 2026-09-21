@@ -1,27 +1,28 @@
 [package]
 name = "magicblock-sync"
-version = "0.1.0"
-edition = "2021"
+
 description = "Base-layer account synchronization for MagicBlock"
+edition = "2021"
 readme = "README.md"
+version = "0.1.0"
 
 [dependencies]
+ahash = "0.8"
+base64 = "0.22"
+derive_more = { version = "2.1.1", features = ["deref", "deref_mut", "display", "error"] }
+fastwebsockets = { version = "0.10", features = ["unstable-split", "upgrade"] }
 futures = "0.3"
-helius-laserstream = { git = "https://github.com/magicblock-labs/laserstream-sdk", branch = "v0.2.8+conn-fix" } # rust version "0.1.5" + conn fix
-tokio = { version = "1.0", features = ["sync", "macros", "rt", "net", "time"] }
-tracing = "0.1"
-serde = { version = "1", features = ["derive"] }
-sonic-rs = "0.5.8"
-solana-account-decoder-client-types = { version = "4.1", features = ["agave-unstable-api"] }
-solana-pubkey = "4.2"
-thiserror = "2"
-derive_more = { version = "2.1.1", features = ["display", "error", "deref"] }
-fastwebsockets = { version = "0.10", features = ["upgrade", "unstable-split"] }
-url = "2.5"
+http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
-base64 = "0.22"
+json = { version = "0.5.8", package = "sonic-rs" }
+serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
+solana-account-decoder-client-types = { version = "=4.2.2", features = ["agave-unstable-api"] }
+solana-pubkey = "=4.2.1"
+thiserror = "2"
+tokio = { version = "1.0", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing = "0.1"
+url = "2.5"
+webpki-roots = "1"

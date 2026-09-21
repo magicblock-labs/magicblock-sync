@@ -1,7 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use fastwebsockets::{handshake, WebSocket, WebSocketRead, WebSocketWrite};
+use fastwebsockets::{handshake, FragmentCollectorRead, WebSocket, WebSocketWrite};
 use http_body_util::Empty;
 use hyper::{body::Bytes, upgrade::Upgraded, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -19,13 +19,23 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::{Error, Url};
 
-pub(crate) type Reader = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
+pub(crate) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
 
 /// Outbound half; writes rely on the peer continuing to read rather than a local deadline.
 pub(crate) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 
 // Enough for a maximum-size Solana account encoded as base64, including its envelope.
 pub(crate) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+
+/// Shares TLS configuration across connections without initializing it for plain WebSockets.
+static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
+    let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports default TLS versions")
+        .with_root_certificates(RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned()))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+});
 
 /// Opens a valid provider URL; the caller bounds connection setup with one deadline.
 pub(crate) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
@@ -37,25 +47,18 @@ pub(crate) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
     tcp.set_nodelay(true)?;
     let mut socket = if url.scheme() == "wss" {
-        static TLS: OnceLock<TlsConnector> = OnceLock::new();
-        let tls = TLS.get_or_init(|| {
-            let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("ring supports default TLS versions")
-                .with_root_certificates(RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned()))
-                .with_no_client_auth();
-            TlsConnector::from(Arc::new(config))
-        });
-        upgrade(url, tls.connect(ServerName::try_from(host)?, tcp).await?).await?
+        upgrade(url, TLS.connect(ServerName::try_from(host)?, tcp).await?).await?
     } else {
         upgrade(url, tcp).await?
     };
     // Keep all outbound frames on the session's writer, including control replies.
     socket.set_auto_pong(false);
     socket.set_auto_close(false);
+    // This bounds individual frames; the session checks assembled messages separately.
     // fastwebsockets rejects lengths >= its limit, whereas MAX_MESSAGE is inclusive.
     socket.set_max_message_size(MAX_MESSAGE + 1);
-    Ok(socket.split(io::split))
+    let (reader, writer) = socket.split(io::split);
+    Ok((FragmentCollectorRead::new(reader), writer))
 }
 
 /// Upgrades an established stream, verifying the server key and rejecting unrequested extensions.

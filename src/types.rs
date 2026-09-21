@@ -1,10 +1,10 @@
 use std::io;
 
-use derive_more::Display;
+use derive_more::{Deref, Display};
 use fastwebsockets::WebSocketError;
 use hyper::http;
+use json::Value;
 use serde::Deserialize;
-use sonic_rs::Value;
 use tokio_rustls::rustls::pki_types::InvalidDnsNameError;
 
 use crate::{Pubkey, UiAccount, Url};
@@ -41,10 +41,11 @@ pub struct Connection {
 }
 
 /// An opaque reservation, unique within the pool that issued it, even after release.
+/// Admission does not imply remote coverage and cannot be released before establishment.
 /// Do not pass handles between pools. Copying a handle does not acquire another lease.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Subscription {
-    /// Account reserved exclusively within the issuing pool.
+pub struct Reservation {
+    /// Account requested by the caller; uniqueness is the caller's responsibility.
     pub(crate) account: Pubkey,
     /// Socket incarnation responsible for this reservation's coverage.
     pub(crate) connection: Connection,
@@ -52,16 +53,15 @@ pub struct Subscription {
     pub(crate) id: u64,
 }
 
-impl Subscription {
-    /// Identifies the reserved account without implying that remote coverage is established.
-    pub fn account(self) -> Pubkey {
-        self.account
-    }
-
-    /// Identifies the exact socket incarnation used to correlate coverage and loss events.
-    pub fn connection(self) -> Connection {
-        self.connection
-    }
+/// Established remote coverage, releasable only within the pool that issued it.
+/// Copying a handle does not acquire another lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deref)]
+pub struct Subscription {
+    /// Local admission identity, preserved through establishment and release.
+    #[deref]
+    pub(crate) reservation: Reservation,
+    /// Provider-issued ID, scoped to the reservation's socket incarnation.
+    pub(crate) remote: u64,
 }
 
 /// Events are ordered per socket, not across providers. Slots are observations, not a watermark.
@@ -71,21 +71,21 @@ pub enum Event {
     Connected(Connection),
     /// The provider acknowledged accountSubscribe. No initial snapshot is implied.
     Established(Subscription),
-    /// Account data remains in the requested base64 wire representation for caller-side decoding.
+    /// Account data remains in the requested base64+zstd representation for caller-side decoding.
     Update {
-        /// Reservation whose remote subscription produced this update.
+        /// Established handle whose remote subscription produced this update.
         subscription: Subscription,
         /// Provider observation slot, not a global ordering guarantee.
         slot: u64,
-        /// Base64 wire account, or `None` when the provider explicitly reports absence.
+        /// Base64+zstd wire account, or `None` when the provider explicitly reports absence.
         account: Option<UiAccount>,
     },
-    /// The provider acknowledged release, or a cancelled pending subscription was rejected.
+    /// The provider acknowledged release.
     Released(Subscription),
     /// A subscription was rejected; its reservation has been freed.
     Rejected {
         /// Reservation freed by the failed subscribe request.
-        subscription: Subscription,
+        reservation: Reservation,
         /// Provider explanation for rejecting establishment.
         error: RpcError,
     },
@@ -95,7 +95,7 @@ pub enum Event {
         /// Failed incarnation; its replacement has a distinct generation.
         connection: Connection,
         /// All reservations still held on this incarnation when the pool consumes the event.
-        subscriptions: Vec<Subscription>,
+        reservations: Vec<Reservation>,
         /// Failure that invalidated coverage, including undeliverable events.
         error: Error,
     },
@@ -115,20 +115,14 @@ pub struct RpcError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid subscription configuration: {0}")]
-    Config(&'static str),
     #[error("all provider subscription limits are exhausted")]
     Capacity,
     #[error("capacity is connecting or unavailable; wait for connection events")]
     Unavailable,
     #[error("available socket command queues are full; retry after draining events")]
     Busy,
-    #[error("this account already has reservation {0:?}")]
-    Duplicate(Subscription),
     #[error("subscription is no longer current")]
     Stale,
-    #[error("event queue overflow invalidated socket coverage")]
-    DeliveryFull,
     #[error("event receiver closed")]
     Closed,
     #[error("peer closed the socket")]
@@ -138,7 +132,7 @@ pub enum Error {
     #[error("invalid provider message: {0}")]
     Protocol(&'static str),
     #[error(transparent)]
-    Json(#[from] sonic_rs::Error),
+    Json(#[from] json::Error),
     #[error(transparent)]
     Rpc(#[from] RpcError),
     #[error(transparent)]

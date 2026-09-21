@@ -1,5 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
+use ahash::AHashMap;
 use derive_more::Deref;
 use tokio::{
     sync::mpsc::{self, error::TrySendError, Receiver, Sender},
@@ -8,11 +9,11 @@ use tokio::{
 
 use crate::{
     connection::{Command, Session},
-    Config, Connection, Error, Event, Pubkey, Subscription,
+    Config, Connection, Error, Event, Pubkey, Reservation, Subscription,
 };
 
 /// Maximum commands awaiting processing on one socket.
-const COMMAND_CAP: usize = 256;
+pub(crate) const COMMAND_CAP: usize = 256;
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
 
@@ -26,7 +27,7 @@ struct Socket {
     /// Aborted on drop so a replaced socket cannot outlive its pool entry.
     task: JoinHandle<()>,
     /// Reservations not yet released or lost, including pending and releasing ones.
-    load: usize,
+    reservations: AHashMap<u64, Admission>,
     /// Whether the pool has consumed this incarnation's `Connected` event.
     ready: bool,
     /// Retry delay for this attempt; reset when the pool observes connection success.
@@ -48,7 +49,7 @@ impl Socket {
             id,
             commands,
             task,
-            load: 0,
+            reservations: AHashMap::new(),
             ready: false,
             backoff,
         }
@@ -69,7 +70,7 @@ impl Socket {
 
     /// Checks subscription headroom; command-queue capacity is checked separately.
     fn available(&self, limit: usize) -> bool {
-        self.healthy() && self.load < limit
+        self.healthy() && self.reservations.len() < limit
     }
 }
 
@@ -81,9 +82,9 @@ impl Drop for Socket {
 }
 
 /// Local admission state retained until acknowledgement or socket loss frees capacity.
-struct Reservation {
+struct Admission {
     /// Identity used to reject stale handles and correlate lifecycle events.
-    subscription: Subscription,
+    reservation: Reservation,
     /// Whether release has been queued successfully; further releases are idempotent.
     releasing: bool,
 }
@@ -97,8 +98,6 @@ pub struct Pool {
     config: Config,
     /// Stable slots shared by all providers; reconnects replace entries in place.
     sockets: Vec<Socket>,
-    /// Unique account reservations and their local release state.
-    accounts: HashMap<Pubkey, Reservation>,
     /// Bounded delivery queue; consuming events also advances pool bookkeeping.
     events: Receiver<Event>,
     /// Shared with socket tasks and retained so the receiver never ends unexpectedly.
@@ -113,12 +112,11 @@ impl Pool {
     /// Starts one connection attempt per provider on the current Tokio runtime.
     /// Network failures arrive as `Dropped` events and retry with capped backoff.
     /// The caller must satisfy [`Config`]'s requirements; construction does not validate them.
-    pub fn new(config: Config) -> Result<Self, Error> {
+    pub fn new(config: Config) -> Self {
         let (sender, events) = mpsc::channel(EVENT_CAP);
         let mut pool = Self {
             config,
             sockets: Vec::new(),
-            accounts: HashMap::new(),
             events,
             sender,
             sequence: 0,
@@ -127,17 +125,14 @@ impl Pool {
         for provider in 0..pool.config.providers.len() {
             pool.open(provider);
         }
-        Ok(pool)
+        pool
     }
 
     /// Reserves one account on a least-loaded ready socket, rotating equal-load ties.
-    /// Pending and releasing reservations count toward limits. An account belongs to
-    /// exactly one provider until release or loss; duplicates do not acquire a lease.
+    /// Pending and releasing reservations count toward limits. The caller guarantees
+    /// at most one live subscription per account; the pool does not deduplicate accounts.
     /// Success is admission only: wait for `Established` before fetching a snapshot.
-    pub fn subscribe(&mut self, account: Pubkey) -> Result<Subscription, Error> {
-        if let Some(reservation) = self.accounts.get(&account) {
-            return Err(Error::Duplicate(reservation.subscription));
-        }
+    pub fn subscribe(&mut self, account: Pubkey) -> Result<Reservation, Error> {
         let len = self.sockets.len();
         let candidate = (0..len)
             .map(|offset| (self.cursor + offset) % len)
@@ -146,12 +141,12 @@ impl Pool {
                 socket.available(self.config.providers[socket.id.provider].subs_per_connection)
                     && socket.capacity() > 0
             })
-            .min_by_key(|&i| self.sockets[i].load);
+            .min_by_key(|&i| self.sockets[i].reservations.len());
         let Some(index) = candidate else {
             let full = self.config.providers.iter().enumerate().all(|(provider, config)| {
                 let mut sockets = self.sockets.iter().filter(|s| s.id.provider == provider);
                 sockets.clone().count() == config.max_connections
-                    && sockets.all(|s| s.load == config.subs_per_connection)
+                    && sockets.all(|s| s.reservations.len() == config.subs_per_connection)
             });
             if full {
                 return Err(Error::Capacity);
@@ -165,40 +160,45 @@ impl Pool {
         // Two wire request IDs per reservation: subscribe is even, release is odd.
         self.sequence += 1;
         let socket = &mut self.sockets[index];
-        let subscription = Subscription {
+        let reservation = Reservation {
             account,
             connection: socket.id,
             id: self.sequence,
         };
-        socket.enqueue(Command::Subscribe(subscription))?;
-        socket.load += 1;
-        self.accounts.insert(account, Reservation { subscription, releasing: false });
+        socket.enqueue(Command::Subscribe(reservation))?;
+        socket
+            .reservations
+            .insert(reservation.id, Admission { reservation, releasing: false });
         self.cursor = (index + 1) % len;
-        self.grow(subscription.connection.provider);
-        Ok(subscription)
+        self.grow(reservation.connection.provider);
+        Ok(reservation)
     }
 
-    /// Requests release, including before establishment. Idempotent while releasing.
+    /// Requests release of established coverage. Idempotent while releasing.
     /// Capacity is retained until acknowledgement or socket loss. A stale handle never
     /// releases a newer reservation for the same account. `Busy` leaves it unchanged.
     pub fn release(&mut self, subscription: Subscription) -> Result<(), Error> {
-        let Some(reservation) = self.accounts.get_mut(&subscription.account) else {
-            return Err(Error::Stale);
-        };
-        if reservation.subscription != subscription {
+        let reservation = subscription.reservation;
+        let socket = self.sockets.get_mut(reservation.connection.index).ok_or(Error::Stale)?;
+        if socket.id != reservation.connection {
             return Err(Error::Stale);
         }
-        if reservation.releasing {
+        let admission = socket.reservations.get(&reservation.id).ok_or(Error::Stale)?;
+        if admission.releasing {
             return Ok(());
         }
-        self.sockets[subscription.connection.index].enqueue(Command::Release(subscription))?;
-        reservation.releasing = true;
+        socket.enqueue(Command::Release(subscription))?;
+        socket
+            .reservations
+            .get_mut(&reservation.id)
+            .expect("reservation is current")
+            .releasing = true;
         Ok(())
     }
 
     /// Advances the registry and returns the next event. Cancellation-safe.
-    /// Call continuously: undrained bounded queues invalidate coverage rather than
-    /// silently skipping updates. There is no automatic account resubscription.
+    /// Call continuously: a full event queue pauses socket processing until drained.
+    /// There is no automatic account resubscription.
     pub async fn next(&mut self) -> Event {
         // The registry retains a sender; only its owner can close this receiver.
         let mut event = self.events.recv().await.expect("registry owns event sender");
@@ -209,20 +209,15 @@ impl Pool {
                 socket.backoff = Duration::ZERO;
                 self.grow(connection.provider);
             }
-            Event::Released(subscription) | Event::Rejected { subscription, .. } => {
-                self.accounts.remove(&subscription.account);
-                self.sockets[subscription.connection.index].load -= 1;
+            Event::Released(Subscription { reservation, .. })
+            | Event::Rejected { reservation, .. } => {
+                self.sockets[reservation.connection.index].reservations.remove(&reservation.id);
             }
-            Event::Dropped { connection, subscriptions, .. } => {
-                self.accounts.retain(|_, reservation| {
-                    let subscription = reservation.subscription;
-                    if subscription.connection != *connection {
-                        return true;
-                    }
-                    subscriptions.push(subscription);
-                    false
-                });
+            Event::Dropped { connection, reservations, .. } => {
                 let socket = &mut self.sockets[connection.index];
+                reservations.extend(
+                    socket.reservations.drain().map(|(_, admission)| admission.reservation),
+                );
                 let id = Connection {
                     generation: connection.generation + 1,
                     ..*connection
@@ -252,7 +247,7 @@ impl Pool {
             }
             if socket.healthy() {
                 healthy += 1;
-                load += socket.load;
+                load += socket.reservations.len();
             }
         }
         let config = &self.config.providers[provider];
@@ -279,11 +274,7 @@ impl Pool {
             index: self.sockets.len(),
             generation: 0,
         };
-        self.sockets.push(Socket::spawn(
-            id,
-            &self.config,
-            self.sender.clone(),
-            Duration::ZERO,
-        ));
+        let socket = Socket::spawn(id, &self.config, self.sender.clone(), Duration::ZERO);
+        self.sockets.push(socket);
     }
 }
