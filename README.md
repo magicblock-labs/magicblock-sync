@@ -60,31 +60,49 @@ the provider subscription ID; only this established handle can be released.
 Coverage starts with the provider's
 [`accountSubscribe` acknowledgement](https://solana.com/docs/rpc/websocket/accountsubscribe),
 not with admission or an initial account snapshot. MBV/Engine must ensure at most
-one live subscription per account. The pool does not check account uniqueness,
-and handles are not reference-counted. Pending establishment cannot be cancelled.
+one live subscription per account, with one lifecycle owner releasing each established
+subscription at most once, without retries. `Reservation` and `Subscription` are
+`Copy` identities, not additional leases. The pool does not check account uniqueness
+or track duplicate releases. Pending establishment cannot be cancelled.
 
 Drive `next` continuously, including while requests are pending. Admission and
 release are synchronous and can be used alongside `next` in an orchestration
-`tokio::select!` loop. `Busy` means command-queue backpressure; `Unavailable` means
-capacity is not connected yet; `Capacity` means all configured limits are occupied.
-Failed admission does not reserve capacity. Release retains capacity until the
-provider acknowledges it or the connection is lost. Repeated release calls are
-idempotent while acknowledgement is pending. Updates can still arrive during release.
+`tokio::select!` loop. `Unavailable` means no healthy socket has room or the selected
+socket has just failed; `Capacity` means all configured limits are occupied.
+Failed admission does not reserve capacity. The caller decides when to retry admission.
+
+`release` returns `()`: it enqueues without waiting for remote acknowledgement and
+ignores obsolete handles or already-lost socket mailboxes. Network and provider
+failures remain explicit events. Capacity is retained until `next` consumes the
+provider's `Released` acknowledgement or the connection's `Dropped` event. Updates
+can still arrive during release.
 
 ## Pooling and loss
 
-The pool starts with one socket per provider. It doubles a provider's sockets at
-25%, 37.5%, 50%, 62.5%, then 75% occupancy, capped by that provider's limit. Only
-one growth batch per provider is in flight. Pending and releasing subscriptions
-count toward occupancy. New accounts use the least-loaded available sockets with
-rotating ties; existing subscriptions never move just to balance load.
+The pool starts with one socket per provider. New accounts take the first healthy
+socket with room, starting from a rotating cursor. This approximates balance;
+existing subscriptions never move just to balance load, even after uneven releases.
+
+Growth uses a fixed pool-wide threshold of 75%: live reservations divided by the
+subscription capacity of all provisioned socket slots, including connecting and
+reconnecting slots and each provider's distinct limits. Pending and releasing
+subscriptions count as live until rejection, release acknowledgement, or loss is
+consumed. Replacing a socket does not change provisioned capacity.
+
+Admission crossing the threshold triggers a growth round across every provider.
+Each provider can add up to its number of healthy sockets, capped by its remaining
+connection slots. Fresh connection attempts block another batch for that provider;
+reconnects do not. Providers without healthy sockets rely on their existing attempts.
+Admission with no eligible socket also attempts growth. After a connection or loss
+event, growth is retried only if pool-wide utilization is still at least 75%.
 
 Each established socket has one I/O task and batches up to 256 queued commands
 without waiting for a full batch. Providers must support WebSocket JSON-RPC batch
 requests when multiple commands are ready; a single request is sent as a JSON
 object. No delay is added to fill a batch. Each account still has its own request ID
-and acknowledgement. The registry scans sockets,
-not accounts, for allocation; updates use direct subscription-ID lookup. There is
+and acknowledgement. Allocation stops at the first eligible socket. Successful admission
+uses constant-time pool accounting and scans for growth only at a threshold crossing. Growth rounds
+scan sockets once per provider; updates use direct subscription-ID lookup. There is
 no per-account task or lock, transport trait, or automatic resubscription.
 
 `fastwebsockets` handles framing and fragment collection; its client helper performs
@@ -102,9 +120,15 @@ acknowledgements have fixed 10-second budgets. Acknowledgement timers are driven
 `FuturesUnordered` and cancelled on response. The pool pings every 15 seconds
 and requires a pong by the next tick. Writes are untimed, assuming peers continue reading.
 
-Command queues hold up to 256 entries per socket; the shared event queue holds
-8,192 entries. These bounds are fixed, while provider limits remain configurable.
-Event sends wait for queue space instead of dropping coverage on overflow. While
+Socket command channels are unbounded, but their occupancy is logically bounded
+by the socket's subscription limit. Each live reservation has at most one queued
+command: release requires establishment, which follows processing subscribe, and
+release occurs at most once. Pending subscriptions count toward the hard limit
+immediately, so even a burst before acknowledgements cannot exceed it. There is
+no separate command-queue capacity error; 256 limits each processing batch only.
+
+The shared event queue holds 8,192 entries. Event sends wait for queue space
+instead of dropping coverage on overflow. While
 delivery is blocked, that socket pauses reads, commands, and timeout checks;
 deadline budgets still elapse. Keep draining `next` to let socket processing progress.
 

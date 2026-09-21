@@ -9,7 +9,7 @@ version = "0.1.0"
 [dependencies]
 ahash = "0.8"
 base64 = "0.22"
-derive_more = { version = "2.1.1", features = ["deref", "deref_mut", "display", "error"] }
+derive_more = { version = "2.1.1", features = ["deref", "display", "error"] }
 fastwebsockets = { version = "0.10", features = ["unstable-split", "upgrade"] }
 futures = "0.3"
 http-body-util = "0.1"

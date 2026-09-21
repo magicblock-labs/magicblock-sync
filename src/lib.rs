@@ -3,7 +3,10 @@
 //! [`Pool::subscribe`] reserves capacity; only [`Event::Established`] confirms
 //! remote coverage. Drive [`Pool::next`] continuously, including while waiting
 //! for establishment or release. Only established [`Subscription`] handles can be
-//! released; callers ensure at most one live subscription per account.
+//! released; callers ensure at most one live subscription per account and release
+//! each at most once, without retries. [`Pool::release`] enqueues without waiting for
+//! remote acknowledgement; obsolete releases are ignored. [`Event::Released`] confirms
+//! acknowledgement and frees capacity when consumed through [`Pool::next`].
 //! Reconnected sockets start empty: restoring coverage,
 //! reconciling snapshots, and applying account state belong to the caller.
 

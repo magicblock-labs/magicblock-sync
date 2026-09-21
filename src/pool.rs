@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use ahash::AHashMap;
-use derive_more::Deref;
 use tokio::{
-    sync::mpsc::{self, error::TrySendError, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, UnboundedSender},
     task::JoinHandle,
 };
 
@@ -12,22 +11,19 @@ use crate::{
     Config, Connection, Error, Event, Pubkey, Reservation, Subscription,
 };
 
-/// Maximum commands awaiting processing on one socket.
-pub(crate) const COMMAND_CAP: usize = 256;
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
 
-#[derive(Deref)]
 struct Socket {
     /// Current incarnation; replacing the task advances its generation.
     id: Connection,
-    /// Bounded admission queue for this incarnation's I/O task.
-    #[deref]
-    commands: Sender<Command>,
+    /// Logically bounded by the subscription limit: each live reservation has at most
+    /// one queued command, since release follows establishment and occurs at most once.
+    commands: UnboundedSender<Command>,
     /// Aborted on drop so a replaced socket cannot outlive its pool entry.
     task: JoinHandle<()>,
-    /// Reservations not yet released or lost, including pending and releasing ones.
-    reservations: AHashMap<u64, Admission>,
+    /// Live reservation IDs and accounts; this socket supplies their connection identity.
+    reservations: AHashMap<u64, Pubkey>,
     /// Whether the pool has consumed this incarnation's `Connected` event.
     ready: bool,
     /// Retry delay for this attempt; reset when the pool observes connection success.
@@ -37,14 +33,15 @@ struct Socket {
 impl Socket {
     /// Starts an empty incarnation with a fresh command queue after the requested delay.
     fn spawn(id: Connection, config: &Config, events: Sender<Event>, backoff: Duration) -> Self {
-        let (commands, receiver) = mpsc::channel(COMMAND_CAP);
-        let task = tokio::spawn(Session::start(
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let session = Session::start(
             id,
             config.providers[id.provider].url.clone(),
             receiver,
             events,
             backoff,
-        ));
+        );
+        let task = tokio::spawn(session);
         Self {
             id,
             commands,
@@ -55,20 +52,12 @@ impl Socket {
         }
     }
 
-    /// Queues a command without waiting, distinguishing pressure from lost admission.
-    fn enqueue(&self, command: Command) -> Result<(), Error> {
-        self.commands.try_send(command).map_err(|error| match error {
-            TrySendError::Full(_) => Error::Busy,
-            TrySendError::Closed(_) => Error::Unavailable,
-        })
-    }
-
     /// Requires observed connection success and an I/O task still accepting commands.
     fn healthy(&self) -> bool {
-        self.ready && !self.is_closed()
+        self.ready && !self.commands.is_closed()
     }
 
-    /// Checks subscription headroom; command-queue capacity is checked separately.
+    /// Pending, established, and releasing subscriptions all occupy hard capacity.
     fn available(&self, limit: usize) -> bool {
         self.healthy() && self.reservations.len() < limit
     }
@@ -79,14 +68,6 @@ impl Drop for Socket {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-/// Local admission state retained until acknowledgement or socket loss frees capacity.
-struct Admission {
-    /// Identity used to reject stale handles and correlate lifecycle events.
-    reservation: Reservation,
-    /// Whether release has been queued successfully; further releases are idempotent.
-    releasing: bool,
 }
 
 /// Single-owner subscription registry. There is one I/O task per socket, not per account.
@@ -104,7 +85,11 @@ pub struct Pool {
     sender: Sender<Event>,
     /// Last allocated reservation ID; IDs are never reused within this pool.
     sequence: u64,
-    /// First socket considered next time, rotating allocation among equal-load ties.
+    /// Total live reservations; socket maps remain authoritative for admission and loss.
+    reservations: usize,
+    /// Capacity of all provisioned slots, including connecting and reconnecting sockets.
+    capacity: usize,
+    /// First socket considered next time, rotating first-eligible allocation.
     cursor: usize,
 }
 
@@ -120,6 +105,8 @@ impl Pool {
             events,
             sender,
             sequence: 0,
+            reservations: 0,
+            capacity: 0,
             cursor: 0,
         };
         for provider in 0..pool.config.providers.len() {
@@ -128,34 +115,26 @@ impl Pool {
         pool
     }
 
-    /// Reserves one account on a least-loaded ready socket, rotating equal-load ties.
+    /// Reserves one account on the first eligible socket from a rotating cursor.
+    /// Rotation approximates balance without moving existing subscriptions.
     /// Pending and releasing reservations count toward limits. The caller guarantees
     /// at most one live subscription per account; the pool does not deduplicate accounts.
     /// Success is admission only: wait for `Established` before fetching a snapshot.
     pub fn subscribe(&mut self, account: Pubkey) -> Result<Reservation, Error> {
         let len = self.sockets.len();
-        let candidate = (0..len)
-            .map(|offset| (self.cursor + offset) % len)
-            .filter(|&i| {
-                let socket = &self.sockets[i];
-                socket.available(self.config.providers[socket.id.provider].subs_per_connection)
-                    && socket.capacity() > 0
-            })
-            .min_by_key(|&i| self.sockets[i].reservations.len());
+        let candidate = (self.cursor..len).chain(0..self.cursor).find(|&i| {
+            let socket = &self.sockets[i];
+            socket.available(self.config.providers[socket.id.provider].subs_per_connection)
+        });
         let Some(index) = candidate else {
-            let full = self.config.providers.iter().enumerate().all(|(provider, config)| {
-                let mut sockets = self.sockets.iter().filter(|s| s.id.provider == provider);
-                sockets.clone().count() == config.max_connections
-                    && sockets.all(|s| s.reservations.len() == config.subs_per_connection)
-            });
+            self.grow();
+            let full = self.reservations == self.capacity
+                && self.sockets.len()
+                    == self.config.providers.iter().map(|p| p.max_connections).sum::<usize>();
             if full {
                 return Err(Error::Capacity);
             }
-            let busy = self
-                .sockets
-                .iter()
-                .any(|s| s.available(self.config.providers[s.id.provider].subs_per_connection));
-            return Err(if busy { Error::Busy } else { Error::Unavailable });
+            return Err(Error::Unavailable);
         };
         // Two wire request IDs per reservation: subscribe is even, release is odd.
         self.sequence += 1;
@@ -165,35 +144,32 @@ impl Pool {
             connection: socket.id,
             id: self.sequence,
         };
-        socket.enqueue(Command::Subscribe(reservation))?;
         socket
-            .reservations
-            .insert(reservation.id, Admission { reservation, releasing: false });
+            .commands
+            .send(Command::Subscribe(reservation))
+            .map_err(|_| Error::Unavailable)?;
+        socket.reservations.insert(reservation.id, account);
         self.cursor = (index + 1) % len;
-        self.grow(reservation.connection.provider);
+        let was_loaded = self.loaded();
+        self.reservations += 1;
+        if !was_loaded && self.loaded() {
+            self.grow();
+        }
         Ok(reservation)
     }
 
-    /// Requests release of established coverage. Idempotent while releasing.
-    /// Capacity is retained until acknowledgement or socket loss. A stale handle never
-    /// releases a newer reservation for the same account. `Busy` leaves it unchanged.
-    pub fn release(&mut self, subscription: Subscription) -> Result<(), Error> {
+    /// Enqueues release, not a remote acknowledgement. Release each subscription at most
+    /// once, without retries; obsolete identities and lost socket mailboxes are ignored.
+    /// Capacity remains occupied until `Released` or `Dropped` is consumed via `next`.
+    pub fn release(&mut self, subscription: Subscription) {
         let reservation = subscription.reservation;
-        let socket = self.sockets.get_mut(reservation.connection.index).ok_or(Error::Stale)?;
+        // Same-pool handles retain a valid slot; only reconnects invalidate its identity.
+        let socket = &self.sockets[reservation.connection.index];
         if socket.id != reservation.connection {
-            return Err(Error::Stale);
+            return;
         }
-        let admission = socket.reservations.get(&reservation.id).ok_or(Error::Stale)?;
-        if admission.releasing {
-            return Ok(());
-        }
-        socket.enqueue(Command::Release(subscription))?;
-        socket
-            .reservations
-            .get_mut(&reservation.id)
-            .expect("reservation is current")
-            .releasing = true;
-        Ok(())
+        // A closed mailbox means coverage is already lost; its Dropped event reports why.
+        let _ = socket.commands.send(Command::Release(subscription));
     }
 
     /// Advances the registry and returns the next event. Cancellation-safe.
@@ -207,16 +183,22 @@ impl Pool {
                 let socket = &mut self.sockets[connection.index];
                 socket.ready = true;
                 socket.backoff = Duration::ZERO;
-                self.grow(connection.provider);
             }
             Event::Released(Subscription { reservation, .. })
             | Event::Rejected { reservation, .. } => {
+                // Correlated terminal responses precede loss and retire each reservation once.
                 self.sockets[reservation.connection.index].reservations.remove(&reservation.id);
+                self.reservations -= 1;
             }
             Event::Dropped { connection, reservations, .. } => {
                 let socket = &mut self.sockets[connection.index];
+                self.reservations -= socket.reservations.len();
                 reservations.extend(
-                    socket.reservations.drain().map(|(_, admission)| admission.reservation),
+                    socket.reservations.drain().map(|(id, account)| Reservation {
+                        account,
+                        connection: socket.id,
+                        id,
+                    }),
                 );
                 let id = Connection {
                     generation: connection.generation + 1,
@@ -226,18 +208,31 @@ impl Pool {
                     (socket.backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
                 self.sockets[connection.index] =
                     Socket::spawn(id, &self.config, self.sender.clone(), delay);
-                self.grow(connection.provider);
             }
             Event::Established(_) | Event::Update { .. } => {}
+        }
+        if matches!(event, Event::Connected(_) | Event::Dropped { .. }) && self.loaded() {
+            self.grow();
         }
         event
     }
 
-    /// Adds a bounded connection batch when healthy occupancy warrants more capacity.
-    fn grow(&mut self, provider: usize) {
+    /// Fixed 75% pool-wide utilization, including capacity not yet ready for admission.
+    fn loaded(&self) -> bool {
+        self.reservations * 4 >= self.capacity * 3
+    }
+
+    /// Visits every provider once; added capacity does not truncate the growth round.
+    fn grow(&mut self) {
+        for provider in 0..self.config.providers.len() {
+            self.grow_provider(provider);
+        }
+    }
+
+    /// Adds at most one socket per healthy socket, bounded by the provider's limit.
+    fn grow_provider(&mut self, provider: usize) {
         let mut count = 0;
         let mut healthy = 0usize;
-        let mut load = 0usize;
         for socket in self.sockets.iter().filter(|s| s.id.provider == provider) {
             count += 1;
             // Only fresh attempts block another growth batch. Reconnects still
@@ -247,20 +242,10 @@ impl Pool {
             }
             if socket.healthy() {
                 healthy += 1;
-                load += socket.reservations.len();
             }
         }
         let config = &self.config.providers[provider];
-        // With no healthy sockets, existing reconnect attempts restore capacity.
-        if healthy == 0 || count == config.max_connections {
-            return;
-        }
-        let capacity = healthy * config.subs_per_connection;
-        // 25%, 37.5%, 50%, 62.5%, then 75% occupancy as the pool doubles.
-        let eighths = (2 + healthy.ilog2()).min(6) as usize;
-        if load * 8 < capacity * eighths {
-            return;
-        }
+        // A full provider or one without healthy sockets naturally opens an empty batch.
         let batch = healthy.min(config.max_connections - count);
         for _ in 0..batch {
             self.open(provider);
@@ -276,5 +261,6 @@ impl Pool {
         };
         let socket = Socket::spawn(id, &self.config, self.sender.clone(), Duration::ZERO);
         self.sockets.push(socket);
+        self.capacity += self.config.providers[provider].subs_per_connection;
     }
 }

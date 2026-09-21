@@ -22,6 +22,7 @@ pub struct Provider {
 
 /// Providers for a pool; all subscriptions use confirmed commitment.
 /// Callers must supply at least one valid provider with positive limits.
+/// Total configured subscription capacity must not exceed `usize::MAX / 4`.
 /// These requirements are assumed, not checked at construction.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -54,7 +55,8 @@ pub struct Reservation {
 }
 
 /// Established remote coverage, releasable only within the pool that issued it.
-/// Copying a handle does not acquire another lease.
+/// One lifecycle owner releases it at most once, without retries. Copying a handle
+/// does not acquire another lease; release returns after enqueue, not acknowledgement.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deref)]
 pub struct Subscription {
     /// Local admission identity, preserved through establishment and release.
@@ -119,10 +121,6 @@ pub enum Error {
     Capacity,
     #[error("capacity is connecting or unavailable; wait for connection events")]
     Unavailable,
-    #[error("available socket command queues are full; retry after draining events")]
-    Busy,
-    #[error("subscription is no longer current")]
-    Stale,
     #[error("event receiver closed")]
     Closed,
     #[error("peer closed the socket")]

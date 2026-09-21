@@ -1,22 +1,20 @@
 use std::time::Duration;
 
 use crate::{
-    pool::COMMAND_CAP,
     websocket::{self, Reader, Writer, MAX_MESSAGE},
     Connection, Error, Event, Reservation, RpcError, Subscription, UiAccount, Url,
 };
 use ahash::AHashMap;
-use derive_more::{Deref, DerefMut};
 use fastwebsockets::{Frame, OpCode, Payload};
 use futures::{
     future::{self, AbortHandle, Abortable},
-    stream::FuturesUnordered,
+    stream::{self, FuturesUnordered},
     StreamExt,
 };
 use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{Sender, UnboundedReceiver},
     time::{self, Instant, MissedTickBehavior, Sleep},
 };
 
@@ -29,6 +27,8 @@ pub(crate) enum Command {
 
 /// Connection and RPC acknowledgement budget; writes are intentionally untimed.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum commands processed per socket iteration, independent of mailbox capacity.
+const COMMAND_CAP: usize = 256;
 /// Ping cadence; a missing pong at the next tick invalidates coverage.
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
@@ -39,8 +39,11 @@ struct Pending {
     timer: AbortHandle,
 }
 
-/// Owns subscription transitions, request batching, and event delivery for one incarnation.
-pub(crate) struct Orchestrator {
+/// Owns protocol state and I/O for one incarnation. Reads stay pinned across command
+/// and timer branches so partially consumed frames are never cancelled.
+pub(crate) struct Session {
+    /// Exclusive outbound half for requests and control replies.
+    writer: Writer,
     /// Wire request IDs: even for subscribe, odd for release.
     pending: AHashMap<u64, Pending>,
     /// Outstanding acknowledgement deadlines, cancelled as responses arrive.
@@ -53,22 +56,12 @@ pub(crate) struct Orchestrator {
     events: Sender<Event>,
 }
 
-/// Drives socket I/O without cancelling partial reads when commands or timers become ready.
-#[derive(Deref, DerefMut)]
-pub(crate) struct Session {
-    /// Exclusive outbound half for requests and control replies.
-    writer: Writer,
-    #[deref]
-    #[deref_mut]
-    orchestrator: Orchestrator,
-}
-
 impl Session {
     /// Runs one incarnation, closing admission before reliably reporting any coverage loss.
     pub(crate) async fn start(
         id: Connection,
         url: Url,
-        mut commands: Receiver<Command>,
+        mut commands: UnboundedReceiver<Command>,
         events: Sender<Event>,
         delay: Duration,
     ) {
@@ -79,7 +72,11 @@ impl Session {
                 .map_err(|_| Error::Timeout("connect"))??;
             let mut session = Self {
                 writer,
-                orchestrator: Orchestrator::new(events.clone()),
+                pending: AHashMap::new(),
+                timers: FuturesUnordered::new(),
+                active: AHashMap::new(),
+                output: Vec::new(),
+                events: events.clone(),
             };
             session.emit(Event::Connected(id)).await?;
             session.run(reader, &mut commands).await
@@ -100,104 +97,90 @@ impl Session {
     /// Drives reads, commands, and deadlines without cancelling partially consumed frames.
     async fn run(
         &mut self,
-        mut reader: Reader,
-        commands: &mut Receiver<Command>,
+        reader: Reader,
+        commands: &mut UnboundedReceiver<Command>,
     ) -> Result<(), Error> {
         let mut heartbeat = time::interval_at(Instant::now() + HEARTBEAT, HEARTBEAT);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut awaiting_pong = false;
         let mut batch = Vec::with_capacity(COMMAND_CAP);
-        // Automatic replies are disabled; the session sends them through its writer.
+        // The pinned stream owns the in-flight read. Dropping next() when another
+        // branch wins does not cancel a partially consumed frame or restart framing.
+        // No extra task or heap allocation is needed for the stream itself.
+        let frames = stream::unfold(reader, |mut reader| async {
+            // Automatic replies are disabled; all writes stay on the session's writer.
+            let mut send =
+                |_| async { Err::<(), _>(Error::Protocol("unexpected automatic reply")) };
+            let frame = reader.read_frame(&mut send).await;
+            Some((frame, reader))
+        });
+        tokio::pin!(frames);
         // Writes and event delivery are untimed. While either waits, this socket cannot
-        // read or check heartbeat/acknowledgement deadlines; their budgets still elapse.
-        let mut send = |_| async { Err::<(), _>(Error::Protocol("unexpected automatic reply")) };
+        // read or check deadlines, but their budgets continue to elapse.
         loop {
-            // fastwebsockets consumes header bytes before awaiting the payload. Keep
-            // this future alive across command/timer branches or partial reads corrupt
-            // framing. Split I/O uses one uncontended Tokio mutex, not another task.
-            let read = reader.read_frame(&mut send);
-            tokio::pin!(read);
-            loop {
-                tokio::select! {
-                    // Socket reads and deadlines must progress even under command pressure.
-                    frame = &mut read => {
-                        let frame = frame?;
-                        match frame.opcode {
-                            OpCode::Text | OpCode::Binary => {
-                                // The collector has already allocated the complete message.
-                                if frame.payload.len() > MAX_MESSAGE {
-                                    return Err(Error::Protocol("message exceeds size limit"));
-                                }
-                                self.message(&frame.payload).await?;
-                            }
-                            OpCode::Continuation => return Err(Error::Protocol("unexpected continuation")),
-                            OpCode::Ping | OpCode::Pong if frame.payload.len() > 125 => {
-                                return Err(Error::Protocol("oversized control frame"));
-                            }
-                            OpCode::Ping => self.writer.write_frame(Frame::pong(frame.payload)).await?,
-                            OpCode::Pong => awaiting_pong = false,
-                            OpCode::Close => {
-                                let _ = self.writer.write_frame(Frame::close(1000, b"")).await;
-                                return Err(Error::Disconnected);
-                            }
-                        }
-                        break;
+            tokio::select! {
+                biased;
+                count = commands.recv_many(&mut batch, COMMAND_CAP) => {
+                    if count == 0 {
+                        return Ok(());
                     }
-                    count = commands.recv_many(&mut batch, COMMAND_CAP) => {
-                        if count == 0 {
-                            return Ok(());
-                        }
-                        if count > 1 {
-                            self.output.push(b'[');
-                        }
-                        for (index, command) in batch.drain(..).enumerate() {
-                            if index > 0 {
-                                self.output.push(b',');
-                            }
-                            match command {
-                                Command::Subscribe(sub) => self.subscribe(sub)?,
-                                Command::Release(sub) => self.release(sub)?,
-                            }
-                        }
-                        if count > 1 {
-                            self.output.push(b']');
-                        }
-                        self.flush().await?;
+                    if count > 1 {
+                        self.output.push(b'[');
                     }
-                    _ = self.expired() => {
-                        return Err(Error::Timeout("RPC acknowledgement"));
+                    for (index, command) in batch.drain(..).enumerate() {
+                        if index > 0 {
+                            self.output.push(b',');
+                        }
+                        match command {
+                            Command::Subscribe(sub) => self.subscribe(sub)?,
+                            Command::Release(sub) => self.request(Command::Release(sub), [sub.remote])?,
+                        }
                     }
-                    _ = heartbeat.tick() => {
-                        if awaiting_pong { return Err(Error::Timeout("heartbeat")); }
-                        let frame = Frame::new(true, OpCode::Ping, None, Payload::Borrowed(b""));
-                        self.writer.write_frame(frame).await?;
-                        awaiting_pong = true;
+                    if count > 1 {
+                        self.output.push(b']');
+                    }
+                    // Reuse the nonempty batch buffer for transport masking and serialization.
+                    let payload = self.output.as_mut_slice().into();
+                    self.writer.write_frame(Frame::text(payload)).await?;
+                    self.output.clear();
+                }
+                // Socket reads and deadlines must progress even under command pressure.
+                Some(frame) = frames.next() => {
+                    let frame = frame?;
+                    match frame.opcode {
+                        OpCode::Text | OpCode::Binary => {
+                            // The collector has already allocated the complete message.
+                            if frame.payload.len() > MAX_MESSAGE {
+                                return Err(Error::Protocol("message exceeds size limit"));
+                            }
+                            self.message(&frame.payload).await?;
+                        }
+                        OpCode::Continuation => {
+                            return Err(Error::Protocol("unexpected continuation"));
+                        }
+                        OpCode::Ping | OpCode::Pong if frame.payload.len() > 125 => {
+                            return Err(Error::Protocol("oversized control frame"));
+                        }
+                        OpCode::Ping => {
+                            self.writer.write_frame(Frame::pong(frame.payload)).await?;
+                        }
+                        OpCode::Pong => awaiting_pong = false,
+                        OpCode::Close => {
+                            let _ = self.writer.write_frame(Frame::close(1000, b"")).await;
+                            return Err(Error::Disconnected);
+                        }
                     }
                 }
+                _ = self.expired() => {
+                    return Err(Error::Timeout("RPC acknowledgement"));
+                }
+                _ = heartbeat.tick() => {
+                    if awaiting_pong { return Err(Error::Timeout("heartbeat")); }
+                    let frame = Frame::new(true, OpCode::Ping, None, Payload::Borrowed(b""));
+                    self.writer.write_frame(frame).await?;
+                    awaiting_pong = true;
+                }
             }
-        }
-    }
-
-    /// Sends ready requests, reusing the buffer for serialization and client masking.
-    async fn flush(&mut self) -> Result<(), Error> {
-        if self.output.is_empty() {
-            return Ok(());
-        }
-        let payload = self.orchestrator.output.as_mut_slice().into();
-        self.writer.write_frame(Frame::text(payload)).await?;
-        self.output.clear();
-        Ok(())
-    }
-}
-
-impl Orchestrator {
-    fn new(events: Sender<Event>) -> Self {
-        Self {
-            pending: AHashMap::new(),
-            timers: FuturesUnordered::new(),
-            active: AHashMap::new(),
-            output: Vec::new(),
-            events,
         }
     }
 
@@ -217,34 +200,19 @@ impl Orchestrator {
             encoding: "base64+zstd",
             commitment: "confirmed",
         };
-        self.request(
-            Command::Subscribe(reservation),
-            "accountSubscribe",
-            (reservation.account.to_string(), config),
-        )
-    }
-
-    /// Requests release without freeing remote capacity before acknowledgement.
-    fn release(&mut self, subscription: Subscription) -> Result<(), Error> {
-        self.request(
-            Command::Release(subscription),
-            "accountUnsubscribe",
-            [subscription.remote],
-        )
+        let request = (reservation.account.to_string(), config);
+        self.request(Command::Subscribe(reservation), request)
     }
 
     /// Appends to the current wire batch; serialization and writing count toward the budget.
-    fn request(
-        &mut self,
-        command: Command,
-        method: &'static str,
-        params: impl Serialize,
-    ) -> Result<(), Error> {
+    fn request(&mut self, command: Command, params: impl Serialize) -> Result<(), Error> {
         let (timer, registration) = AbortHandle::new_pair();
         self.timers.push(Abortable::new(time::sleep(TIMEOUT), registration));
-        let id = match &command {
-            Command::Subscribe(reservation) => reservation.id * 2,
-            Command::Release(subscription) => subscription.reservation.id * 2 + 1,
+        let (id, method) = match &command {
+            Command::Subscribe(reservation) => (reservation.id * 2, "accountSubscribe"),
+            Command::Release(subscription) => {
+                (subscription.reservation.id * 2 + 1, "accountUnsubscribe")
+            }
         };
         self.pending.insert(id, Pending { command, timer });
         let request = Request {
@@ -257,7 +225,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Batch responses may be reordered; each envelope follows the same correlation path.
+    /// Batch acknowledgements may be reordered. Single replies and account notifications
+    /// are objects, so both wire shapes use the same envelope routing.
     async fn message(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
             // The lazy iterator stops at `]`; validate the whole message to reject trailing data.
@@ -338,7 +307,7 @@ impl Orchestrator {
     }
 
     /// Preserves event order and waits for the consumer rather than dropping a full queue's update.
-    async fn emit(&self, event: Event) -> Result<(), Error> {
+    async fn emit(&mut self, event: Event) -> Result<(), Error> {
         self.events.send(event).await.map_err(|_| Error::Closed)
     }
 }
