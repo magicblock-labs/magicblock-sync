@@ -12,10 +12,14 @@ use serde::Deserialize;
 use tokio::time::{self, Instant};
 
 use crate::{
-    account::WireAccount,
-    rpc::{AccountConfig, ContextValue, Request, GET_MULTIPLE_ACCOUNTS, VERSION},
-    Error, OwnedAccount, Pubkey, RpcError, Url,
+    rpc::{AccountConfig, ContextValue, Request, WireAccount, VERSION},
+    OwnedAccount, Pubkey, Url,
 };
+
+use super::Error;
+
+/// Fetches a batch of accounts with one shared response context.
+const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
 
 /// Total budget across provider selection, cooldown waits, and attempts.
 const OVERALL: Duration = Duration::from_secs(10);
@@ -115,7 +119,7 @@ impl Fetcher {
                 Ok(_) => Error::Timeout("HTTP attempt"),
                 Err(error) => error,
             };
-            let retry = retryable(&error);
+            let retry = error.retryable();
             let error = Error::Provider {
                 provider: index,
                 source: Box::new(error),
@@ -198,19 +202,6 @@ impl Fetcher {
             .map(|account| account.map(|account| account.decode(slot)).transpose())
             .collect::<Result<_, _>>()?;
         Ok(Snapshot { slot, accounts })
-    }
-}
-
-/// Only transient endpoint failures may consume the remaining failover budget.
-fn retryable(error: &Error) -> bool {
-    match error {
-        Error::Status(status) => {
-            status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
-        }
-        Error::Rpc(RpcError { code, .. }) => matches!(code, -32005 | -32016),
-        Error::Request(error) => !error.is_builder() && !error.is_decode(),
-        Error::Timeout(_) => true,
-        _ => false,
     }
 }
 

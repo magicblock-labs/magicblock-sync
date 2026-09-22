@@ -14,10 +14,11 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{
-    connection::{Command, Notice, Session, COMMAND_CAP},
-    Config, Connection, Error, Event, Pubkey,
+use super::{
+    session::{Command, Notice, Session, COMMAND_CAP},
+    Config, Connection, Error, Event,
 };
+use crate::Pubkey;
 
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
@@ -26,7 +27,7 @@ const EVENT_CAP: usize = 8192;
 type Reply = oneshot::Sender<Result<(), Error>>;
 
 /// One caller operation; operations for the same pubkey must not overlap.
-struct Request {
+struct SubscriptionRequest {
     /// Account to subscribe to or unsubscribe from.
     pubkey: Pubkey,
     /// True requests subscribe; false requests unsubscribe.
@@ -80,20 +81,20 @@ impl Drop for Socket {
     }
 }
 
-/// Commands and task lifetime shared by pool handles; never retained by the registry.
-struct Shared {
-    /// Bounded admission queue, shared by all pool handles.
-    commands: Sender<Request>,
+/// Registry task ownership and commands, shared by pool handles but not the registry.
+struct PoolTask {
+    /// Bounded admission queue shared by all pool handles.
+    commands: Sender<SubscriptionRequest>,
     /// Highest observed confirmed Solana context slot, retained across reconnects.
     slot: Arc<AtomicU64>,
     /// Dropping the last pool handle aborts the registry and therefore every socket task.
-    task: JoinHandle<()>,
+    handle: JoinHandle<()>,
 }
 
-impl Drop for Shared {
+impl Drop for PoolTask {
     /// Also stops a registry blocked on delivery to a slow event consumer.
     fn drop(&mut self) {
-        self.task.abort();
+        self.handle.abort();
     }
 }
 
@@ -104,8 +105,8 @@ impl Drop for Shared {
 /// closing the event receiver stops the pool.
 #[derive(Clone)]
 pub struct Pool {
-    /// Shared ownership without per-account locks or tasks.
-    shared: Arc<Shared>,
+    /// Keeps the registry alive without per-account locks or tasks.
+    task: Arc<PoolTask>,
 }
 
 impl Pool {
@@ -139,7 +140,7 @@ impl Pool {
         });
         (
             Self {
-                shared: Arc::new(Shared { commands, slot, task }),
+                task: Arc::new(PoolTask { commands, slot, handle: task }),
             },
             receiver,
         )
@@ -149,7 +150,7 @@ impl Pool {
     /// This watermark is not a guarantee of the current chain head.
     /// Callers must not lower or otherwise modify this watermark.
     pub fn slot(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.shared.slot)
+        Arc::clone(&self.task.slot)
     }
 
     /// Subscribes to an account and returns after server acknowledgement, not an initial snapshot.
@@ -173,9 +174,9 @@ impl Pool {
     /// Separates command admission from acknowledged completion.
     async fn request(&self, pubkey: Pubkey, subscribe: bool) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
-        self.shared
+        self.task
             .commands
-            .send(Request { pubkey, subscribe, reply })
+            .send(SubscriptionRequest { pubkey, subscribe, reply })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -208,14 +209,14 @@ impl Registry {
     /// Drives control independently of whether a caller is awaiting an operation.
     async fn run(
         &mut self,
-        mut requests: Receiver<Request>,
+        mut requests: Receiver<SubscriptionRequest>,
         mut notices: UnboundedReceiver<Notice>,
     ) {
         loop {
             tokio::select! {
                 request = requests.recv() => {
                     let Some(request) = request else { return };
-                    let Request { pubkey, subscribe, reply } = request;
+                    let SubscriptionRequest { pubkey, subscribe, reply } = request;
                     if subscribe {
                         self.subscribe(pubkey, reply);
                     } else {

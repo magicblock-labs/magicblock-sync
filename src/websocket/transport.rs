@@ -17,16 +17,17 @@ use tokio_rustls::{
 use url::{Host, Position};
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use crate::{Error, Url};
+use super::Error;
+use crate::Url;
 
 /// Inbound half that assembles fragmented frames before session-level validation.
-pub(crate) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
+pub(super) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
 
 /// Outbound half; writes rely on the peer continuing to read rather than a local deadline.
-pub(crate) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
+pub(super) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 
 /// Enough for a maximum-size Solana account encoded as base64, including its envelope.
-pub(crate) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+pub(super) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// Shares TLS configuration across connections without initializing it for plain WebSockets.
 static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLock::new(|| {
@@ -38,7 +39,7 @@ static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLo
 });
 
 /// Opens a valid provider URL; the caller bounds connection setup with one deadline.
-pub(crate) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
+pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
     let host = match url.host().ok_or(Error::Protocol("provider URL has no host"))? {
         Host::Ipv6(ip) => ip.to_string(),
         host => host.to_string(),

@@ -6,14 +6,13 @@ use std::{
     time::Duration,
 };
 
+use super::{
+    transport::{self, Reader, Writer, MAX_MESSAGE},
+    Connection, Error, Event,
+};
 use crate::{
-    account::WireAccount,
-    rpc::{
-        AccountConfig, ContextValue, Request, ACCOUNT_NOTIFICATION, ACCOUNT_SUBSCRIBE,
-        ACCOUNT_UNSUBSCRIBE,
-    },
-    websocket::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event, Pubkey, RpcError, Url,
+    rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount},
+    Pubkey, Url,
 };
 use ahash::AHashMap;
 use fastwebsockets::{Frame, OpCode, Payload};
@@ -30,8 +29,15 @@ use tokio::{
     time::{self, Instant, MissedTickBehavior, Sleep},
 };
 
+/// Establishes confirmed updates for one account.
+const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
+/// Releases an established remote subscription.
+const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
+/// Routes account updates independently of request acknowledgements.
+const ACCOUNT_NOTIFICATION: &str = "accountNotification";
+
 /// Subscription commands assigned to one connection attempt.
-pub(crate) enum Command {
+pub(super) enum Command {
     /// Subscribes to an account whose subscription capacity is already reserved.
     Subscribe(Pubkey),
     /// Unsubscribes using the provider's acknowledged subscription ID.
@@ -44,7 +50,7 @@ pub(crate) enum Command {
 }
 
 /// Control-plane outcomes consumed only by the pool registry.
-pub(crate) enum Notice {
+pub(super) enum Notice {
     /// The socket is accepting commands.
     Connected(Connection),
     /// Subscribe returns a remote ID; unsubscribe returns none; rejection returns an error.
@@ -68,7 +74,7 @@ pub(crate) enum Notice {
 /// Connection and RPC acknowledgement budget; writes are intentionally untimed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum commands processed per socket iteration, independent of mailbox capacity.
-pub(crate) const COMMAND_CAP: usize = 256;
+pub(super) const COMMAND_CAP: usize = 256;
 /// Ping cadence; a missing pong at the next tick invalidates the connection's subscriptions.
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
@@ -82,7 +88,7 @@ struct Pending {
 
 /// Owns protocol state and I/O for one connection attempt. Reads stay pinned across command
 /// and timer branches so partially consumed frames are never cancelled.
-pub(crate) struct Session {
+pub(super) struct Session {
     /// Exclusive outbound half for requests and control replies.
     writer: Writer,
     /// Monotonic request ID within this connection attempt; assumed not to exhaust u64.
@@ -108,7 +114,7 @@ pub(crate) struct Session {
 
 impl Session {
     /// Runs one connection attempt, closing its command receiver before reporting subscription loss.
-    pub(crate) async fn start(
+    pub(super) async fn start(
         id: Connection,
         url: Url,
         mut commands: UnboundedReceiver<Command>,
@@ -119,7 +125,7 @@ impl Session {
     ) {
         let result = async {
             time::sleep_until(Instant::now() + delay).await;
-            let (reader, writer) = time::timeout(TIMEOUT, websocket::connect(&url))
+            let (reader, writer) = time::timeout(TIMEOUT, transport::connect(&url))
                 .await
                 .map_err(|_| Error::Timeout("connect"))??;
             let mut session = Self {

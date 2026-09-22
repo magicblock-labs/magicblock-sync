@@ -1,20 +1,20 @@
+//! Shared JSON-RPC envelopes, account encoding policy, and provider diagnostics.
+
+use account::ENCODING;
+use derive_more::Display;
+use json::Value;
 use serde::{Deserialize, Serialize};
 
-/// Account representation supported by both transports and the shared decoder.
-pub(crate) const ENCODING: &str = "base64+zstd";
+/// Borrowed wire accounts and their decoded-data errors.
+mod account;
+
+pub use account::DecodeError;
+pub(crate) use account::WireAccount;
+
 /// Finality required for snapshots and every subscription contributing to the watermark.
 const COMMITMENT: &str = "confirmed";
 /// JSON-RPC version used for requests and response validation.
 pub(crate) const VERSION: &str = "2.0";
-/// Fetches a batch of accounts with one shared response context.
-pub(crate) const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
-/// Establishes confirmed updates for one account.
-pub(crate) const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
-/// Releases an established remote subscription.
-pub(crate) const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
-/// Routes account updates independently of request acknowledgements.
-pub(crate) const ACCOUNT_NOTIFICATION: &str = "accountNotification";
-
 /// Requests share a protocol version, but retain transport-specific methods and params.
 #[derive(Serialize)]
 pub(crate) struct Request<P> {
@@ -22,7 +22,7 @@ pub(crate) struct Request<P> {
     jsonrpc: &'static str,
     /// Correlates the acknowledgement with its originating request.
     id: u64,
-    /// RPC operation named by the shared method constants.
+    /// RPC operation selected by the transport.
     method: &'static str,
     /// Operation-specific positional arguments without an intermediate JSON tree.
     params: P,
@@ -80,4 +80,16 @@ pub(crate) struct ContextValue<T> {
     /// Required payload; explicit null is accepted only when T permits it.
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pub(crate) value: T,
+}
+
+/// The provider's JSON-RPC error, including optional diagnostic data.
+#[derive(Debug, Deserialize, Display, derive_more::Error)]
+#[display("RPC {code}: {message}")]
+pub struct Error {
+    /// Provider's JSON-RPC error code, retained without reclassification.
+    pub code: i64,
+    /// Provider's human-readable explanation.
+    pub message: String,
+    /// Optional provider-specific diagnostics preserved for the caller.
+    pub data: Option<Value>,
 }

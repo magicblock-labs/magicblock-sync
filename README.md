@@ -17,7 +17,7 @@ shared watermark. Endpoint validity is a caller contract, not a constructor chec
 All HTTP and WebSocket providers must belong to the same chain.
 
 ```rust
-use magicblock_sync::Fetcher;
+use magicblock_sync::http::Fetcher;
 
 let fetcher = Fetcher::new(
     vec!["https://api.devnet.solana.com".parse()?],
@@ -66,7 +66,7 @@ a cloneable command handle and a single event receiver. Subscribe and unsubscrib
 by pubkey; the library keeps the provider subscription IDs and routing internally.
 
 ```rust
-use magicblock_sync::{Config, Event, Pool, Provider, Pubkey};
+use magicblock_sync::{websocket::{Config, Event, Pool, Provider}, Pubkey};
 
 let (pool, mut events) = Pool::new(Config {
     providers: vec![Provider {
@@ -220,6 +220,7 @@ absence as undelegation. Updates may be consumed before the subscribe future res
 and buffered updates may outlive an unsubscribe call. Pubkeys are account identities,
 not subscription-generation tokens; reconciliation remains the caller's responsibility.
 
-The original LaserStream dependency and prototype service are removed. Their
-replacement belongs to the separate gRPC work.
-See the crate API documentation for configuration and event contracts.
+`grpc::Client` provides Yellowstone retained-account subscriptions and delegation
+lifecycle observations alongside the WebSocket pool. It reuses upstream automatic
+reconnect; orchestration owns deduplication and gap reconciliation. See its Rustdoc
+for discovery assumptions and event contracts.

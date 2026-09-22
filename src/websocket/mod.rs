@@ -1,13 +1,34 @@
-use std::io;
+//! Confirmed account subscriptions with per-provider connection pools.
+//!
+//! [`Pool`] owns subscription routing by pubkey. Its cloneable handles provide
+//! acknowledged async subscribe/unsubscribe operations; consume the separate event
+//! receiver concurrently so delivery backpressure cannot stall acknowledgements.
+//! Subscribe only without an existing subscription, then unsubscribe after successful subscribe.
+//! Operations for the same pubkey must not overlap or be cancelled. Clock is reserved
+//! for internal use. Unsubscribe tolerates subscriptions already removed by connection loss.
+//! Successful subscribe confirms the server's subscription acknowledgement, not an initial snapshot. Unsubscribe
+//! reclaims capacity before returning, but previously buffered updates may remain.
+//! Connection loss removes affected pubkeys and reports them in [`Event::Dropped`].
+//! Replacements restore only Clock; callers restore user subscriptions and reconcile snapshots.
+//!
 
-use derive_more::Display;
+use crate::{
+    rpc::{DecodeError, Error as RpcError},
+    OwnedAccount, Pubkey, Url,
+};
 use fastwebsockets::WebSocketError;
 use hyper::http;
-use json::Value;
-use serde::Deserialize;
+use std::io;
 use tokio_rustls::rustls::pki_types::InvalidDnsNameError;
 
-use crate::{OwnedAccount, Pubkey, Url};
+/// Subscription routing, capacity accounting, and task ownership.
+mod pool;
+/// Per-socket protocol state and ordered delivery.
+mod session;
+/// WebSocket setup, TLS, and upgrade validation.
+mod transport;
+
+pub use pool::Pool;
 
 /// A provider's independent hard limits. Its index in the configuration is its identity.
 #[derive(Clone, Debug)]
@@ -36,9 +57,9 @@ pub struct Connection {
     /// Index of the provider in the pool's original configuration.
     pub provider: usize,
     /// Stable index in the connection pool, reused on reconnect; unrelated to Solana slots.
-    pub(crate) index: usize,
+    index: usize,
     /// Incremented on reconnect to distinguish old and replacement connections.
-    pub(crate) generation: u64,
+    generation: u64,
 }
 
 /// Events are ordered per connection, not across connections. Solana context slots are individual
@@ -70,55 +91,9 @@ pub enum Event {
     },
 }
 
-/// The provider's JSON-RPC error, including optional diagnostic data.
-#[derive(Debug, Deserialize, Display, derive_more::Error)]
-#[display("RPC {code}: {message}")]
-pub struct RpcError {
-    /// Provider's JSON-RPC error code, retained without reclassification.
-    pub code: i64,
-    /// Provider's human-readable explanation.
-    pub message: String,
-    /// Optional provider-specific diagnostics preserved for the caller.
-    pub data: Option<Value>,
-}
-
-/// Admission, transport, and decoding failures, retaining provider causes where available.
+/// WebSocket admission, transport, and protocol failures.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The batch falls outside the supported single-request key count.
-    #[error("fetch requires between 1 and 100 keys")]
-    BatchSize,
-    /// An HTTP attempt failed on the identified configured provider.
-    #[error("HTTP provider {provider}: {source}")]
-    Provider {
-        /// Stable index in the fetcher's endpoint list.
-        provider: usize,
-        /// Original attempt failure, including transport or decoding diagnostics.
-        #[source]
-        source: Box<Error>,
-    },
-    /// The overall fetch budget expired before a complete snapshot was obtained.
-    #[error("fetch deadline exhausted")]
-    Deadline {
-        /// Most recent provider failure, if any attempt failed before exhaustion.
-        #[source]
-        last: Option<Box<Error>>,
-    },
-    /// The HTTP endpoint returned a non-success status.
-    #[error("HTTP status {0}")]
-    Status(reqwest::StatusCode),
-    /// HTTP request construction, transport, or response-body failure.
-    #[error(transparent)]
-    Request(#[from] reqwest::Error),
-    /// The declared account payload is not valid base64.
-    #[error("invalid account base64: {0}")]
-    Base64(#[from] base64::DecodeError),
-    /// The account owner is not a valid public key.
-    #[error("invalid account owner: {0}")]
-    Owner(#[from] solana_pubkey::ParsePubkeyError),
-    /// The decoded bytes do not form a valid zstd payload.
-    #[error("invalid account zstd: {0}")]
-    Zstd(#[source] io::Error),
     /// All configured subscription capacity is occupied.
     #[error("all provider subscription limits are exhausted")]
     Capacity,
@@ -143,6 +118,9 @@ pub enum Error {
     /// The provider rejected an RPC operation.
     #[error(transparent)]
     Rpc(#[from] RpcError),
+    /// Shared account decoding failed.
+    #[error(transparent)]
+    Account(#[from] DecodeError),
     /// WebSocket framing or transport failed.
     #[error(transparent)]
     Socket(#[from] WebSocketError),
