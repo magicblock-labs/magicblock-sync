@@ -27,7 +27,7 @@ const COOLDOWN: Duration = Duration::from_millis(100);
 /// One response context, preserving input order and duplicate keys.
 /// Accounts retain Uninit mode for caller classification before materialization.
 pub struct Snapshot {
-    /// Confirmed response context shared by every account in this batch.
+    /// Confirmed Solana context slot shared by every account in this response.
     pub slot: u64,
     /// Only explicit JSON null becomes None; invalid accounts fail the entire fetch.
     pub accounts: Vec<Option<OwnedAccount>>,

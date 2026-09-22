@@ -2,7 +2,8 @@
 
 Fetch account snapshots over HTTP and follow changes over WebSocket, with decoded
 Engine accounts from both transports. Provider failover and a shared confirmed
-account-update watermark keep fetching independent of any one endpoint.
+account-update watermark (the highest observed Solana context slot) keep fetching
+independent of any one endpoint.
 
 Part of the [Chainlink rewrite](https://github.com/magicblock-labs/magicblock-validator/issues/1698).
 Companion discovery, subscription-before-fetch coordination, reconciliation, and
@@ -22,7 +23,7 @@ let fetcher = Fetcher::new(
     vec!["https://api.devnet.solana.com".parse()?],
     pool.slot(),
 )?;
-// After establishing coverage, fetch while continuing to drive pool.next().
+// After subscribe succeeds, fetch while the event consumer keeps running.
 let snapshot = fetcher.fetch(&[account], None).await?;
 // snapshot.accounts follows input order, including duplicates.
 ```
@@ -60,14 +61,14 @@ health probing. Dropping a fetch future cancels its I/O without detached work.
 
 ## Subscriptions
 
-Create the pool inside a Tokio runtime with networking and time enabled. Each
-provider has a typed `Url` and its own connection and per-connection subscription
-limits. Both `ws` and `wss` endpoints are supported.
+Create the pool inside a Tokio runtime with networking and time enabled. It returns
+a cloneable command handle and a single event receiver. Subscribe and unsubscribe
+by pubkey; the library keeps the provider subscription IDs and routing internally.
 
 ```rust
 use magicblock_sync::{Config, Event, Pool, Provider, Pubkey};
 
-let mut pool = Pool::new(Config {
+let (pool, mut events) = Pool::new(Config {
     providers: vec![Provider {
         url: "wss://api.devnet.solana.com".parse()?,
         max_connections: 8,
@@ -75,96 +76,103 @@ let mut pool = Pool::new(Config {
     }],
 });
 
-// Wait for a socket to become available; failures are observable and retried.
-loop {
-    match pool.next().await {
+// Subscribe fails fast while connections are opening. Wait for initial readiness.
+while let Some(event) = events.recv().await {
+    match event {
         Event::Connected(_) => break,
         Event::Dropped { error, .. } => eprintln!("connection failed: {error}"),
         _ => {}
     }
 }
-let account: Pubkey = "11111111111111111111111111111111".parse()?;
-let reservation = pool.subscribe(account)?;
 
-loop {
-    match pool.next().await {
-        Event::Established(subscription) if *subscription == reservation => {
-            // Coverage now exists: orchestration may start its HTTP snapshot.
-            // Retain subscription to call pool.release(subscription) when finished.
+// Drain events concurrently, including while commands await acknowledgement.
+let consumer = tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::Update { pubkey, slot, account } => {
+                // Reconcile this observation with the HTTP snapshot before applying it.
+                println!("{pubkey} at {slot}: present={}", account.is_some());
+            }
+            Event::Dropped { pubkeys, error, .. } => {
+                // These accounts lost their subscriptions. Orchestration decides what to restore.
+                eprintln!("lost {} subscriptions: {error}", pubkeys.len());
+            }
+            Event::Connected(_) => {}
         }
-        Event::Update { subscription, slot, account } => {
-            // Reconcile by subscription identity and slot before applying state.
-        }
-        Event::Dropped { reservations: lost, error, .. } => {
-            // Invalidate this coverage. Orchestration decides whether to restore it.
-            break;
-        }
-        Event::Rejected { error, .. } => return Err(error.into()),
-        _ => {}
     }
-}
-// After requesting release, keep draining events until Released or Dropped.
-// Dropping the pool closes every socket.
+});
+
+let account: Pubkey = "11111111111111111111111111111111".parse()?;
+pool.subscribe(account).await?;
+// The server acknowledged subscribe: fetch and reconcile the HTTP snapshot here.
+// Later, when the subscription is no longer needed:
+pool.unsubscribe(account).await?;
+
+drop(pool); // Dropping the last handle stops the registry and all socket tasks.
+consumer.await?;
 ```
 
-`subscribe` returns a `Reservation` identifying admitted work, not a releasable
-handle. `Established` supplies a `Subscription` containing that reservation and
-the provider subscription ID; only this established handle can be released.
-Coverage starts with the provider's
-[`accountSubscribe` acknowledgement](https://solana.com/docs/rpc/websocket/accountsubscribe),
-not with admission or an initial account snapshot. MBV/Engine must ensure at most
-one live subscription per account, with one lifecycle owner releasing each established
-subscription at most once, without retries. `Reservation` and `Subscription` are
-`Copy` identities, not additional leases. The pool does not check account uniqueness
-or track duplicate releases. Pending establishment cannot be cancelled.
+Each admitted operation returns after the server responds and the library updates
+its registry. Successful subscribe confirms the server's acknowledgement,
+**not an initial account snapshot**.
+Successful unsubscribe frees capacity, but updates already buffered in the event
+queue can still arrive afterward. There are no public subscription handles or
+separate acknowledgement events.
 
-Drive `next` continuously, including while requests are pending. Admission and
-release are synchronous and can be used alongside `next` in an orchestration
-`tokio::select!` loop. `Unavailable` means no healthy socket has room or the selected
-socket has just failed; `Capacity` means all configured limits are occupied.
-Failed admission does not reserve capacity. The caller decides when to retry admission.
+Clone `Pool` to operate on different accounts concurrently. Calls for the **same
+pubkey must not overlap**, and callers must not cancel their operation futures.
+Subscribe only when the account has no existing subscription or pending operation, and
+unsubscribe only after successful subscribe. There is no duplicate-subscribe handling
+or reference counting. Unsubscribe succeeds if connection loss already removed the
+subscription. If a waiter disappears, accepted requests still finish internally rather than
+rolling back.
 
-`release` returns `()`: it enqueues without waiting for remote acknowledgement and
-ignores obsolete handles or already-lost socket mailboxes. Network and provider
-failures remain explicit events. Capacity is retained until `next` consumes the
-provider's `Released` acknowledgement or the connection's `Dropped` event. Updates
-can still arrive during release.
+`Unavailable` means no healthy socket currently has room; `Capacity` means all
+configured limits are occupied. Neither reserves capacity or waits for a new socket.
+The caller decides when to retry. Subscribe rejection returns the provider's RPC
+error. Socket failure completes pending calls with `Disconnected`; the `Dropped`
+event carries the precise cause and affected pubkeys. Closing or dropping the event
+receiver also stops the pool, completing outstanding calls with `Closed`.
 
 ## Pooling and loss
 
 The pool starts with one socket per provider. Each initial socket reserves one
-subscription for internal confirmed Clock tracking before user admission, including
-when reconnecting. Growth sockets do not subscribe to Clock. This reservation counts
+subscription for internal confirmed Clock tracking before accepting user requests, including
+when reconnecting. Additional connections do not subscribe to Clock. This subscription counts
 toward hard capacity and utilization, but its establishment and updates are hidden.
 Clock keeps the watermark advancing even when there are no user subscriptions;
 its updates follow the same decoding and watermark path as other accounts.
-Public `subscribe(Clock)` is rejected. Clock rejection or an invalid notification
-closes that socket through the normal `Dropped` and reconnect path.
+Clock is reserved: callers must never pass its pubkey to `subscribe` or `unsubscribe`.
+A provider rejection of Clock or an invalid notification closes that socket through
+the normal `Dropped` and reconnect path.
 
 New accounts take the first healthy socket with room, starting from a rotating
 cursor. This approximates balance;
 existing subscriptions never move just to balance load, even after uneven releases.
 
-Growth uses a fixed pool-wide threshold of 75%: live reservations divided by the
-subscription capacity of all provisioned socket slots, including connecting and
-reconnecting slots and each provider's distinct limits. Pending and releasing
-subscriptions count as live until rejection, release acknowledgement, or loss is
-consumed. Replacing a socket does not change provisioned capacity.
+Pool growth starts at 75% utilization: occupied subscription capacity divided by
+the total capacity of all connection-pool entries. Each entry contributes its
+provider's per-connection limit, even while connecting or reconnecting. Clock and
+pending subscribe/unsubscribe requests occupy capacity until the registry processes
+rejection, unsubscribe acknowledgement, or connection loss. Reconnecting an
+existing pool entry does not change total capacity.
 
-Admission crossing the threshold triggers a growth round across every provider.
+Accepting a subscribe request that crosses the threshold triggers growth across every provider.
 Each provider can add up to its number of healthy sockets, capped by its remaining
-connection slots. Fresh connection attempts block another batch for that provider;
+connection limit. Initial connection attempts block another growth batch for that provider;
 reconnects do not. Providers without healthy sockets rely on their existing attempts.
-Admission with no eligible socket also attempts growth. After a connection or loss
+A subscribe request with no eligible connection also attempts growth. After a connection or loss
 event, growth is retried only if pool-wide utilization is still at least 75%.
 
-Each established socket has one I/O task and batches up to 256 queued commands
+One background task owns pool routing and lifecycle bookkeeping. Each socket has
+one I/O task and batches up to 256 queued commands
 without waiting for a full batch. Providers must support WebSocket JSON-RPC batch
 requests when multiple commands are ready; a single request is sent as a JSON
 object. No delay is added to fill a batch. Each account still has its own request ID
 and acknowledgement. Allocation stops at the first eligible socket. Successful admission
 uses constant-time pool accounting and scans for growth only at a threshold crossing. Growth rounds
-scan sockets once per provider; updates use direct subscription-ID lookup. There is
+scan sockets once per provider. Updates use direct subscription-ID lookup and go
+straight from the socket task to the consumer queue, bypassing the pool registry. There is
 no per-account task or lock, transport trait, or automatic user resubscription.
 
 `fastwebsockets` handles framing and fragment collection; its client helper performs
@@ -183,33 +191,34 @@ acknowledgements have fixed 10-second budgets. Acknowledgement timers are driven
 `FuturesUnordered` and cancelled on response. The pool pings every 15 seconds
 and requires a pong by the next tick. Writes are untimed, assuming peers continue reading.
 
+The shared client command queue holds 256 requests; sending waits for space.
 Socket command channels are unbounded, but their occupancy is logically bounded
-by the socket's subscription limit. Each live reservation has at most one queued
-command: release requires establishment, which follows processing subscribe, and
-release occurs at most once. Pending subscriptions count toward the hard limit
-immediately, so even a burst before acknowledgements cannot exceed it. There is
-no separate command-queue capacity error; 256 limits each processing batch only.
+by subscription capacity and the non-overlapping-operation contract. Internal
+acknowledgements use a separate channel, bounded logically by admitted work and
+socket count. Pending subscriptions count toward the hard limit immediately, so
+a burst before acknowledgements cannot exceed it.
 
 The shared event queue holds 8,192 entries. Event sends wait for queue space
-instead of dropping coverage on overflow. While
+instead of dropping updates or disconnecting when the queue is full. While
 delivery is blocked, that socket pauses reads, commands, and timeout checks;
-deadline budgets still elapse. Keep draining `next` to let socket processing progress.
+deadline budgets still elapse. The registry can also wait for space to report connection
+events. Keep consuming the receiver concurrently with subscription operations.
 
 Disconnects, protocol errors, and acknowledgement/heartbeat timeouts produce
-`Dropped` with the old connection identity and all affected
-user reservations, including queued requests and pending establishment; internal
-Clock reservations are omitted. Only the affected
-socket's reservation map is drained. The socket closes before this terminal event
-waits for queue space.
+`Dropped` with the old connection identity and all affected user pubkeys, including
+pending establishment and unsubscription; Clock is omitted. The registry removes only
+the affected socket's accounts and completes pending calls before publishing loss.
+The socket closes before this terminal event waits for queue space.
 Already queued events from that socket precede its loss notification. Replacements
-restore only their internal Clock reservation, have new identities, and retry with
+restore only their internal Clock subscription, have new identities, and retry with
 exponential backoff from one to thirty seconds. A rejected unsubscribe also closes the socket because its remote
 capacity cannot safely be reclaimed.
 
-Updates preserve context slots and return decoded account values. Different providers
+Updates preserve Solana context slots and return decoded account values. Different providers
 have no shared event order; this layer neither deduplicates updates nor interprets
-absence as undelegation. Stale subscription handles cannot release replacement
-coverage. Handles belong to the pool that issued them.
+absence as undelegation. Updates may be consumed before the subscribe future resumes,
+and buffered updates may outlive an unsubscribe call. Pubkeys are account identities,
+not subscription-generation tokens; reconciliation remains the caller's responsibility.
 
 The original LaserStream dependency and prototype service are removed. Their
 replacement belongs to the separate gRPC work.

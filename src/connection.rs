@@ -10,10 +10,10 @@ use crate::{
     account::WireAccount,
     rpc::{
         AccountConfig, ContextValue, Request, ACCOUNT_NOTIFICATION, ACCOUNT_SUBSCRIBE,
-        ACCOUNT_UNSUBSCRIBE, VERSION,
+        ACCOUNT_UNSUBSCRIBE,
     },
     websocket::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event, Reservation, RpcError, Subscription, Url,
+    Connection, Error, Event, Pubkey, RpcError, Url,
 };
 use ahash::AHashMap;
 use fastwebsockets::{Frame, OpCode, Payload};
@@ -24,67 +24,96 @@ use futures::{
 };
 use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
+use solana_sdk_ids::sysvar::clock;
 use tokio::{
-    sync::mpsc::{Sender, UnboundedReceiver},
+    sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     time::{self, Instant, MissedTickBehavior, Sleep},
 };
 
-/// Work admitted by the pool for this socket incarnation.
+/// Subscription commands assigned to one connection attempt.
 pub(crate) enum Command {
-    /// Requests remote coverage for an already admitted reservation.
-    Subscribe(
-        /// Capacity already reserved by the pool.
-        Reservation,
-    ),
-    /// Unsubscribes acknowledged coverage using its provider ID.
-    Release(
-        /// Established coverage whose capacity remains held until acknowledgement.
-        Subscription,
-    ),
+    /// Subscribes to an account whose subscription capacity is already reserved.
+    Subscribe(Pubkey),
+    /// Unsubscribes using the provider's acknowledged subscription ID.
+    Unsubscribe {
+        /// Account being unsubscribed.
+        pubkey: Pubkey,
+        /// Provider-issued subscription ID.
+        remote: u64,
+    },
+}
+
+/// Control-plane outcomes consumed only by the pool registry.
+pub(crate) enum Notice {
+    /// The socket is accepting commands.
+    Connected(Connection),
+    /// Subscribe returns a remote ID; unsubscribe returns none; rejection returns an error.
+    Acknowledged {
+        /// Connection identity responsible for the operation.
+        connection: Connection,
+        /// Account whose operation completed.
+        pubkey: Pubkey,
+        /// Provider response, validated by the socket task.
+        result: Result<Option<u64>, Error>,
+    },
+    /// All subscriptions on this connection are lost; no further updates can follow.
+    Dropped {
+        /// Failed connection identity.
+        connection: Connection,
+        /// Precise cause, retained for the public loss event.
+        error: Error,
+    },
 }
 
 /// Connection and RPC acknowledgement budget; writes are intentionally untimed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum commands processed per socket iteration, independent of mailbox capacity.
-const COMMAND_CAP: usize = 256;
-/// Ping cadence; a missing pong at the next tick invalidates coverage.
+pub(crate) const COMMAND_CAP: usize = 256;
+/// Ping cadence; a missing pong at the next tick invalidates the connection's subscriptions.
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
-/// A sent request whose acknowledgement still owns a deadline and reservation.
+/// A sent request awaiting acknowledgement within its deadline.
 struct Pending {
-    /// Retains the admission identity and, for release, the provider subscription ID.
+    /// Retains the pubkey and, for unsubscribe, the provider subscription ID.
     command: Command,
     /// Cancels the acknowledgement timer once a response is correlated.
     timer: AbortHandle,
 }
 
-/// Owns protocol state and I/O for one incarnation. Reads stay pinned across command
+/// Owns protocol state and I/O for one connection attempt. Reads stay pinned across command
 /// and timer branches so partially consumed frames are never cancelled.
 pub(crate) struct Session {
     /// Exclusive outbound half for requests and control replies.
     writer: Writer,
-    /// Wire request IDs: even for subscribe, odd for release.
+    /// Monotonic request ID within this connection attempt; assumed not to exhaust u64.
+    sequence: u64,
+    /// Wire request IDs correlate acknowledgements with pending commands.
     pending: AHashMap<u64, Pending>,
     /// Outstanding acknowledgement deadlines, cancelled as responses arrive.
     timers: FuturesUnordered<Abortable<Sleep>>,
-    /// Provider IDs route notifications to established handles.
-    active: AHashMap<u64, Subscription>,
+    /// Provider IDs route notifications directly to pubkeys.
+    active: AHashMap<u64, Pubkey>,
+    /// Identity supplied with every internal lifecycle outcome.
+    id: Connection,
+    /// Lifecycle-only channel; account updates bypass the registry.
+    notices: UnboundedSender<Notice>,
     /// Reused by serialization and transport masking for objects and request batches.
     output: Vec<u8>,
     /// Bounded delivery applies backpressure to this socket's protocol processing.
     events: Sender<Event>,
-    /// Pool-wide freshness floor for HTTP fetches. Valid confirmed updates only
+    /// Pool-wide minimum Solana context slot for HTTP fetches. Valid confirmed updates only
     /// raise it; it survives this socket's replacement and is not a chain-head guarantee.
     slot: Arc<AtomicU64>,
 }
 
 impl Session {
-    /// Runs one incarnation, closing admission before reliably reporting any coverage loss.
+    /// Runs one connection attempt, closing its command receiver before reporting subscription loss.
     pub(crate) async fn start(
         id: Connection,
         url: Url,
         mut commands: UnboundedReceiver<Command>,
         events: Sender<Event>,
+        notices: UnboundedSender<Notice>,
         delay: Duration,
         slot: Arc<AtomicU64>,
     ) {
@@ -95,6 +124,9 @@ impl Session {
                 .map_err(|_| Error::Timeout("connect"))??;
             let mut session = Self {
                 writer,
+                sequence: 0,
+                id,
+                notices: notices.clone(),
                 pending: AHashMap::new(),
                 timers: FuturesUnordered::new(),
                 active: AHashMap::new(),
@@ -102,19 +134,14 @@ impl Session {
                 events: events.clone(),
                 slot,
             };
-            session.emit(Event::Connected(id)).await?;
+            session.notify(Notice::Connected(id))?;
             session.run(reader, &mut commands).await
         }
         .await;
-        // Stop admission and drop the socket before waiting to report coverage loss.
+        // Close the command receiver and drop the socket before reporting subscription loss.
         commands.close();
         if let Err(error) = result {
-            let msg = Event::Dropped {
-                connection: id,
-                reservations: Vec::new(),
-                error,
-            };
-            let _ = events.send(msg).await;
+            let _ = notices.send(Notice::Dropped { connection: id, error });
         }
     }
 
@@ -156,8 +183,13 @@ impl Session {
                             self.output.push(b',');
                         }
                         match command {
-                            Command::Subscribe(sub) => self.subscribe(sub)?,
-                            Command::Release(sub) => self.request(Command::Release(sub), [sub.remote])?,
+                            Command::Subscribe(pubkey) => {
+                                let params = (pubkey.to_string(), AccountConfig::new(None));
+                                self.request(Command::Subscribe(pubkey), params)?;
+                            }
+                            Command::Unsubscribe { pubkey, remote } => {
+                                self.request(Command::Unsubscribe { pubkey, remote }, [remote])?;
+                            }
                         }
                     }
                     if count > 1 {
@@ -218,21 +250,18 @@ impl Session {
         future::pending().await
     }
 
-    /// Requests compressed account notifications; coverage begins only after acknowledgement.
-    fn subscribe(&mut self, reservation: Reservation) -> Result<(), Error> {
-        let request = (reservation.account.to_string(), AccountConfig::new(None));
-        self.request(Command::Subscribe(reservation), request)
-    }
-
     /// Appends to the current wire batch; serialization and writing count toward the budget.
     fn request(&mut self, command: Command, params: impl Serialize) -> Result<(), Error> {
         let (timer, registration) = AbortHandle::new_pair();
-        self.timers.push(Abortable::new(time::sleep(TIMEOUT), registration));
-        let (id, method) = match &command {
-            Command::Subscribe(reservation) => (reservation.id * 2, ACCOUNT_SUBSCRIBE),
-            Command::Release(subscription) => {
-                (subscription.reservation.id * 2 + 1, ACCOUNT_UNSUBSCRIBE)
-            }
+        self.timers.push(Abortable::new(
+            time::sleep_until(Instant::now() + TIMEOUT),
+            registration,
+        ));
+        self.sequence += 1;
+        let id = self.sequence;
+        let method = match &command {
+            Command::Subscribe(_) => ACCOUNT_SUBSCRIBE,
+            Command::Unsubscribe { .. } => ACCOUNT_UNSUBSCRIBE,
         };
         self.pending.insert(id, Pending { command, timer });
         let request = Request::new(id, method, params);
@@ -262,22 +291,19 @@ impl Session {
     /// Validates routing before decoding an update, then waits for delivery capacity.
     async fn envelope(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let message: Envelope<'_> = json::from_slice(bytes)?;
-        if message.jsonrpc != VERSION {
-            return Err(Error::Protocol("invalid RPC version"));
-        }
         if let Some(id) = message.id {
             if message.result.is_some() == message.error.is_some() {
                 return Err(Error::Protocol("invalid RPC response envelope"));
             }
             let pending = self.pending.remove(&id).ok_or(Error::Protocol("unknown request ID"))?;
             pending.timer.abort();
-            return self.response(pending, message.result, message.error).await;
+            return self.response(pending, message.result, message.error);
         }
         if message.method != Some(ACCOUNT_NOTIFICATION) {
             return Err(Error::Protocol("invalid notification method"));
         }
         let notification = message.params.ok_or(Error::Protocol("missing notification params"))?;
-        let subscription = *self
+        let pubkey = *self
             .active
             .get(&notification.subscription)
             .ok_or(Error::Protocol("unknown remote subscription"))?;
@@ -287,14 +313,17 @@ impl Session {
         let account = account.value.map(|value| value.decode(slot)).transpose()?;
         // Every valid confirmed update contributes, including explicit absence.
         self.slot.fetch_max(slot, Relaxed);
-        if subscription.reservation.id == 0 {
+        if pubkey == clock::ID {
             return Ok(());
         }
-        self.emit(Event::Update { subscription, slot, account }).await
+        self.events
+            .send(Event::Update { pubkey, slot, account })
+            .await
+            .map_err(|_| Error::Closed)
     }
 
-    /// Applies a correlated acknowledgement to subscription state and emits its outcome.
-    async fn response(
+    /// Updates wire routing before reporting an acknowledgement to the registry.
+    fn response(
         &mut self,
         pending: Pending,
         result: Option<LazyValue<'_>>,
@@ -302,46 +331,49 @@ impl Session {
     ) -> Result<(), Error> {
         if let Some(error) = error {
             let error: RpcError = json::from_str(error.as_raw_str())?;
-            // A rejected unsubscribe leaves remote capacity ambiguous. Close the socket
-            // instead of pretending the reservation is free or leaking it indefinitely.
+            // Clock is mandatory; rejected unsubscribe leaves remote capacity ambiguous.
             return match pending.command {
-                Command::Release(_) => Err(Error::Rpc(error)),
-                Command::Subscribe(reservation) if reservation.id == 0 => Err(Error::Rpc(error)),
-                Command::Subscribe(reservation) => {
-                    self.emit(Event::Rejected { reservation, error }).await
+                Command::Subscribe(pubkey) if pubkey != clock::ID => {
+                    self.notify(Notice::Acknowledged {
+                        connection: self.id,
+                        pubkey,
+                        result: Err(Error::Rpc(error)),
+                    })
                 }
+                _ => Err(Error::Rpc(error)),
             };
         }
         let result = result.ok_or(Error::Protocol("missing RPC result"))?;
-        let event = match pending.command {
-            Command::Release(subscription) => {
+        let (pubkey, remote) = match pending.command {
+            Command::Unsubscribe { pubkey, remote } => {
                 if result.as_bool() != Some(true) {
                     return Err(Error::Protocol("unsubscribe was not acknowledged"));
                 }
-                self.active
-                    .remove(&subscription.remote)
-                    .ok_or(Error::Protocol("release has no active subscription"))?;
-                Event::Released(subscription)
+                self.active.remove(&remote);
+                (pubkey, None)
             }
-            Command::Subscribe(reservation) => {
+            Command::Subscribe(pubkey) => {
                 let remote =
                     result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
-                let subscription = Subscription { reservation, remote };
-                if self.active.insert(remote, subscription).is_some() {
+                if self.active.insert(remote, pubkey).is_some() {
                     return Err(Error::Protocol("duplicate remote subscription ID"));
                 }
-                if reservation.id == 0 {
+                if pubkey == clock::ID {
                     return Ok(());
                 }
-                Event::Established(subscription)
+                (pubkey, Some(remote))
             }
         };
-        self.emit(event).await
+        self.notify(Notice::Acknowledged {
+            connection: self.id,
+            pubkey,
+            result: Ok(remote),
+        })
     }
 
-    /// Preserves event order and waits for the consumer rather than dropping a full queue's update.
-    async fn emit(&mut self, event: Event) -> Result<(), Error> {
-        self.events.send(event).await.map_err(|_| Error::Closed)
+    /// Lifecycle outcomes remain ordered per socket without blocking account-update delivery.
+    fn notify(&self, notice: Notice) -> Result<(), Error> {
+        self.notices.send(notice).map_err(|_| Error::Closed)
     }
 }
 
@@ -351,8 +383,6 @@ impl Session {
 /// Borrowed routing envelope, validated before interpreting its operation-specific payload.
 #[derive(Deserialize)]
 struct Envelope<'a> {
-    /// Protocol version checked before routing acknowledgements or updates.
-    jsonrpc: &'a str,
     /// Account-notification method for messages without a request ID.
     method: Option<&'a str>,
     /// Presence selects response handling; absence selects notification handling.
@@ -371,7 +401,7 @@ struct Envelope<'a> {
 /// Account update tied to an established remote subscription.
 #[derive(Deserialize)]
 struct Notification<'a> {
-    /// Provider-issued ID scoped to this socket incarnation.
+    /// Provider-issued subscription ID, valid only on this connection.
     subscription: u64,
     /// Account payload left borrowed until routing is validated.
     #[serde(borrow)]

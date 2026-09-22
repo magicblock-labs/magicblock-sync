@@ -1,4 +1,5 @@
 use std::{
+    collections::hash_map::Entry::Occupied,
     sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
@@ -6,85 +7,69 @@ use std::{
 use ahash::AHashMap;
 use solana_sdk_ids::sysvar::clock;
 use tokio::{
-    sync::mpsc::{self, Receiver, Sender, UnboundedSender},
+    sync::{
+        mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     task::JoinHandle,
 };
 
 use crate::{
-    connection::{Command, Session},
-    Config, Connection, Error, Event, Pubkey, Reservation, Subscription,
+    connection::{Command, Notice, Session, COMMAND_CAP},
+    Config, Connection, Error, Event, Pubkey,
 };
 
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
 
-/// One provisioned slot, with capacity held across its current connection attempt.
+/// Completes an operation only after registry bookkeeping reflects its outcome.
+type Reply = oneshot::Sender<Result<(), Error>>;
+
+/// One caller operation; operations for the same pubkey must not overlap.
+struct Request {
+    /// Account to subscribe to or unsubscribe from.
+    pubkey: Pubkey,
+    /// True requests subscribe; false requests unsubscribe.
+    subscribe: bool,
+    /// Waiter for admission failure or the server's acknowledgement.
+    reply: Reply,
+}
+
+/// Subscription state that occupies capacity until rejection, unsubscribe acknowledgement, or connection loss.
+enum Subscription {
+    /// One subscribe or unsubscribe awaiting acknowledgement; capacity remains occupied.
+    Pending(Reply),
+    /// Acknowledged subscription identified by the provider's subscription ID.
+    Active(u64),
+}
+
+/// One connection-pool entry; its allocated capacity is retained across reconnect attempts.
 struct Socket {
-    /// Current incarnation; replacing the task advances its generation.
+    /// Current connection identity; replacing the task advances its generation.
     id: Connection,
-    /// Logically bounded by the subscription limit: each live reservation has at most
-    /// one queued command, since release follows establishment and occurs at most once.
+    /// Logically bounded by capacity and the caller's non-overlapping-operation contract.
     commands: UnboundedSender<Command>,
     /// Aborted on drop so a replaced socket cannot outlive its pool entry.
     task: JoinHandle<()>,
-    /// Live reservation IDs and accounts; this socket supplies their connection identity.
-    reservations: AHashMap<u64, Pubkey>,
-    /// Whether the pool has consumed this incarnation's `Connected` event.
+    /// User subscription states and pending replies for this connection.
+    accounts: AHashMap<Pubkey, Subscription>,
+    /// Whether the registry has observed connection success.
     ready: bool,
-    /// Retry delay for this attempt; reset when the pool observes connection success.
+    /// Whether this pool entry maintains its provider's internal Clock subscription.
+    clock: bool,
+    /// Retry delay, reset when the registry observes connection success.
     backoff: Duration,
 }
 
 impl Socket {
-    /// Starts an incarnation with a fresh queue, restoring Clock before user admission.
-    fn spawn(
-        id: Connection,
-        config: &Config,
-        events: Sender<Event>,
-        backoff: Duration,
-        clock: bool,
-        slot: Arc<AtomicU64>,
-    ) -> Self {
-        let (commands, receiver) = mpsc::unbounded_channel();
-        let mut reservations = AHashMap::new();
-        if clock {
-            // Queue before spawning or exposing admission, ahead of every user command.
-            let reservation = Reservation {
-                account: clock::ID,
-                connection: id,
-                id: 0,
-            };
-            // The receiver remains local until Session::start takes ownership.
-            let _ = commands.send(Command::Subscribe(reservation));
-            reservations.insert(0, clock::ID);
-        }
-        let session = Session::start(
-            id,
-            config.providers[id.provider].url.clone(),
-            receiver,
-            events,
-            backoff,
-            slot,
-        );
-        let task = tokio::spawn(session);
-        Self {
-            id,
-            commands,
-            task,
-            reservations,
-            ready: false,
-            backoff,
-        }
-    }
-
     /// Requires observed connection success and an I/O task still accepting commands.
     fn healthy(&self) -> bool {
         self.ready && !self.commands.is_closed()
     }
 
-    /// Pending, established, and releasing subscriptions all occupy hard capacity.
-    fn available(&self, limit: usize) -> bool {
-        self.healthy() && self.reservations.len() < limit
+    /// Clock, pending, established, and releasing subscriptions all occupy capacity.
+    fn occupied(&self) -> usize {
+        self.accounts.len() + usize::from(self.clock)
     }
 }
 
@@ -95,182 +80,308 @@ impl Drop for Socket {
     }
 }
 
-/// Single-owner subscription registry. There is one I/O task per socket, not per account.
-/// Dropping the registry aborts its tasks and closes their sockets.
-/// Reservation IDs, their paired wire request IDs, and connection generations are
-/// assumed never to exhaust their `u64` range during a pool's lifetime.
-pub struct Pool {
-    /// Caller-provided limits and connection policy, fixed for this pool's lifetime.
-    config: Config,
-    /// Stable slots shared by all providers; reconnects replace entries in place.
-    sockets: Vec<Socket>,
-    /// Bounded delivery queue; consuming events also advances pool bookkeeping.
-    events: Receiver<Event>,
-    /// Shared with socket tasks and retained so the receiver never ends unexpectedly.
-    sender: Sender<Event>,
-    /// Last allocated reservation ID; IDs are never reused within this pool.
-    sequence: u64,
-    /// Total live reservations; socket maps remain authoritative for admission and loss.
-    reservations: usize,
-    /// Capacity of all provisioned slots, including connecting and reconnecting sockets.
-    capacity: usize,
-    /// First socket considered next time, rotating first-eligible allocation.
-    cursor: usize,
-    /// Highest confirmed account-update context observed; retained across reconnects.
+/// Commands and task lifetime shared by pool handles; never retained by the registry.
+struct Shared {
+    /// Bounded admission queue, shared by all pool handles.
+    commands: Sender<Request>,
+    /// Highest observed confirmed Solana context slot, retained across reconnects.
     slot: Arc<AtomicU64>,
+    /// Dropping the last pool handle aborts the registry and therefore every socket task.
+    task: JoinHandle<()>,
+}
+
+impl Drop for Shared {
+    /// Also stops a registry blocked on delivery to a slow event consumer.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Cloneable subscription client with one background registry and one task per socket.
+/// Consume the separate event receiver concurrently with operations: a full event queue
+/// applies backpressure and can delay acknowledgements. Operations for a pubkey must
+/// not overlap, and Clock is reserved for internal use. Dropping all pool handles or
+/// closing the event receiver stops the pool.
+#[derive(Clone)]
+pub struct Pool {
+    /// Shared ownership without per-account locks or tasks.
+    shared: Arc<Shared>,
 }
 
 impl Pool {
     /// Starts one connection attempt per provider on the current Tokio runtime.
+    /// Construction does not wait for readiness or validate [`Config`]'s requirements.
     /// Network failures arrive as `Dropped` events and retry with capped backoff.
-    /// The caller must satisfy [`Config`]'s requirements; construction does not validate them.
-    pub fn new(config: Config) -> Self {
-        let (sender, events) = mpsc::channel(EVENT_CAP);
-        let mut pool = Self {
+    pub fn new(config: Config) -> (Self, Receiver<Event>) {
+        let (commands, requests) = mpsc::channel(COMMAND_CAP);
+        let (events, receiver) = mpsc::channel(EVENT_CAP);
+        let (notices, incoming) = mpsc::unbounded_channel();
+        let slot = Arc::new(AtomicU64::new(0));
+        let mut registry = Registry {
             config,
             sockets: Vec::new(),
-            events,
-            sender,
-            sequence: 0,
-            reservations: 0,
+            routes: AHashMap::new(),
+            events: events.clone(),
+            notices,
+            occupied: 0,
             capacity: 0,
             cursor: 0,
-            slot: Arc::new(AtomicU64::new(0)),
+            slot: Arc::clone(&slot),
         };
-        for provider in 0..pool.config.providers.len() {
-            pool.open(provider, true);
-        }
-        pool
+        let task = tokio::spawn(async move {
+            for provider in 0..registry.config.providers.len() {
+                registry.open(provider, true);
+            }
+            tokio::select! {
+                _ = events.closed() => {},
+                _ = registry.run(requests, incoming) => {},
+            }
+        });
+        (
+            Self {
+                shared: Arc::new(Shared { commands, slot, task }),
+            },
+            receiver,
+        )
     }
 
-    /// Shared highest confirmed account-update slot, initially zero; not a chain-head guarantee.
-    /// Drive `next` continuously so socket processing and reconnection can progress.
+    /// Highest observed confirmed Solana context slot from account updates, initially zero.
+    /// This watermark is not a guarantee of the current chain head.
     /// Callers must not lower or otherwise modify this watermark.
     pub fn slot(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.slot)
+        Arc::clone(&self.shared.slot)
     }
 
-    /// Reserves one account on the first eligible socket from a rotating cursor.
-    /// Rotation approximates balance without moving existing subscriptions.
-    /// Pending and releasing reservations count toward limits. The caller guarantees
-    /// at most one live subscription per account; the pool does not deduplicate accounts.
-    /// Success is admission only: wait for `Established` before fetching a snapshot.
-    pub fn subscribe(&mut self, account: Pubkey) -> Result<Reservation, Error> {
-        if account == clock::ID {
-            return Err(Error::Clock);
-        }
-        let len = self.sockets.len();
-        let candidate = (self.cursor..len).chain(0..self.cursor).find(|&i| {
-            let socket = &self.sockets[i];
-            socket.available(self.config.providers[socket.id.provider].subs_per_connection)
-        });
-        let Some(index) = candidate else {
-            self.grow();
-            let full = self.reservations == self.capacity
-                && self.sockets.len()
-                    == self.config.providers.iter().map(|p| p.max_connections).sum::<usize>();
-            if full {
-                return Err(Error::Capacity);
-            }
-            return Err(Error::Unavailable);
-        };
-        // Two wire request IDs per reservation: subscribe is even, release is odd.
-        self.sequence += 1;
-        let socket = &mut self.sockets[index];
-        let reservation = Reservation {
-            account,
-            connection: socket.id,
-            id: self.sequence,
-        };
-        socket
+    /// Subscribes to an account and returns after server acknowledgement, not an initial snapshot.
+    /// The caller guarantees no existing subscription or pending operation for this pubkey.
+    /// Clock is reserved for internal use. Admission fails with `Unavailable` or `Capacity`
+    /// rather than waiting for a ready socket. Do not cancel this future; admitted work
+    /// completes even without a waiter.
+    pub async fn subscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
+        self.request(pubkey, true).await
+    }
+
+    /// Unsubscribes from an account and returns after acknowledgement and capacity reclamation.
+    /// Call only after successful subscribe, without overlapping operations or cancellation.
+    /// Clock is reserved for internal use. A subscription already removed by connection loss is
+    /// a successful no-op. Buffered updates may arrive after this returns. Socket loss
+    /// during the operation returns `Disconnected`; `Dropped` retains the cause.
+    pub async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
+        self.request(pubkey, false).await
+    }
+
+    /// Separates command admission from acknowledged completion.
+    async fn request(&self, pubkey: Pubkey, subscribe: bool) -> Result<(), Error> {
+        let (reply, result) = oneshot::channel();
+        self.shared
             .commands
-            .send(Command::Subscribe(reservation))
-            .map_err(|_| Error::Unavailable)?;
-        socket.reservations.insert(reservation.id, account);
-        self.cursor = (index + 1) % len;
-        let was_loaded = self.loaded();
-        self.reservations += 1;
-        if !was_loaded && self.loaded() {
-            self.grow();
+            .send(Request { pubkey, subscribe, reply })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+}
+
+/// Subscription routing and capacity registry; updates bypass this task entirely.
+struct Registry {
+    /// Fixed provider limits and connection policy.
+    config: Config,
+    /// Connection-pool entries replaced at the same vector index on reconnect.
+    sockets: Vec<Socket>,
+    /// Pubkey-to-socket index; lifecycle state lives only in the socket's entry.
+    routes: AHashMap<Pubkey, usize>,
+    /// Public lifecycle events share the sockets' direct update queue.
+    events: Sender<Event>,
+    /// Internal lifecycle delivery is bounded logically by admitted work and socket count.
+    notices: UnboundedSender<Notice>,
+    /// Total occupied capacity, including Clock and pending operations.
+    occupied: usize,
+    /// Allocated subscription capacity, including connections being opened or reconnected.
+    capacity: usize,
+    /// First socket considered by rotating admission.
+    cursor: usize,
+    /// Shared minimum Solana context slot for HTTP fetches, retained across reconnects.
+    slot: Arc<AtomicU64>,
+}
+
+impl Registry {
+    /// Drives control independently of whether a caller is awaiting an operation.
+    async fn run(
+        &mut self,
+        mut requests: Receiver<Request>,
+        mut notices: UnboundedReceiver<Notice>,
+    ) {
+        loop {
+            tokio::select! {
+                request = requests.recv() => {
+                    let Some(request) = request else { return };
+                    let Request { pubkey, subscribe, reply } = request;
+                    if subscribe {
+                        self.subscribe(pubkey, reply);
+                    } else {
+                        self.unsubscribe(pubkey, reply);
+                    }
+                }
+                Some(notice) = notices.recv() => self.notice(notice).await,
+            }
         }
-        Ok(reservation)
     }
 
-    /// Enqueues release, not a remote acknowledgement. Release each subscription at most
-    /// once, without retries; obsolete identities and lost socket mailboxes are ignored.
-    /// Capacity remains occupied until `Released` or `Dropped` is consumed via `next`.
-    pub fn release(&mut self, subscription: Subscription) {
-        let reservation = subscription.reservation;
-        // Same-pool handles retain a valid slot; only reconnects invalidate its identity.
-        let socket = &self.sockets[reservation.connection.index];
-        if socket.id != reservation.connection {
+    /// Reserves subscription capacity; only server acknowledgement confirms an active subscription.
+    fn subscribe(&mut self, pubkey: Pubkey, reply: Reply) {
+        let index = match self.admit() {
+            Ok(index) => index,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let socket = &mut self.sockets[index];
+        if socket.commands.send(Command::Subscribe(pubkey)).is_err() {
+            let _ = reply.send(Err(Error::Unavailable));
             return;
         }
-        // A closed mailbox means coverage is already lost; its Dropped event reports why.
-        let _ = socket.commands.send(Command::Release(subscription));
+        socket.accounts.insert(pubkey, Subscription::Pending(reply));
+        self.routes.insert(pubkey, index);
+        self.cursor = (index + 1) % self.sockets.len();
+        let needed_growth = self.should_grow();
+        self.occupied += 1;
+        if !needed_growth && self.should_grow() {
+            self.grow();
+        }
     }
 
-    /// Advances the registry and returns the next event. Cancellation-safe.
-    /// Call continuously: a full event queue pauses socket processing until drained.
-    /// Only the internal Clock subscription is automatically restored.
-    pub async fn next(&mut self) -> Event {
-        // The registry retains a sender; only its owner can close this receiver.
-        let Some(mut event) = self.events.recv().await else {
-            // Unreachable while the registry retains its sender; never spin on closure.
-            return futures::future::pending().await;
+    /// Keeps capacity occupied until unsubscribe is acknowledged or the socket is lost.
+    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
+        let Some(&index) = self.routes.get(&pubkey) else {
+            // Connection loss can remove the subscription before the caller unsubscribes.
+            let _ = reply.send(Ok(()));
+            return;
         };
-        match &mut event {
-            Event::Connected(connection) => {
+        let socket = &mut self.sockets[index];
+        let Some(state) = socket.accounts.get_mut(&pubkey) else { return };
+        let Subscription::Active(remote) = state else { return };
+        let remote = *remote;
+        *state = Subscription::Pending(reply);
+        // If I/O has just stopped, its queued loss notice completes this waiter.
+        let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
+    }
+
+    /// Chooses ready capacity without queuing admission behind connection attempts.
+    fn admit(&mut self) -> Result<usize, Error> {
+        let len = self.sockets.len();
+        if let Some(index) = (self.cursor..len).chain(0..self.cursor).find(|&i| {
+            let socket = &self.sockets[i];
+            socket.healthy()
+                && socket.occupied() < self.config.providers[socket.id.provider].subs_per_connection
+        }) {
+            return Ok(index);
+        }
+        self.grow();
+        let full = self.occupied == self.capacity
+            && self.sockets.len()
+                == self.config.providers.iter().map(|p| p.max_connections).sum::<usize>();
+        Err(if full { Error::Capacity } else { Error::Unavailable })
+    }
+
+    /// Applies lifecycle outcomes before waking callers or reporting connection loss.
+    async fn notice(&mut self, notice: Notice) {
+        match notice {
+            Notice::Connected(connection) => {
                 let socket = &mut self.sockets[connection.index];
                 socket.ready = true;
                 socket.backoff = Duration::ZERO;
+                let _ = self.events.send(Event::Connected(connection)).await;
             }
-            Event::Released(Subscription { reservation, .. })
-            | Event::Rejected { reservation, .. } => {
-                // Correlated terminal responses precede loss and retire each reservation once.
-                self.sockets[reservation.connection.index].reservations.remove(&reservation.id);
-                self.reservations -= 1;
+            Notice::Acknowledged { connection, pubkey, result } => {
+                // Acknowledgements do not trigger pool growth.
+                return self.acknowledge(connection, pubkey, result);
             }
-            Event::Dropped { connection, reservations, .. } => {
+            Notice::Dropped { connection, error } => {
                 let socket = &mut self.sockets[connection.index];
-                // ID zero is retained until loss, even if Clock establishment fails.
-                let clock = socket.reservations.contains_key(&0);
-                self.reservations -= socket.reservations.len();
-                reservations.extend(socket.reservations.drain().filter(|(id, _)| *id != 0).map(
-                    |(id, account)| Reservation {
-                        account,
-                        connection: socket.id,
-                        id,
-                    },
-                ));
-                let id = Connection {
-                    generation: connection.generation + 1,
-                    ..*connection
-                };
+                self.occupied -= socket.occupied();
+                let clock = socket.clock;
                 let delay =
                     (socket.backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
-                let replacement = Socket::spawn(
-                    id,
-                    &self.config,
-                    self.sender.clone(),
-                    delay,
-                    clock,
-                    Arc::clone(&self.slot),
-                );
-                self.reservations += replacement.reservations.len();
+                let pubkeys = socket
+                    .accounts
+                    .drain()
+                    .map(|(pubkey, entry)| {
+                        self.routes.remove(&pubkey);
+                        if let Subscription::Pending(reply) = entry {
+                            let _ = reply.send(Err(Error::Disconnected));
+                        }
+                        pubkey
+                    })
+                    .collect();
+                // The failed task has finished publishing updates. Publish loss before replacing
+                // it or accepting new user subscriptions, preserving this connection's event order.
+                let _ = self.events.send(Event::Dropped { connection, pubkeys, error }).await;
+                let id = Connection {
+                    generation: connection.generation + 1,
+                    ..connection
+                };
+                let replacement = self.spawn(id, delay, clock);
+                self.occupied += replacement.occupied();
                 self.sockets[connection.index] = replacement;
             }
-            Event::Established(_) | Event::Update { .. } => {}
         }
-        if matches!(event, Event::Connected(_) | Event::Dropped { .. }) && self.loaded() {
+        if self.should_grow() {
             self.grow();
         }
-        event
+    }
+
+    /// Commits the server's outcome before completing the caller's operation.
+    fn acknowledge(
+        &mut self,
+        connection: Connection,
+        pubkey: Pubkey,
+        result: Result<Option<u64>, Error>,
+    ) {
+        let socket = &mut self.sockets[connection.index];
+        let Occupied(mut entry) = socket.accounts.entry(pubkey) else { return };
+        let pending = match result.as_ref() {
+            Ok(Some(remote)) => entry.insert(Subscription::Active(*remote)),
+            // Subscribe rejection and unsubscribe acknowledgement both free subscription capacity.
+            _ => {
+                self.routes.remove(&pubkey);
+                self.occupied -= 1;
+                entry.remove()
+            }
+        };
+        let Subscription::Pending(reply) = pending else { return };
+        let _ = reply.send(result.map(|_| ()));
+    }
+
+    /// Starts a connection attempt with Clock queued ahead of every user command.
+    fn spawn(&self, id: Connection, backoff: Duration, clock: bool) -> Socket {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        if clock {
+            let _ = commands.send(Command::Subscribe(clock::ID));
+        }
+        let task = tokio::spawn(Session::start(
+            id,
+            self.config.providers[id.provider].url.clone(),
+            receiver,
+            self.events.clone(),
+            self.notices.clone(),
+            backoff,
+            Arc::clone(&self.slot),
+        ));
+        Socket {
+            id,
+            commands,
+            task,
+            accounts: AHashMap::new(),
+            ready: false,
+            clock,
+            backoff,
+        }
     }
 
     /// Fixed 75% pool-wide utilization, including capacity not yet ready for admission.
-    fn loaded(&self) -> bool {
-        self.reservations * 4 >= self.capacity * 3
+    fn should_grow(&self) -> bool {
+        self.occupied * 4 >= self.capacity * 3
     }
 
     /// Visits every provider once; added capacity does not truncate the growth round.
@@ -303,22 +414,15 @@ impl Pool {
         }
     }
 
-    /// Allocates a fresh socket slot and starts its first connection attempt immediately.
+    /// Adds a connection-pool entry and starts its first connection attempt immediately.
     fn open(&mut self, provider: usize, clock: bool) {
         let id = Connection {
             provider,
             index: self.sockets.len(),
             generation: 0,
         };
-        let socket = Socket::spawn(
-            id,
-            &self.config,
-            self.sender.clone(),
-            Duration::ZERO,
-            clock,
-            Arc::clone(&self.slot),
-        );
-        self.reservations += socket.reservations.len();
+        let socket = self.spawn(id, Duration::ZERO, clock);
+        self.occupied += socket.occupied();
         self.sockets.push(socket);
         self.capacity += self.config.providers[provider].subs_per_connection;
     }
