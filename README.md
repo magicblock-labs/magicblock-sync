@@ -6,9 +6,11 @@ account-update watermark (the highest observed Solana context slot) keep fetchin
 independent of any one endpoint.
 
 Part of the [Chainlink rewrite](https://github.com/magicblock-labs/magicblock-validator/issues/1698).
-Companion discovery, subscription-before-fetch coordination, reconciliation, and
-materialization remain caller responsibilities; classify each account's default
-`Uninit` mode before submitting it to Engine.
+`ChainSync::sync` fetches accounts missing from Engine in batches of up to 100 and
+materializes them, including HTTP `null` responses as default accounts. Discovery,
+subscription-before-fetch coordination, and reconciliation remain caller
+responsibilities. Direct `Fetcher` users receive accounts in `Uninit` mode and
+must classify them before materialization when their workflow requires it.
 
 ## Fetching
 
@@ -66,7 +68,8 @@ a cloneable command handle and a single event receiver. Subscribe and unsubscrib
 by pubkey; the library keeps the provider subscription IDs and routing internally.
 
 ```rust
-use magicblock_sync::{websocket::{Config, Event, Pool, Provider}, Pubkey};
+use magicblock_sync::websocket::{Config, Event, Pool, Provider};
+use solana_pubkey::Pubkey;
 
 let (pool, mut events) = Pool::new(Config {
     providers: vec![Provider {

@@ -5,11 +5,10 @@
 //! watermark. [`grpc::Client`] adds retained-account redundancy and delegation lifecycle
 //! observations through Yellowstone.
 //!
-//! [`ChainSync`] currently checks whether requested accounts exist in Engine.
-//! Subscription-before-fetch coordination, reconciliation, materialization, and
-//! transport recovery remain outside this entry point. HTTP/WebSocket accounts
-//! retain Uninit mode for caller classification; resolved gRPC delegations include
-//! their original owner and Delegated mode.
+//! [`ChainSync`] fetches accounts missing from Engine and materializes them.
+//! Subscription-before-fetch coordination, reconciliation, and transport recovery
+//! remain outside this entry point. HTTP/WebSocket accounts retain Uninit mode;
+//! resolved gRPC delegations include their original owner and Delegated mode.
 
 pub mod grpc;
 pub mod http;
@@ -19,41 +18,80 @@ pub mod websocket;
 use std::borrow::Borrow;
 
 use engine::Engine;
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 
-/// Synchronization entry point backed by Engine.
-pub struct ChainSync(Engine);
+use crate::http::Fetcher;
 
-/// Account lookup failure.
+/// Synchronization entry point backed by Engine and an HTTP fetcher.
+pub struct ChainSync {
+    /// Owns account lookup, leases, and materialization.
+    engine: Engine,
+    /// Supplies snapshots for accounts absent from Engine.
+    fetcher: Fetcher,
+}
+
+/// Account synchronization failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The requested account is not in Engine.
-    #[error("account {0} is missing from Engine")]
-    Missing(Pubkey),
     /// Engine's account loader could not check an account.
     #[error("Engine account lookup failed: {0}")]
     AccountsDb(#[from] accountsdb::AccountsDBError),
-}
-
-impl From<Engine> for ChainSync {
-    fn from(engine: Engine) -> Self {
-        Self(engine)
-    }
+    /// HTTP account fetching failed.
+    #[error("HTTP account fetch failed: {0}")]
+    Fetch(#[from] http::Error),
+    /// Engine could not read or materialize an account.
+    #[error("Engine account operation failed: {0}")]
+    Engine(#[from] engine::EngineError),
 }
 
 impl ChainSync {
-    /// Checks each key against one Engine loader without fetching or materializing.
-    pub fn sync<I>(&self, keys: I) -> Result<(), Error>
+    /// Creates an entry point using the supplied Engine and HTTP fetcher.
+    pub fn new(engine: Engine, fetcher: Fetcher) -> Self {
+        Self { engine, fetcher }
+    }
+
+    /// Fetches missing accounts in batches of at most 100 and materializes them.
+    /// An HTTP null is materialized from a default account builder. Account
+    /// leases are held through fetching and materialization so concurrent syncs
+    /// of the same key do not fetch or materialize it twice.
+    pub async fn sync<I>(&self, keys: I) -> Result<(), Error>
     where
         I: IntoIterator,
         I::Item: Borrow<Pubkey>,
     {
-        let accounts = self.0.accounts();
-        let loader = accounts.loader();
-        for key in keys {
-            let key = *key.borrow();
-            if !loader.contains(&key)? {
-                return Err(Error::Missing(key));
+        let mut missing = {
+            let accounts = self.engine.accounts();
+            let loader = accounts.loader();
+            let mut missing = Vec::new();
+            for key in keys {
+                let key = *key.borrow();
+                if !loader.contains(&key)? {
+                    missing.push(key);
+                }
+            }
+            missing
+        };
+        // Acquire each batch's leases in one order across concurrent calls.
+        missing.sort_unstable();
+        missing.dedup();
+
+        for batch in missing.chunks(100) {
+            let mut pending = Vec::new();
+            for &key in batch {
+                let accessor = self.engine.account(key).await;
+                if accessor.read(|_| ())?.is_none() {
+                    pending.push((key, accessor));
+                }
+            }
+            let keys = pending.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+            if keys.is_empty() {
+                continue;
+            }
+            let snapshot = self.fetcher.fetch(&keys, None).await?;
+            for ((_, accessor), account) in pending.into_iter().zip(snapshot.accounts) {
+                let account = account.unwrap_or_else(|| AccountBuilder::default().build());
+                accessor.materialize(account, None).await?;
             }
         }
         Ok(())

@@ -1,20 +1,21 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicU64, AtomicUsize, Ordering::*},
         Arc,
     },
     time::Duration,
 };
 
-use hyper::body::Bytes;
+use hyper::{body::Bytes, header::CONTENT_TYPE};
 use json::LazyValue;
-use serde::Deserialize;
+use reqwest::{redirect::Policy, retry, Client};
+use serde::{Deserialize, Serialize};
 use solana_account::OwnedAccount;
 use solana_pubkey::Pubkey;
 use tokio::time::{self, Instant};
 use url::Url;
 
-use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount, VERSION};
+use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
 use super::Error;
 
@@ -45,6 +46,18 @@ struct Provider {
     until: AtomicU64,
 }
 
+/// Positional RPC arguments for one account batch.
+#[derive(Serialize)]
+struct BatchParams(Vec<String>, AccountConfig);
+
+/// Provider selected for an attempt, with its stable error-reporting index.
+struct Candidate<'a> {
+    /// Stable provider position reported with attempt failures.
+    index: usize,
+    /// Selected endpoint, including cooldown state shared by concurrent fetches.
+    provider: &'a Provider,
+}
+
 /// Concurrent single-batch HTTP fetching. Callers bound concurrency and supply
 /// endpoints on the same chain, each supporting the standard 100-key RPC limit.
 /// No background tasks, cache, splitting, or subscription coordination are provided.
@@ -65,16 +78,14 @@ impl Fetcher {
     /// Creates a pooled Rustls client with redirects and automatic retries disabled.
     /// The caller supplies a nonempty list of valid HTTP(S) endpoints on the same chain.
     pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self, Error> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()?;
+        let client = Client::builder().redirect(Policy::none()).retry(retry::never()).build()?;
+        let providers = providers
+            .into_iter()
+            .map(|url| Provider { url, until: AtomicU64::new(0) })
+            .collect();
         Ok(Self {
             client,
-            providers: providers
-                .into_iter()
-                .map(|url| Provider { url, until: AtomicU64::new(0) })
-                .collect(),
+            providers,
             slot,
             cursor: AtomicUsize::new(0),
             epoch: Instant::now(),
@@ -85,7 +96,8 @@ impl Fetcher {
     /// Captures max(min_slot, watermark) once; failover never relaxes that minimum.
     /// Attempts have a two-second budget within ten seconds overall. Dropping this
     /// future cancels its I/O; successful HTTP responses never advance the watermark.
-    /// Deadlines are cooperative: they reject late success but cannot interrupt decoding.
+    /// Reqwest bounds request and body I/O; synchronous decoding may outlive
+    /// the attempt budget.
     /// Only transient endpoint failures retry; malformed responses and decoding errors
     /// return immediately with provider context. Transient failures impose a 100 ms cooldown.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot, Error> {
@@ -94,29 +106,18 @@ impl Fetcher {
         if !(1..=100).contains(&keys.len()) {
             return Err(Error::BatchSize);
         }
-        let request = Request::new(
-            1,
-            GET_MULTIPLE_ACCOUNTS,
-            (
-                keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                AccountConfig::new(Some(minimum)),
-            ),
+        let params = BatchParams(
+            keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            AccountConfig::new(Some(minimum)),
         );
+        let request = Request::new(1, GET_MULTIPLE_ACCOUNTS, params);
         let body = Bytes::from(json::to_vec(&request)?);
         let mut last = None;
-        while let Some((index, provider)) = self.available(deadline).await {
+        while let Some(Candidate { index, provider }) = self.available(deadline).await {
             let end = (Instant::now() + ATTEMPT).min(deadline);
-            let result = time::timeout_at(
-                end,
-                self.attempt(provider, body.clone(), keys.len(), minimum),
-            )
-            .await
-            .unwrap_or(Err(Error::Timeout("HTTP attempt")));
-            // Synchronous decoding cannot be preempted by Tokio's timer. Do not return
-            // a late success if decoding consumed the remaining attempt budget.
+            let result = self.attempt(provider, body.clone(), end).await;
             let error = match result {
-                Ok(snapshot) if Instant::now() < end => return Ok(snapshot),
-                Ok(_) => Error::Timeout("HTTP attempt"),
+                Ok(snapshot) => return Ok(snapshot),
                 Err(error) => error,
             };
             let retry = error.retryable();
@@ -136,7 +137,7 @@ impl Fetcher {
 
     /// Rotates through eligible providers, waiting only when all are cooling down.
     /// Eligibility is approximate, not a lease; concurrent requests may use the same endpoint.
-    async fn available(&self, deadline: Instant) -> Option<(usize, &Provider)> {
+    async fn available(&self, deadline: Instant) -> Option<Candidate<'_>> {
         while Instant::now() < deadline {
             let len = self.providers.len();
             let start = self.cursor.fetch_add(1, Relaxed) % len;
@@ -146,7 +147,7 @@ impl Fetcher {
                 let provider = &self.providers[index];
                 let until = provider.until.load(Relaxed);
                 if until <= now {
-                    return Some((index, provider));
+                    return Some(Candidate { index, provider });
                 }
                 wake = wake.min(self.epoch + Duration::from_millis(until));
             }
@@ -160,14 +161,14 @@ impl Fetcher {
         &self,
         provider: &Provider,
         body: Bytes,
-        count: usize,
-        minimum: u64,
+        end: Instant,
     ) -> Result<Snapshot, Error> {
         let response = self
             .client
             .post(provider.url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json")
             .body(body)
+            .timeout(end.saturating_duration_since(Instant::now()))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -175,26 +176,12 @@ impl Fetcher {
         }
         let bytes = response.bytes().await?;
         let response: Response<'_> = json::from_slice(&bytes)?;
-        if response.jsonrpc != VERSION || response.id != 1 {
-            return Err(Error::Protocol("invalid HTTP response correlation"));
-        }
-        if response.result.is_some() == response.error.is_some() {
-            return Err(Error::Protocol("invalid HTTP response envelope"));
-        }
         if let Some(error) = response.error {
             return Err(Error::Rpc(json::from_str(error.as_raw_str())?));
         }
         let result = response.result.ok_or(Error::Protocol("missing HTTP result"))?;
         let result: ContextValue<Vec<Option<WireAccount<'_>>>> =
             json::from_str(result.as_raw_str())?;
-        if result.value.len() != count {
-            return Err(Error::Protocol("HTTP result length does not match request"));
-        }
-        if result.context.slot < minimum {
-            return Err(Error::Protocol(
-                "HTTP context is below requested minimum slot",
-            ));
-        }
         let slot = result.context.slot;
         let accounts = result
             .value
@@ -205,14 +192,10 @@ impl Fetcher {
     }
 }
 
-/// Correlated HTTP result or rejection, borrowed until its envelope is validated.
+/// HTTP result or rejection, borrowing its payload until it is decoded.
 #[derive(Deserialize)]
 struct Response<'a> {
-    /// Protocol version expected for the correlated response.
-    jsonrpc: &'a str,
-    /// Echoed request identity, validated before decoding the payload.
-    id: u64,
-    /// Success payload, parsed only after envelope validation.
+    /// Success payload, decoded after the outer response.
     #[serde(borrow)]
     result: Option<LazyValue<'a>>,
     /// Provider rejection, retained with its structured diagnostic data.

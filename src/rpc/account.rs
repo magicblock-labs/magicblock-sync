@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::io;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -15,23 +15,20 @@ pub(crate) struct WireAccount<'a> {
     #[serde(borrow)]
     data: Data<'a>,
     /// Base58 program owner; parsed before constructing an Engine account.
-    #[serde(borrow)]
-    owner: Cow<'a, str>,
+    owner: &'a str,
     /// Balance observed at the response context slot.
     lamports: u64,
     /// Whether the account contains executable program code.
     executable: bool,
 }
 
-/// Borrows ordinary strings while retaining owned fallback for escaped JSON strings.
+/// Borrowed account data and its declared encoding.
 #[derive(Deserialize)]
 struct Data<'a>(
     /// Base64-encoded compressed account bytes.
-    #[serde(borrow)]
-    Cow<'a, str>,
+    &'a str,
     /// Must match the encoding requested by both transports.
-    #[serde(borrow)]
-    Cow<'a, str>,
+    &'a str,
 );
 
 impl WireAccount<'_> {
@@ -49,9 +46,8 @@ impl WireAccount<'_> {
             .lamports(self.lamports)
             .executable(self.executable)
             .slot(slot)
-            .data(data)
-            .build();
-        Ok(account)
+            .data(data);
+        Ok(account.build())
     }
 }
 
@@ -66,7 +62,7 @@ pub enum DecodeError {
     Owner(#[from] solana_pubkey::ParsePubkeyError),
     /// The decoded bytes do not form a valid zstd payload.
     #[error("invalid account zstd: {0}")]
-    Zstd(#[source] std::io::Error),
+    Zstd(#[source] io::Error),
     /// The provider returned an unsupported account representation.
     #[error("invalid provider message: {0}")]
     Protocol(&'static str),
