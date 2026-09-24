@@ -1,15 +1,12 @@
 //! Confirmed account subscriptions with per-provider connection pools.
 //!
-//! [`Pool`] owns subscription routing by pubkey. Its cloneable handles provide
-//! acknowledged async subscribe/unsubscribe operations; consume the separate event
-//! receiver concurrently so delivery backpressure cannot stall acknowledgements.
-//! Subscribe only without an existing subscription, then unsubscribe after successful subscribe.
-//! Operations for the same pubkey must not overlap or be cancelled. Clock is reserved
-//! for internal use. Unsubscribe tolerates subscriptions already removed by connection loss.
-//! Successful subscribe confirms the server's subscription acknowledgement, not an initial snapshot. Unsubscribe
-//! reclaims capacity before returning, but previously buffered updates may remain.
-//! Connection loss removes affected pubkeys and reports them in [`Event::Dropped`].
-//! Replacements restore only Clock; callers restore user subscriptions and reconcile snapshots.
+//! [`Pool`] routes subscriptions by pubkey and returns a separate event receiver.
+//! Drain events while awaiting operations; backpressure can delay acknowledgements.
+//!
+//! Subscription success means the server acknowledged the request, not that an
+//! initial snapshot arrived. On connection loss, [`Event::Dropped`] lists the
+//! lost pubkeys. Replacement connections restore only the internal `Clock`
+//! subscription; callers decide what to restore and reconcile missed updates.
 //!
 
 use crate::rpc::{DecodeError, Error as RpcError};
@@ -62,14 +59,14 @@ pub struct Connection {
     generation: u64,
 }
 
-/// Events are ordered per connection, not across connections. Solana context slots are individual
-/// observations; the pool's watermark retains the highest confirmed update slot.
+/// Events are ordered per connection, not across connections. The shared watermark
+/// retains the highest confirmed context slot observed in an account update.
 #[derive(derive_more::Debug)]
 pub enum Event {
     /// A connection is ready to accept subscribe requests,
     /// subject to remaining subscription capacity.
     Connected(Connection),
-    /// Decoded account data; callers classify its default Uninit mode before materialization.
+    /// Decoded account data in `Uninit` mode for caller classification.
     Update {
         /// Account whose remote subscription produced this update.
         pubkey: Pubkey,
@@ -79,12 +76,12 @@ pub enum Event {
         #[debug(skip)]
         account: Option<OwnedAccount>,
     },
-    /// All pending, active, and unsubscribing accounts on this connection have lost their subscriptions.
-    /// Already queued updates precede this event. The replacement restores only Clock.
+    /// All subscriptions on this connection were lost, including pending operations.
+    /// Updates already queued from this connection precede this event.
     Dropped {
         /// Failed connection identity; its replacement has a new generation.
         connection: Connection,
-        /// Lost user pubkeys, already removed from the registry; internal Clock is omitted.
+        /// Lost user pubkeys, already removed from the registry; internal `Clock` is omitted.
         pubkeys: Vec<Pubkey>,
         /// Cause of subscription loss, including event-delivery failure.
         error: Error,

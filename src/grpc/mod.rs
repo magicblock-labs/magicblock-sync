@@ -53,7 +53,7 @@ pub struct Config {
 
 /// Ordered account and lifecycle observations from a single provider.
 pub enum Event {
-    /// Exact-membership-filtered account update; mode remains Uninit for caller classification.
+    /// Exact-membership-filtered account update in `Uninit` mode for caller classification.
     Update {
         /// Subscribed account.
         pubkey: Pubkey,

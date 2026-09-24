@@ -10,7 +10,7 @@ use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 pub struct Delegation {
     /// Delegated application account.
     pub pubkey: Pubkey,
-    /// Original owner, Delegated mode, and creation slot are already resolved.
+    /// Original owner, `Delegated` mode, and creation slot are already resolved.
     pub account: OwnedAccount,
     /// Complete delegation-record bytes, retaining appended post-delegation actions.
     pub record: Vec<u8>,

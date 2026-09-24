@@ -19,7 +19,7 @@ use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
 use super::Error;
 
-/// Fetches a batch of accounts with one shared response context.
+/// JSON-RPC method for fetching multiple accounts in one response context.
 const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
 
 /// Total budget across provider selection, cooldown waits, and attempts.
@@ -29,8 +29,8 @@ const ATTEMPT: Duration = Duration::from_secs(2);
 /// Shared pause after a transient provider failure; successes do not clear it early.
 const COOLDOWN: Duration = Duration::from_millis(100);
 
-/// One response context, preserving input order and duplicate keys.
-/// Accounts retain Uninit mode for caller classification before materialization.
+/// One response context with accounts in input order, including duplicate keys.
+/// Accounts retain `Uninit` mode for classification before materialization.
 pub struct Snapshot {
     /// Confirmed Solana context slot shared by every account in this response.
     pub slot: u64,
@@ -58,9 +58,10 @@ struct Candidate<'a> {
     provider: &'a Provider,
 }
 
-/// Concurrent single-batch HTTP fetching. Callers bound concurrency and supply
-/// endpoints on the same chain, each supporting the standard 100-key RPC limit.
-/// No background tasks, cache, splitting, or subscription coordination are provided.
+/// Fetches account batches over HTTP with provider failover.
+/// Callers bound concurrency and supply same-chain endpoints that support the
+/// standard 100-key RPC limit. This fetcher does not split batches or manage
+/// subscriptions.
 pub struct Fetcher {
     /// Shared connection pool; provider selection owns retries and redirects are disabled.
     client: reqwest::Client,
@@ -93,13 +94,15 @@ impl Fetcher {
     }
 
     /// Fetches 1–100 keys at confirmed commitment in one request per attempt.
-    /// Captures max(min_slot, watermark) once; failover never relaxes that minimum.
-    /// Attempts have a two-second budget within ten seconds overall. Dropping this
-    /// future cancels its I/O; successful HTTP responses never advance the watermark.
-    /// Reqwest bounds request and body I/O; synchronous decoding may outlive
-    /// the attempt budget.
-    /// Only transient endpoint failures retry; malformed responses and decoding errors
-    /// return immediately with provider context. Transient failures impose a 100 ms cooldown.
+    /// The request uses the greater of `min_slot` and the shared watermark,
+    /// captured once; failover never lowers this floor. HTTP responses do not
+    /// advance the watermark.
+    ///
+    /// Transient failures retry with a 100 ms provider cooldown. Malformed
+    /// responses and account decoding errors return immediately with provider
+    /// context. Each attempt has up to two seconds within a ten-second total
+    /// budget. Dropping this future cancels HTTP I/O, but synchronous decoding
+    /// may outlive the attempt budget.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot, Error> {
         let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
         let deadline = Instant::now() + OVERALL;

@@ -5,10 +5,10 @@
 //! watermark. [`grpc::Client`] adds retained-account redundancy and delegation lifecycle
 //! observations through Yellowstone.
 //!
-//! [`ChainSync`] fetches accounts missing from Engine and materializes them.
-//! Subscription-before-fetch coordination, reconciliation, and transport recovery
-//! remain outside this entry point. HTTP/WebSocket accounts retain Uninit mode;
-//! resolved gRPC delegations include their original owner and Delegated mode.
+//! [`ChainSync`] subscribes before fetching and materializing accounts missing
+//! from Engine. Callers handle updates and transport recovery. HTTP and WebSocket
+//! accounts retain `Uninit` mode; resolved gRPC delegations carry their original
+//! owner and `Delegated` mode.
 
 pub mod grpc;
 pub mod http;
@@ -22,13 +22,16 @@ use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 
 use crate::http::Fetcher;
+use crate::websocket::Pool;
 
-/// Synchronization entry point backed by Engine and an HTTP fetcher.
+/// Synchronization entry point backed by Engine, WebSocket subscriptions, and HTTP snapshots.
 pub struct ChainSync {
     /// Owns account lookup, leases, and materialization.
     engine: Engine,
     /// Supplies snapshots for accounts absent from Engine.
     fetcher: Fetcher,
+    /// Subscribes to missing accounts before their snapshots are fetched.
+    websocket: Pool,
 }
 
 /// Account synchronization failure.
@@ -40,21 +43,28 @@ pub enum Error {
     /// HTTP account fetching failed.
     #[error("HTTP account fetch failed: {0}")]
     Fetch(#[from] http::Error),
+    /// WebSocket account subscription failed.
+    #[error("WebSocket subscription failed: {0}")]
+    Subscribe(#[from] websocket::Error),
     /// Engine could not read or materialize an account.
     #[error("Engine account operation failed: {0}")]
     Engine(#[from] engine::EngineError),
 }
 
 impl ChainSync {
-    /// Creates an entry point using the supplied Engine and HTTP fetcher.
-    pub fn new(engine: Engine, fetcher: Fetcher) -> Self {
-        Self { engine, fetcher }
+    /// Creates an entry point using the supplied Engine, HTTP fetcher, and WebSocket pool.
+    pub fn new(engine: Engine, fetcher: Fetcher, websocket: Pool) -> Self {
+        Self { engine, fetcher, websocket }
     }
 
-    /// Fetches missing accounts in batches of at most 100 and materializes them.
-    /// An HTTP null is materialized from a default account builder. Account
-    /// leases are held through fetching and materialization so concurrent syncs
-    /// of the same key do not fetch or materialize it twice.
+    /// Waits for each missing account's subscription acknowledgement before
+    /// fetching batches of up to 100. HTTP `null` becomes a default account.
+    /// Account leases prevent concurrent syncs from fetching and materializing
+    /// the same key twice.
+    ///
+    /// The caller consumes WebSocket events and handles recovery. Subscriptions
+    /// acknowledged before a failure remain active; reconcile them before
+    /// retrying an account that is still absent.
     pub async fn sync<I>(&self, keys: I) -> Result<(), Error>
     where
         I: IntoIterator,
@@ -87,6 +97,9 @@ impl ChainSync {
             let keys = pending.iter().map(|(key, _)| *key).collect::<Vec<_>>();
             if keys.is_empty() {
                 continue;
+            }
+            for &key in &keys {
+                self.websocket.subscribe(key).await?;
             }
             let snapshot = self.fetcher.fetch(&keys, None).await?;
             for ((_, accessor), account) in pending.into_iter().zip(snapshot.accounts) {
