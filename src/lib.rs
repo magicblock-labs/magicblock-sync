@@ -82,6 +82,9 @@ impl ChainSync {
     /// snapshot but materialize only the normalized program. HTTP `null` becomes
     /// a default non-program account; a missing program is an error.
     ///
+    /// Pubkeys requested as writable accounts or programs must occur only once.
+    /// Repeated payer and read-only requests are collapsed by pubkey.
+    ///
     /// Each batch waits for subscription acknowledgements before fetching. A
     /// subscription, fetch, or program-normalization failure releases that
     /// batch's subscriptions. Materialization errors return without cleanup.
@@ -104,16 +107,7 @@ impl ChainSync {
         };
         // Lock primary accounts in the same order across concurrent syncs.
         missing.sort_unstable_by_key(|account| account.pubkey);
-        // A program request takes precedence over other roles for the same key.
-        missing.dedup_by(|next, current| {
-            if next.pubkey != current.pubkey {
-                return false;
-            }
-            if next.property == AccountProperty::Program {
-                current.property = AccountProperty::Program;
-            }
-            true
-        });
+        missing.dedup_by_key(|account| account.pubkey);
 
         // Companions count against getMultipleAccounts' 100-key limit.
         let mut start = 0;
