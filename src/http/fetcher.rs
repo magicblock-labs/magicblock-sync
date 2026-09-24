@@ -19,65 +19,66 @@ use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
 use super::Error;
 
-/// JSON-RPC method for fetching multiple accounts in one response context.
+/// RPC operation that returns one shared context for the batch.
 const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
 
-/// Total budget across provider selection, cooldown waits, and attempts.
+/// Total budget across attempts and provider cooldowns.
 const OVERALL: Duration = Duration::from_secs(10);
-/// Maximum time for one provider, capped by the remaining overall budget.
+/// Per-provider attempt budget, capped by the overall deadline.
 const ATTEMPT: Duration = Duration::from_secs(2);
-/// Shared pause after a transient provider failure; successes do not clear it early.
+/// Shared delay after transient provider failure.
 const COOLDOWN: Duration = Duration::from_millis(100);
 
-/// One response context with accounts in input order, including duplicate keys.
-/// Accounts retain `Uninit` mode for classification before materialization.
+/// Confirmed account snapshot in request order, with accounts in `Uninit` mode.
 pub struct Snapshot {
-    /// Confirmed Solana context slot shared by every account in this response.
+    /// Context slot shared by the batch.
     pub slot: u64,
-    /// Only explicit JSON null becomes None; invalid accounts fail the entire fetch.
+    /// `None` only for an explicit RPC null; invalid accounts fail the batch.
     pub accounts: Vec<Option<OwnedAccount>>,
 }
 
-/// Endpoint and its approximate shared eligibility across concurrent attempts.
+/// Endpoint with eligibility shared across concurrent fetches.
 struct Provider {
-    /// Caller-supplied HTTP endpoint on the same chain as the watermark source.
+    /// Configured same-chain HTTP endpoint.
     url: Url,
-    /// Milliseconds since the fetcher's monotonic epoch; zero means eligible.
+    /// Milliseconds since `Fetcher::epoch` when this endpoint becomes eligible.
     until: AtomicU64,
 }
 
-/// Positional RPC arguments for one account batch.
+/// Positional arguments for one account batch.
 #[derive(Serialize)]
-struct BatchParams(Vec<String>, AccountConfig);
+struct BatchParams(
+    /// Requested pubkeys in response order.
+    Vec<String>,
+    /// Shared encoding, finality, and slot floor.
+    AccountConfig,
+);
 
-/// Provider selected for an attempt, with its stable error-reporting index.
+/// Selected provider and its stable error-reporting index.
 struct Candidate<'a> {
-    /// Stable provider position reported with attempt failures.
+    /// Position in the configured endpoint list.
     index: usize,
-    /// Selected endpoint, including cooldown state shared by concurrent fetches.
+    /// Endpoint and its shared cooldown state.
     provider: &'a Provider,
 }
 
-/// Fetches account batches over HTTP with provider failover.
-/// Callers bound concurrency and supply same-chain endpoints that support the
-/// standard 100-key RPC limit. This fetcher does not split batches or manage
-/// subscriptions.
+/// Fetches confirmed account batches with same-chain provider failover.
+/// Callers split batches and manage subscriptions.
 pub struct Fetcher {
-    /// Shared connection pool; provider selection owns retries and redirects are disabled.
+    /// Reusable HTTP connections without implicit redirects or retries.
     client: reqwest::Client,
-    /// Nonempty endpoint list; positions are stable provider identities.
+    /// Stable endpoint order used for error reporting.
     providers: Vec<Provider>,
-    /// Confirmed WebSocket watermark sampled once at fetch entry.
+    /// Confirmed WebSocket watermark sampled at fetch entry.
     slot: Arc<AtomicU64>,
-    /// Rotating first candidate across concurrent fetches and failover attempts.
+    /// Rotating first candidate for provider selection.
     cursor: AtomicUsize,
-    /// Monotonic origin for provider eligibility timestamps.
+    /// Monotonic origin for cooldown timestamps.
     epoch: Instant,
 }
 
 impl Fetcher {
-    /// Creates a pooled Rustls client with redirects and automatic retries disabled.
-    /// The caller supplies a nonempty list of valid HTTP(S) endpoints on the same chain.
+    /// Uses a nonempty list of same-chain HTTP(S) endpoints.
     pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self, Error> {
         let client = Client::builder().redirect(Policy::none()).retry(retry::never()).build()?;
         let providers = providers
@@ -93,16 +94,12 @@ impl Fetcher {
         })
     }
 
-    /// Fetches 1–100 keys at confirmed commitment in one request per attempt.
-    /// The request uses the greater of `min_slot` and the shared watermark,
-    /// captured once; failover never lowers this floor. HTTP responses do not
-    /// advance the watermark.
+    /// Fetches 1–100 keys at confirmed commitment. The greater of `min_slot`
+    /// and the shared watermark sets a floor that remains fixed across failover.
+    /// HTTP responses do not advance the watermark.
     ///
-    /// Transient failures retry with a 100 ms provider cooldown. Malformed
-    /// responses and account decoding errors return immediately with provider
-    /// context. Each attempt has up to two seconds within a ten-second total
-    /// budget. Dropping this future cancels HTTP I/O, but synchronous decoding
-    /// may outlive the attempt budget.
+    /// Transient failures retry within a ten-second budget. Malformed responses
+    /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot, Error> {
         let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
         let deadline = Instant::now() + OVERALL;
@@ -138,8 +135,7 @@ impl Fetcher {
         Err(Error::Deadline { last })
     }
 
-    /// Rotates through eligible providers, waiting only when all are cooling down.
-    /// Eligibility is approximate, not a lease; concurrent requests may use the same endpoint.
+    /// Chooses an eligible provider, waiting only when all are cooling down.
     async fn available(&self, deadline: Instant) -> Option<Candidate<'_>> {
         while Instant::now() < deadline {
             let len = self.providers.len();
@@ -159,7 +155,7 @@ impl Fetcher {
         None
     }
 
-    /// Requests and decodes one complete snapshot without performing failover itself.
+    /// Fetches and decodes one complete snapshot from the chosen provider.
     async fn attempt(
         &self,
         provider: &Provider,
@@ -195,13 +191,13 @@ impl Fetcher {
     }
 }
 
-/// HTTP result or rejection, borrowing its payload until it is decoded.
+/// Borrowed success or provider rejection before payload decoding.
 #[derive(Deserialize)]
 struct Response<'a> {
-    /// Success payload, decoded after the outer response.
+    /// Success payload decoded after outer-envelope validation.
     #[serde(borrow)]
     result: Option<LazyValue<'a>>,
-    /// Provider rejection, retained with its structured diagnostic data.
+    /// Structured provider rejection retained for diagnostics.
     #[serde(borrow)]
     error: Option<LazyValue<'a>>,
 }

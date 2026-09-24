@@ -5,29 +5,28 @@ use solana_account::{AccountBuilder, AccountMode, OwnedAccount};
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
-/// A new delegation resolved from its application account and canonical record.
-/// The creation slot is carried by `account.slot()`.
+/// Delegation resolved from an application account and its canonical record.
 pub struct Delegation {
-    /// Delegated application account.
+    /// Application account's public key.
     pub pubkey: Pubkey,
-    /// Original owner, `Delegated` mode, and creation slot are already resolved.
+    /// Account with original owner, `Delegated` mode, and creation slot.
     pub account: OwnedAccount,
-    /// Complete delegation-record bytes, retaining appended post-delegation actions.
+    /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
-    /// Transaction identity for action provenance and caller-side deduplication.
+    /// Creation transaction signature for action provenance and deduplication.
     pub signature: [u8; 64],
 }
 
-/// Application image with its public key already decoded at the stream boundary.
+/// Application image awaiting its canonical delegation record.
 struct Candidate {
-    /// Application account identity, not its record PDA.
+    /// Application account, not the record PDA.
     pubkey: Pubkey,
-    /// Raw image awaiting the original owner from its record.
+    /// Raw image whose original owner is still unresolved.
     image: SubscribeUpdateAccountInfo,
 }
 
 impl Candidate {
-    /// Restores the original owner and attaches the matched creation record.
+    /// Restores the original owner and creation slot from the matched record.
     fn resolve(self, record: Record, slot: u64) -> Delegation {
         let account = AccountBuilder::default()
             .owner(record.owner)
@@ -47,40 +46,36 @@ impl Candidate {
 
 /// Creation metadata retained until its application account arrives.
 struct Record {
-    /// Original program owner authenticated by the canonical record PDA.
+    /// Original program owner from the canonical record.
     owner: Pubkey,
-    /// Transaction that created the record, retained for post-delegation actions.
+    /// Creation transaction for action provenance.
     signature: [u8; 64],
     /// Full record, including appended actions.
     data: Vec<u8>,
 }
 
-/// One side of a delegation whose other account update has not arrived yet.
-/// A completed delegation leaves this map immediately. Ignored records retain only
-/// a marker so that a later application-account update is discarded too.
+/// One side of an unresolved same-slot delegation.
 enum PendingDelegation {
-    /// Application account received before its delegation record.
+    /// Application image arrived first.
     Account(Candidate),
-    /// Delegation record received before its application account.
+    /// Canonical record arrived first.
     Record(Record),
-    /// Another validator's delegation, or a commit after the creation slot.
+    /// Record must not activate an application image in this slot.
     Ignored,
 }
 
-/// Resolves new delegations without depending on account/record arrival order.
-/// Matching requires the canonical record PDA and the same slot. The caller's
-/// at-most-one-delegation-per-account-per-slot contract makes signature matching unnecessary.
+/// Matches application accounts with canonical records within one slot.
 pub(super) struct Delegations {
-    /// Only records naming this validator can activate an account.
+    /// Only delegations for this validator may activate.
     authority: Pubkey,
-    /// Slot shared by all pending observations; replay may move it backward.
+    /// Slot shared by pending observations; replay may move backward.
     slot: u64,
-    /// Unfinished delegations and ignored markers, keyed by canonical record PDA.
+    /// Unresolved halves and ignored markers keyed by record PDA.
     pending: AHashMap<Pubkey, PendingDelegation>,
 }
 
 impl Delegations {
-    /// Starts discovery for one validator with no pending observations.
+    /// Starts matching with no pending observations.
     pub(super) fn new(authority: Pubkey) -> Self {
         Self {
             authority,
@@ -89,7 +84,7 @@ impl Delegations {
         }
     }
 
-    /// Updates are grouped by slot, including replay, so matches cannot span slot changes.
+    /// Discards incomplete matches whenever the stream changes slots.
     pub(super) fn set_slot(&mut self, slot: u64) {
         if self.slot != slot {
             self.pending.clear();
@@ -97,14 +92,14 @@ impl Delegations {
         }
     }
 
-    /// Processes record-shaped data without excluding its use as application data.
-    /// PDA matching, not the discriminator alone, authenticates the record's identity.
+    /// Validates a record candidate and pairs it with a pending application image.
     pub(super) fn record(
         &mut self,
         key: Pubkey,
         account: &SubscribeUpdateAccountInfo,
         metadata: &DelegationRecord,
     ) -> Result<Option<Delegation>, Error> {
+        // Keep an ignored marker so a later application update cannot form a match.
         if metadata.authority != self.authority || metadata.delegation_slot != self.slot {
             return Ok(self.observe(key, PendingDelegation::Ignored));
         }
@@ -122,7 +117,7 @@ impl Delegations {
         Ok(self.observe(key, PendingDelegation::Record(record)))
     }
 
-    /// Matches an application account against its canonical delegation-record PDA.
+    /// Pairs an application image with its canonical record PDA.
     pub(super) fn account(
         &mut self,
         key: Pubkey,
@@ -133,7 +128,7 @@ impl Delegations {
         self.observe(record, PendingDelegation::Account(candidate))
     }
 
-    /// Completes matching account/record observations; ignores remain effective for the slot.
+    /// Resolves opposite halves or retains the latest unmatched observation.
     fn observe(&mut self, key: Pubkey, incoming: PendingDelegation) -> Option<Delegation> {
         use PendingDelegation::*;
 

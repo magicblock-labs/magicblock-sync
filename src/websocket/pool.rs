@@ -20,96 +20,95 @@ use super::{
 };
 use solana_pubkey::Pubkey;
 
-/// Maximum events awaiting consumption across the pool.
+/// Maximum public events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;
 
-/// Completes an operation only after registry bookkeeping reflects its outcome.
+/// Completion channel for one caller operation.
 type Reply = oneshot::Sender<Result<(), Error>>;
 
-/// One caller operation; operations for the same pubkey must not overlap.
+/// One account operation submitted to the registry.
 struct SubscriptionRequest {
-    /// Account to subscribe to or unsubscribe from.
+    /// Account whose subscription state changes.
     pubkey: Pubkey,
-    /// True requests subscribe; false requests unsubscribe.
+    /// Whether this is subscribe rather than unsubscribe.
     subscribe: bool,
-    /// Waiter for admission failure or the server's acknowledgement.
+    /// Receives admission failure or server acknowledgement.
     reply: Reply,
 }
 
-/// Subscription state that occupies capacity until rejection, unsubscribe acknowledgement, or connection loss.
+/// Per-account state that occupies socket capacity.
 enum Subscription {
-    /// One subscribe or unsubscribe awaiting acknowledgement; capacity remains occupied.
+    /// Operation awaiting a server acknowledgement.
     Pending(Reply),
-    /// Acknowledged subscription identified by the provider's subscription ID.
+    /// Acknowledged subscription with its provider ID.
     Active(u64),
 }
 
-/// One connection-pool entry; its allocated capacity is retained across reconnect attempts.
+/// Pool entry whose capacity remains allocated across reconnects.
 struct Socket {
-    /// Current connection identity; replacing the task advances its generation.
+    /// Current attempt identity; reconnect advances its generation.
     id: Connection,
-    /// Logically bounded by capacity and the caller's non-overlapping-operation contract.
+    /// Commands for the current socket task.
     commands: UnboundedSender<Command>,
-    /// Aborted on drop so a replaced socket cannot outlive its pool entry.
+    /// Aborted when this entry is replaced or dropped.
     task: JoinHandle<()>,
-    /// User subscription states and pending replies for this connection.
+    /// User subscription states and pending replies.
     accounts: AHashMap<Pubkey, Subscription>,
-    /// Whether the registry has observed connection success.
+    /// Whether the registry observed connection readiness.
     ready: bool,
-    /// Whether this pool entry maintains its provider's internal `Clock` subscription.
+    /// Whether this entry maintains the internal `Clock` subscription.
     clock: bool,
-    /// Retry delay, reset when the registry observes connection success.
+    /// Reconnect delay reset after observed readiness.
     backoff: Duration,
 }
 
 impl Socket {
-    /// Requires observed connection success and an I/O task still accepting commands.
+    /// Requires both observed readiness and an open command channel.
     fn healthy(&self) -> bool {
         self.ready && !self.commands.is_closed()
     }
 
-    /// `Clock`, pending, active, and releasing subscriptions all occupy capacity.
+    /// Counts user and internal `Clock` subscriptions against capacity.
     fn occupied(&self) -> usize {
         self.accounts.len() + usize::from(self.clock)
     }
 }
 
 impl Drop for Socket {
-    /// Stops socket I/O instead of detaching the task when its handle is dropped.
+    /// Stops socket I/O when the entry is replaced or the pool ends.
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-/// Registry task ownership and commands, shared by pool handles but not the registry.
+/// Shared lifetime control without a registry-owned reference cycle.
 struct PoolTask {
-    /// Bounded admission queue shared by all pool handles.
+    /// Bounded queue for caller subscription operations.
     commands: Sender<SubscriptionRequest>,
-    /// Highest observed confirmed Solana context slot, retained across reconnects.
+    /// Confirmed context-slot watermark retained across reconnects.
     slot: Arc<AtomicU64>,
-    /// Dropping the last pool handle aborts the registry and therefore every socket task.
+    /// Aborted when the final pool handle drops.
     handle: JoinHandle<()>,
 }
 
 impl Drop for PoolTask {
-    /// Also stops a registry blocked on delivery to a slow event consumer.
+    /// Stops registry and socket tasks with the last public handle.
     fn drop(&mut self) {
         self.handle.abort();
     }
 }
 
-/// Cloneable handle to the subscription pool.
-/// Dropping all handles or closing the event receiver stops the pool.
+/// Cloneable subscription handle. The pool stops when all handles or its event
+/// receiver are dropped.
 #[derive(Clone)]
 pub struct Pool {
-    /// Keeps the registry alive without per-account locks or tasks.
+    /// Shared registry lifetime and command sender.
     task: Arc<PoolTask>,
 }
 
 impl Pool {
-    /// Starts one connection attempt per provider on the current Tokio runtime.
-    /// This does not wait for a connection or validate [`Config`]. Connection
-    /// failures arrive as [`Event::Dropped`] and are retried with capped backoff.
+    /// Starts connecting on the current Tokio runtime without waiting for
+    /// readiness. Connection failures arrive as [`Event::Dropped`].
     pub fn new(config: Config) -> (Self, Receiver<Event>) {
         let (commands, requests) = mpsc::channel(COMMAND_CAP);
         let (events, receiver) = mpsc::channel(EVENT_CAP);
@@ -143,35 +142,32 @@ impl Pool {
         )
     }
 
-    /// Highest observed confirmed Solana context slot from account updates, initially zero.
-    /// This watermark is not a guarantee of the current chain head.
-    /// Callers must not lower or otherwise modify this watermark.
+    /// Shared confirmed-update watermark, initially zero. It is not the chain
+    /// head; callers must not lower or otherwise modify it.
     pub fn slot(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.task.slot)
     }
 
-    /// Subscribes to an account, returning after server acknowledgement rather than
-    /// an initial snapshot. The pubkey must have no subscription or pending operation;
-    /// `Clock` is reserved for internal use.
+    /// Subscribes until server acknowledgement, not an initial snapshot. The key
+    /// must have no existing subscription or pending operation; `Clock` is reserved.
     ///
-    /// Returns [`Error::Unavailable`] or [`Error::Capacity`] instead of waiting for
-    /// a ready socket. Do not cancel this future: admitted work may still complete.
+    /// Capacity failures return immediately. Do not cancel: admitted work may
+    /// complete after the caller stops waiting.
     pub async fn subscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
         self.request(pubkey, true).await
     }
 
-    /// Unsubscribes after a successful [`Self::subscribe`], returning when the server
-    /// acknowledges and capacity is reclaimed. Do not overlap or cancel operations
-    /// for the same pubkey; `Clock` is reserved for internal use.
+    /// Releases an acknowledged subscription. Do not overlap or cancel operations
+    /// for the same key; `Clock` is reserved.
     ///
-    /// A subscription already lost with its connection is a no-op. Buffered updates
-    /// may still arrive. Connection loss during this call returns
-    /// [`Error::Disconnected`]; [`Event::Dropped`] carries the cause.
+    /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
+    /// Connection loss returns [`Error::Disconnected`], with the cause in
+    /// [`Event::Dropped`].
     pub async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
         self.request(pubkey, false).await
     }
 
-    /// Sends an operation and waits for its acknowledgement.
+    /// Waits for registry admission and the server's operation outcome.
     async fn request(&self, pubkey: Pubkey, subscribe: bool) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
         self.task
@@ -183,30 +179,30 @@ impl Pool {
     }
 }
 
-/// Subscription routing and capacity registry; updates bypass this task entirely.
+/// Owns subscription routing and capacity accounting for the pool.
 struct Registry {
-    /// Fixed provider limits and connection policy.
+    /// Provider limits and reconnect policy.
     config: Config,
-    /// Connection-pool entries replaced at the same vector index on reconnect.
+    /// Entries retain stable indices across reconnects.
     sockets: Vec<Socket>,
-    /// Pubkey-to-socket index; lifecycle state lives only in the socket's entry.
+    /// Pubkey to socket index; lifecycle state lives in that entry.
     routes: AHashMap<Pubkey, usize>,
-    /// Public lifecycle events share the sockets' direct update queue.
+    /// Public updates and lifecycle events share this queue.
     events: Sender<Event>,
-    /// Internal lifecycle delivery is bounded logically by admitted work and socket count.
+    /// Socket outcomes arrive independently of public updates.
     notices: UnboundedSender<Notice>,
-    /// Total occupied capacity, including `Clock` and pending operations.
+    /// Capacity occupied by user operations and internal `Clock` subscriptions.
     occupied: usize,
-    /// Allocated subscription capacity, including connections being opened or reconnected.
+    /// Capacity allocated to all entries, including connecting sockets.
     capacity: usize,
-    /// First socket considered by rotating admission.
+    /// Next socket considered for admission.
     cursor: usize,
-    /// Shared minimum Solana context slot for HTTP fetches, retained across reconnects.
+    /// Shared minimum confirmed slot for HTTP snapshots.
     slot: Arc<AtomicU64>,
 }
 
 impl Registry {
-    /// Drives control independently of whether a caller is awaiting an operation.
+    /// Processes caller commands and socket outcomes in one ownership task.
     async fn run(
         &mut self,
         mut requests: Receiver<SubscriptionRequest>,
@@ -228,7 +224,7 @@ impl Registry {
         }
     }
 
-    /// Reserves subscription capacity; only server acknowledgement confirms an active subscription.
+    /// Reserves capacity before waiting for remote acknowledgement.
     fn subscribe(&mut self, pubkey: Pubkey, reply: Reply) {
         let index = match self.admit() {
             Ok(index) => index,
@@ -252,7 +248,7 @@ impl Registry {
         }
     }
 
-    /// Keeps capacity occupied until unsubscribe is acknowledged or the socket is lost.
+    /// Keeps capacity occupied until acknowledgement or socket loss.
     fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
         let Some(&index) = self.routes.get(&pubkey) else {
             // Connection loss can remove the subscription before the caller unsubscribes.
@@ -268,7 +264,7 @@ impl Registry {
         let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
     }
 
-    /// Chooses ready capacity without queuing admission behind connection attempts.
+    /// Finds ready capacity without queuing behind connection attempts.
     fn admit(&mut self) -> Result<usize, Error> {
         let len = self.sockets.len();
         if let Some(index) = (self.cursor..len).chain(0..self.cursor).find(|&i| {
@@ -285,7 +281,7 @@ impl Registry {
         Err(if full { Error::Capacity } else { Error::Unavailable })
     }
 
-    /// Applies lifecycle outcomes before waking callers or reporting connection loss.
+    /// Applies lifecycle outcomes before waking callers or reporting loss.
     async fn notice(&mut self, notice: Notice) {
         match notice {
             Notice::Connected(connection) => {
@@ -332,7 +328,7 @@ impl Registry {
         }
     }
 
-    /// Commits the server's outcome before completing the caller's operation.
+    /// Commits the server outcome before completing the caller's operation.
     fn acknowledge(
         &mut self,
         connection: Connection,
@@ -354,7 +350,7 @@ impl Registry {
         let _ = reply.send(result.map(|_| ()));
     }
 
-    /// Starts a connection attempt with `Clock` queued ahead of user commands.
+    /// Starts an attempt with internal `Clock` ahead of user commands.
     fn spawn(&self, id: Connection, backoff: Duration, clock: bool) -> Socket {
         let (commands, receiver) = mpsc::unbounded_channel();
         if clock {
@@ -380,19 +376,19 @@ impl Registry {
         }
     }
 
-    /// Fixed 75% pool-wide utilization, including capacity not yet ready for admission.
+    /// Requests more sockets at 75% of allocated pool-wide capacity.
     fn should_grow(&self) -> bool {
         self.occupied * 4 >= self.capacity * 3
     }
 
-    /// Visits every provider once; added capacity does not truncate the growth round.
+    /// Gives each configured provider one growth opportunity.
     fn grow(&mut self) {
         for provider in 0..self.config.providers.len() {
             self.grow_provider(provider);
         }
     }
 
-    /// Adds at most one socket per healthy socket, bounded by the provider's limit.
+    /// Adds up to one new socket per healthy socket within provider limits.
     fn grow_provider(&mut self, provider: usize) {
         let mut count = 0;
         let mut healthy = 0usize;
@@ -415,7 +411,7 @@ impl Registry {
         }
     }
 
-    /// Adds a connection-pool entry and starts its first connection attempt immediately.
+    /// Allocates a pool entry and starts its first connection attempt.
     fn open(&mut self, provider: usize, clock: bool) {
         let id = Connection {
             provider,

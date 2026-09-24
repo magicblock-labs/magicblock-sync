@@ -28,91 +28,89 @@ use tokio::{
 };
 use url::Url;
 
-/// Establishes confirmed updates for one account.
+/// RPC method for starting confirmed account updates.
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
-/// Releases an established remote subscription.
+/// RPC method for releasing a provider subscription ID.
 const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
-/// Routes account updates independently of request acknowledgements.
+/// Notification method accepted for account updates.
 const ACCOUNT_NOTIFICATION: &str = "accountNotification";
 
-/// Subscription commands assigned to one connection attempt.
+/// Account operations assigned to one connection attempt.
 pub(super) enum Command {
-    /// Subscribes to an account whose subscription capacity is already reserved.
+    /// Subscription whose pool capacity is already reserved.
     Subscribe(Pubkey),
-    /// Unsubscribes using the provider's acknowledged subscription ID.
+    /// Release of an acknowledged provider subscription.
     Unsubscribe {
-        /// Account being unsubscribed.
+        /// Account being released.
         pubkey: Pubkey,
-        /// Provider-issued subscription ID.
+        /// Acknowledged provider subscription ID.
         remote: u64,
     },
 }
 
-/// Control-plane outcomes consumed only by the pool registry.
+/// Socket outcomes consumed by the pool registry.
 pub(super) enum Notice {
-    /// The socket is accepting commands.
+    /// Connection is accepting commands.
     Connected(Connection),
-    /// Subscribe returns a remote ID; unsubscribe returns none; rejection returns an error.
+    /// Remote outcome for a caller operation.
     Acknowledged {
-        /// Connection identity responsible for the operation.
+        /// Connection responsible for the operation.
         connection: Connection,
         /// Account whose operation completed.
         pubkey: Pubkey,
-        /// Provider response, validated by the socket task.
+        /// Provider subscription ID on subscribe, none on unsubscribe.
         result: Result<Option<u64>, Error>,
     },
-    /// All subscriptions on this connection are lost; no further updates can follow.
+    /// All subscriptions on this attempt were lost.
     Dropped {
-        /// Failed connection identity.
+        /// Failed attempt identity.
         connection: Connection,
-        /// Precise cause, retained for the public loss event.
+        /// Cause retained for public loss reporting.
         error: Error,
     },
 }
 
-/// Connection and RPC acknowledgement budget; writes are intentionally untimed.
+/// Connection and RPC acknowledgement budget.
 const TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum commands processed per socket iteration, independent of mailbox capacity.
+/// Maximum commands in one socket write batch.
 pub(super) const COMMAND_CAP: usize = 256;
-/// Ping cadence; a missing pong at the next tick invalidates the connection's subscriptions.
+/// Ping cadence; a missing pong invalidates the connection.
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
-/// A sent request awaiting acknowledgement within its deadline.
+/// Sent request awaiting its remote acknowledgement.
 struct Pending {
-    /// Retains the pubkey and, for unsubscribe, the provider subscription ID.
+    /// Operation used to interpret the response.
     command: Command,
-    /// Cancels the acknowledgement timer once a response is correlated.
+    /// Cancelled after response correlation.
     timer: AbortHandle,
 }
 
-/// Owns protocol state and I/O for one connection attempt. Reads stay pinned across command
-/// and timer branches so partially consumed frames are never cancelled.
+/// Owns protocol state and I/O for one connection attempt.
 pub(super) struct Session {
-    /// Exclusive outbound half for requests and control replies.
+    /// Exclusive outbound half for RPC and control replies.
     writer: Writer,
-    /// Monotonic request ID within this connection attempt; assumed not to exhaust u64.
+    /// Monotonic request ID within this attempt.
     sequence: u64,
-    /// Wire request IDs correlate acknowledgements with pending commands.
+    /// Request IDs correlated with unacknowledged commands.
     pending: AHashMap<u64, Pending>,
-    /// Outstanding acknowledgement deadlines, cancelled as responses arrive.
+    /// Acknowledgement deadlines for pending commands.
     timers: FuturesUnordered<Abortable<Sleep>>,
-    /// Provider IDs route notifications directly to pubkeys.
+    /// Provider subscription IDs routed directly to account keys.
     active: AHashMap<u64, Pubkey>,
-    /// Identity supplied with every internal lifecycle outcome.
+    /// Attempt identity carried by lifecycle outcomes.
     id: Connection,
-    /// Lifecycle-only channel; account updates bypass the registry.
+    /// Registry-only lifecycle channel.
     notices: UnboundedSender<Notice>,
-    /// Reused by serialization and transport masking for objects and request batches.
+    /// Reused across serialization and transport masking.
     output: Vec<u8>,
-    /// Bounded delivery applies backpressure to this socket's protocol processing.
+    /// Bounded public update delivery.
     events: Sender<Event>,
-    /// Pool-wide minimum Solana context slot for HTTP fetches. Valid confirmed updates only
-    /// raise it; it survives this socket's replacement and is not a chain-head guarantee.
+    /// Shared confirmed-update floor retained across attempts.
     slot: Arc<AtomicU64>,
 }
 
 impl Session {
-    /// Runs one connection attempt, closing its command receiver before reporting subscription loss.
+    /// Runs one attempt and reports loss only after its I/O is closed.
     pub(super) async fn start(
         id: Connection,
         url: Url,
@@ -150,7 +148,7 @@ impl Session {
         }
     }
 
-    /// Drives reads, commands, and deadlines without cancelling partially consumed frames.
+    /// Multiplexes commands, reads, deadlines, and heartbeats without losing frame state.
     async fn run(
         &mut self,
         reader: Reader,
@@ -160,9 +158,7 @@ impl Session {
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut awaiting_pong = false;
         let mut batch = Vec::with_capacity(COMMAND_CAP);
-        // The pinned stream owns the in-flight read. Dropping next() when another
-        // branch wins does not cancel a partially consumed frame or restart framing.
-        // No extra task or heap allocation is needed for the stream itself.
+        // Keep the in-flight read pinned across select branches so framing survives cancellation.
         let frames = stream::unfold(reader, |mut reader| async {
             // Automatic replies are disabled; all writes stay on the session's writer.
             let mut send =
@@ -245,7 +241,7 @@ impl Session {
         }
     }
 
-    /// Acknowledged requests wake only to discard their timers; an empty set stays idle.
+    /// Waits for an uncancelled acknowledgement deadline.
     async fn expired(&mut self) {
         while let Some(result) = self.timers.next().await {
             if result.is_ok() {
@@ -255,7 +251,7 @@ impl Session {
         future::pending().await
     }
 
-    /// Appends to the current wire batch; serialization and writing count toward the budget.
+    /// Correlates and serializes an operation with its deadline.
     fn request(&mut self, command: Command, params: impl Serialize) -> Result<(), Error> {
         let (timer, registration) = AbortHandle::new_pair();
         self.timers.push(Abortable::new(
@@ -274,8 +270,7 @@ impl Session {
         Ok(())
     }
 
-    /// Batch acknowledgements may be reordered. Single replies and account notifications
-    /// are objects, so both wire shapes use the same envelope routing.
+    /// Accepts single or batched RPC envelopes, rejecting malformed batch tails.
     async fn message(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
             // The lazy iterator stops at `]`; validate the whole message to reject trailing data.
@@ -293,7 +288,7 @@ impl Session {
         Ok(())
     }
 
-    /// Validates routing before decoding an update, then waits for delivery capacity.
+    /// Validates routing before decoding a response or account update.
     async fn envelope(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let message: Envelope<'_> = json::from_slice(bytes)?;
         if let Some(id) = message.id {
@@ -327,7 +322,7 @@ impl Session {
             .map_err(|_| Error::Closed)
     }
 
-    /// Updates wire routing before reporting an acknowledgement to the registry.
+    /// Updates remote-ID routing before reporting an operation outcome.
     fn response(
         &mut self,
         pending: Pending,
@@ -376,39 +371,37 @@ impl Session {
         })
     }
 
-    /// Lifecycle outcomes remain ordered per socket without blocking account-update delivery.
+    /// Preserves per-socket lifecycle order without blocking public updates.
     fn notify(&self, notice: Notice) -> Result<(), Error> {
         self.notices.send(notice).map_err(|_| Error::Closed)
     }
 }
 
-// Providers are assumed to send standard JSON-RPC envelopes and unique active IDs.
-// Borrow payloads until their routing identity has passed validation.
-// Accepted account updates still use full typed decoding; no intermediate Value tree.
-/// Borrowed routing envelope, validated before interpreting its operation-specific payload.
+// Borrow payloads until routing is validated; account updates still use typed decoding.
+/// Borrowed envelope whose routing identity is validated before payload decoding.
 #[derive(Deserialize)]
 struct Envelope<'a> {
-    /// Account-notification method for messages without a request ID.
+    /// Notification method when no request ID is present.
     method: Option<&'a str>,
-    /// Presence selects response handling; absence selects notification handling.
+    /// Presence distinguishes responses from notifications.
     id: Option<u64>,
-    /// Borrowed success payload, decoded according to the pending request's operation.
+    /// Success payload interpreted by the pending operation.
     #[serde(borrow)]
     result: Option<LazyValue<'a>>,
-    /// Borrowed provider error, decoded only after request correlation succeeds.
+    /// Provider rejection decoded after request correlation.
     #[serde(borrow)]
     error: Option<LazyValue<'a>>,
-    /// Required notification routing data when no request ID is present.
+    /// Notification routing data, absent from responses.
     #[serde(borrow)]
     params: Option<Notification<'a>>,
 }
 
-/// Account update tied to an established remote subscription.
+/// Account update tied to a provider subscription ID.
 #[derive(Deserialize)]
 struct Notification<'a> {
-    /// Provider-issued subscription ID, valid only on this connection.
+    /// Provider-issued ID valid only on this connection.
     subscription: u64,
-    /// Account payload left borrowed until routing is validated.
+    /// Account image decoded after subscription routing.
     #[serde(borrow)]
     result: LazyValue<'a>,
 }

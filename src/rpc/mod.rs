@@ -5,31 +5,30 @@ use derive_more::Display;
 use json::Value;
 use serde::{Deserialize, Serialize};
 
-/// Borrowed wire accounts and their decoded-data errors.
 mod account;
 
 pub use account::DecodeError;
 pub(crate) use account::WireAccount;
 
-/// Finality required for snapshots and every subscription contributing to the watermark.
+/// Finality shared by snapshots and subscriptions.
 const COMMITMENT: &str = "confirmed";
-/// JSON-RPC version used for requests and response validation.
+/// Protocol version required by the RPC envelope.
 pub(crate) const VERSION: &str = "2.0";
-/// Requests share a protocol version, but retain transport-specific methods and params.
+/// Typed request wrapped in the common JSON-RPC envelope.
 #[derive(Serialize)]
 pub(crate) struct Request<P> {
-    /// Fixed protocol version; callers only choose the operation and its arguments.
+    /// Fixed JSON-RPC protocol version.
     jsonrpc: &'static str,
-    /// Correlates the acknowledgement with its originating request.
+    /// Request identity for acknowledgement matching.
     id: u64,
-    /// RPC operation selected by the transport.
+    /// Transport-selected RPC operation.
     method: &'static str,
-    /// Operation-specific positional arguments without an intermediate JSON tree.
+    /// Operation-specific positional arguments.
     params: P,
 }
 
 impl<P> Request<P> {
-    /// Wraps typed operation arguments in the common JSON-RPC envelope.
+    /// Uses the common protocol version with typed operation arguments.
     pub(crate) fn new(id: u64, method: &'static str, params: P) -> Self {
         Self {
             jsonrpc: VERSION,
@@ -40,21 +39,21 @@ impl<P> Request<P> {
     }
 }
 
-/// Both transports use the same commitment and encoding. Only HTTP supplies a slot floor.
+/// Account response policy shared by HTTP and WebSocket requests.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountConfig {
-    /// Fixed compressed representation understood by the account decoder.
+    /// Compressed representation accepted by the decoder.
     encoding: &'static str,
-    /// Fixed finality shared with the pool's watermark observations.
+    /// Shared confirmed finality.
     commitment: &'static str,
-    /// HTTP freshness floor; omitted from subscription requests.
+    /// HTTP freshness floor, absent from subscriptions.
     #[serde(skip_serializing_if = "Option::is_none")]
     min_context_slot: Option<u64>,
 }
 
 impl AccountConfig {
-    /// Applies the common account policy with an optional HTTP freshness floor.
+    /// Applies shared encoding and finality with an optional HTTP slot floor.
     pub(crate) fn new(min_context_slot: Option<u64>) -> Self {
         Self {
             encoding: ENCODING,
@@ -64,20 +63,20 @@ impl AccountConfig {
     }
 }
 
-/// Provider observation context shared by the accompanying value.
+/// Provider context applying to one response value.
 #[derive(Deserialize)]
 pub(crate) struct Context {
-    /// Confirmed slot at which the provider observed the response value.
+    /// Confirmed slot of the accompanying value.
     pub(crate) slot: u64,
 }
 
-/// A missing value is invalid even when T permits explicit null.
+/// Context and required value, allowing explicit null only when `T` does.
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub(crate) struct ContextValue<T> {
-    /// Observation context applying to the complete payload.
+    /// Observation context for the whole value.
     pub(crate) context: Context,
-    /// Required payload; explicit null is accepted only when T permits it.
+    /// Required payload; null is valid only for nullable `T`.
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pub(crate) value: T,
 }

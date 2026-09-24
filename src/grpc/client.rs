@@ -6,40 +6,41 @@ use tokio::{
     task::JoinHandle,
 };
 
-/// One batched membership change. Removal wins when a key occurs in both lists.
+/// Membership change acknowledged after request delivery.
 pub(super) struct SubscriptionUpdate {
-    /// Retained accounts to promote without replacing their WebSocket subscriptions.
+    /// Accounts to retain alongside WebSocket coverage.
     pub(super) add: Vec<Pubkey>,
-    /// Accounts no longer retained by orchestration.
+    /// Accounts to stop retaining; removal wins over addition.
     pub(super) remove: Vec<Pubkey>,
-    /// Acknowledges request delivery, not remote coverage.
+    /// Signals delivery, not remote coverage.
     pub(super) reply: oneshot::Sender<()>,
 }
 
-/// Last-handle lifetime control; the task does not hold this Arc itself.
+/// Last-handle lifetime control for the provider task.
 struct ClientTask {
-    /// Bounded control queue, outside the initial-fetch path.
+    /// Bounded membership-update queue.
     updates: mpsc::Sender<SubscriptionUpdate>,
-    /// Aborted when all handles drop, including if event delivery is blocked.
+    /// Aborted when all client handles are dropped.
     handle: JoinHandle<()>,
 }
 
 impl Drop for ClientTask {
+    /// Stops the provider task when the final handle is released.
     fn drop(&mut self) {
         self.handle.abort();
     }
 }
 
-/// Cloneable control handle for one provider and an independent ordered event receiver.
+/// Cloneable control handle for one provider's event stream.
 #[derive(Clone)]
 pub struct Client {
-    /// Keeps the provider task alive and admits subscription updates.
+    /// Shared provider-task lifetime and update sender.
     task: Arc<ClientTask>,
 }
 
 impl Client {
-    /// Starts on the current Tokio runtime. Pass [`crate::websocket::Pool::slot`] to share freshness
-    /// with HTTP/WebSockets. The watermark is not used as a replay checkpoint.
+    /// Starts on the current Tokio runtime. Use [`crate::websocket::Pool::slot`]
+    /// to share freshness with HTTP and WebSockets, not as a replay checkpoint.
     pub fn new(
         config: Config,
         slot: Arc<AtomicU64>,
@@ -58,10 +59,10 @@ impl Client {
         Ok((client, receiver))
     }
 
-    /// Sends one batch without waiting for server-side establishment.
-    /// Duplicate additions/removals are harmless; removal wins within a batch.
-    /// Cancellation does not retract an admitted change. On failure, the terminal
-    /// [`Event::Disconnected`] carries the cause and this call returns [`Error::Closed`].
+    /// Sends a membership change without waiting for remote coverage. Removal
+    /// wins if a key appears in both lists. Cancelling cannot retract an admitted
+    /// change. On terminal failure this returns [`Error::Closed`], with the cause
+    /// in [`Event::Disconnected`].
     pub async fn update(&self, add: Vec<Pubkey>, remove: Vec<Pubkey>) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
         self.task
@@ -73,7 +74,7 @@ impl Client {
     }
 }
 
-/// Membership batches awaiting delivery.
+/// Maximum queued membership changes.
 const UPDATE_CAPACITY: usize = 64;
-/// Account and lifecycle events awaiting consumption.
+/// Maximum queued account and lifecycle events.
 const EVENT_CAPACITY: usize = 8192;

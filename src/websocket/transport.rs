@@ -19,16 +19,16 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::Error;
 
-/// Inbound half that assembles fragmented frames before session-level validation.
+/// Inbound half that assembles fragmented frames for session validation.
 pub(super) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
 
-/// Outbound half; writes rely on the peer continuing to read rather than a local deadline.
+/// Outbound half owned exclusively by the socket session.
 pub(super) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 
-/// Enough for a maximum-size Solana account encoded as base64, including its envelope.
+/// Inclusive limit for an assembled account notification.
 pub(super) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
-/// Shares TLS configuration across connections without initializing it for plain WebSockets.
+/// Shared TLS configuration, initialized only for secure endpoints.
 static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLock::new(|| {
     let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()?
@@ -37,7 +37,7 @@ static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLo
     Ok(TlsConnector::from(Arc::new(config)))
 });
 
-/// Opens a valid provider URL; the caller bounds connection setup with one deadline.
+/// Opens a provider socket; the caller bounds connection setup time.
 pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
     let host = match url.host().ok_or(Error::Protocol("provider URL has no host"))? {
         Host::Ipv6(ip) => ip.to_string(),
@@ -62,7 +62,7 @@ pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
     Ok((FragmentCollectorRead::new(reader), writer))
 }
 
-/// Upgrades an established stream, verifying the server key and rejecting unrequested extensions.
+/// Verifies the server key and rejects unsolicited WebSocket extensions.
 async fn upgrade<S>(url: &Url, stream: S) -> Result<WebSocket<TokioIo<Upgraded>>, Error>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,

@@ -5,17 +5,18 @@ use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, InnerInstruction, SubscribeUpdateTransactionInfo,
 };
 
-/// Borrowed instruction fields shared by top-level and CPI ownership-return decoding.
+/// Borrowed instruction shape shared by top-level and CPI decoding.
 struct Instruction<'a> {
-    /// Program index into the transaction's static account keys.
+    /// Index into static transaction account keys.
     program: u32,
-    /// Instruction account indices into the same key list.
+    /// Account indices into the same key list.
     accounts: &'a [u8],
-    /// DLP discriminator and instruction arguments.
+    /// DLP discriminator and arguments.
     data: &'a [u8],
 }
 
 impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
+    /// Borrows a top-level instruction without copying its payload.
     fn from(instruction: &'a CompiledInstruction) -> Self {
         Self {
             program: instruction.program_id_index,
@@ -26,6 +27,7 @@ impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
 }
 
 impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
+    /// Borrows a CPI instruction in the same shape as a top-level instruction.
     fn from(instruction: &'a InnerInstruction) -> Self {
         Self {
             program: instruction.program_id_index,
@@ -35,10 +37,7 @@ impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
     }
 }
 
-/// Extracts ownership returns from a successful transaction's top-level and CPI instructions.
-/// An executed CPI failure aborts the transaction, so success needs no log or stack parsing.
-/// The subscription supplies successful non-vote transactions with CPI metadata.
-/// Relevant program and account indices must refer to static transaction keys.
+/// Finds distinct ownership returns in a successful transaction and its CPIs.
 pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<Vec<Pubkey>, Error> {
     let meta = tx.meta.as_ref().ok_or(Error::Protocol("missing transaction metadata"))?;
     let message = tx

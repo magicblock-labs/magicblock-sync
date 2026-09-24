@@ -32,22 +32,22 @@ use super::{
     Event,
 };
 
-/// One task owns membership and pending delegations; Yellowstone owns transport recovery.
+/// Owns retained membership and delegation state for one provider stream.
 pub(super) struct Session {
-    /// Provider endpoint, validator identity, and filter capacity.
+    /// Endpoint, authority, and provider credentials.
     config: Config,
-    /// One authoritative exact-membership set, also used to build the wire filter.
+    /// Authoritative exact-membership filter, including reconnect snapshots.
     accounts: CompressedAccountFilterSet,
-    /// Shared with HTTP and WebSockets; not a recovery checkpoint.
+    /// Shared confirmed-update floor, not a replay checkpoint.
     watermark: Arc<AtomicU64>,
-    /// Ordered delivery; closing the receiver stops the task.
+    /// Ordered account and lifecycle event delivery.
     events: mpsc::Sender<Event>,
-    /// Account/record observations awaiting their counterpart.
+    /// Same-slot application and record matching.
     delegations: Delegations,
 }
 
 impl Session {
-    /// Allocates the compressed filter; endpoint validation belongs to the transport.
+    /// Allocates the retained-account filter for one provider session.
     pub(super) fn new(
         config: Config,
         watermark: Arc<AtomicU64>,
@@ -62,14 +62,14 @@ impl Session {
         })
     }
 
-    /// Keeps terminal failure behind previously queued events, including after delivery timeout.
+    /// Reports a terminal stream failure after earlier queued events.
     pub(super) async fn run(mut self, mut updates: mpsc::Receiver<SubscriptionUpdate>) {
         if let Err(error) = self.subscribe(&mut updates).await {
             let _ = self.events.send(Event::Disconnected(error)).await;
         }
     }
 
-    /// Uses upstream reconnect/replay as-is; no local retries, checkpoints, or deduplication.
+    /// Lets Yellowstone reconnect while processing membership changes and updates.
     async fn subscribe(
         &mut self,
         updates: &mut mpsc::Receiver<SubscriptionUpdate>,
@@ -105,7 +105,7 @@ impl Session {
         }
     }
 
-    /// Dispatches provider messages without mixing protocol handling into the I/O loop.
+    /// Routes provider updates without changing transport recovery ownership.
     async fn process(
         &mut self,
         update: SubscribeUpdate,
@@ -120,7 +120,7 @@ impl Session {
         Ok(())
     }
 
-    /// Sends the complete membership snapshot used both now and after reconnect.
+    /// Sends the complete current membership filter for this stream and reconnects.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
         timeout(TIMEOUT, sink.send(self.request()))
             .await
@@ -128,7 +128,7 @@ impl Session {
         Ok(())
     }
 
-    /// Answers the heartbeat without leaving a ping-only reconnect request cached upstream.
+    /// Answers a heartbeat, then restores the full subscription request.
     async fn ping(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
         let request = SubscribeRequest {
             ping: Some(SubscribeRequestPing { id: PING_ID }),
@@ -137,11 +137,10 @@ impl Session {
         timeout(TIMEOUT, sink.send(request))
             .await
             .map_err(|_| Error::Timeout("ping"))??;
-        // Restore the full request before polling the reconnecting stream again.
         self.refresh(sink).await
     }
 
-    /// Refetching and local lifecycle transitions remain orchestration responsibilities.
+    /// Emits refetch requests for successful ownership returns.
     async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<(), Error> {
         self.delegations.set_slot(update.slot);
         let transaction = update.transaction.ok_or(Error::Protocol("missing transaction"))?;
@@ -156,7 +155,7 @@ impl Session {
         Ok(())
     }
 
-    /// Applies and sends a batch before acknowledging it. Failure terminates the session.
+    /// Applies a membership batch before acknowledging request delivery.
     async fn update_subscription(
         &mut self,
         update: SubscriptionUpdate,
@@ -177,7 +176,7 @@ impl Session {
         Ok(())
     }
 
-    /// Records use owner/discriminator/authority filters, allowing appended actions.
+    /// Builds filters for retained accounts, delegation discovery, and returns.
     fn request(&mut self) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             commitment: Some(CommitmentLevel::Confirmed as i32),
@@ -217,7 +216,7 @@ impl Session {
         request
     }
 
-    /// Routes exact members and eligible DLP observations before decoding their payloads.
+    /// Routes retained updates and discovers same-slot delegation pairs.
     async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<(), Error> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
@@ -258,13 +257,13 @@ impl Session {
         Ok(())
     }
 
-    /// Resolved accounts use the same freshness watermark as raw subscription updates.
+    /// Raises the shared watermark for a resolved delegation before delivery.
     async fn delegated(&self, delegation: Delegation) -> Result<(), Error> {
         self.watermark.fetch_max(delegation.account.slot(), Relaxed);
         self.send(Event::Delegated(delegation)).await
     }
 
-    /// Slow consumers apply backpressure; timeout is followed by a terminal failure event.
+    /// Bounds consumer backpressure so a stalled receiver terminates the stream.
     async fn send(&self, event: Event) -> Result<(), Error> {
         timeout(TIMEOUT, self.events.send(event))
             .await
@@ -273,21 +272,20 @@ impl Session {
     }
 }
 
-/// Outgoing filter labels; incoming updates are routed by payload and account identity.
+/// Label for exact retained-account membership.
 const RETAINED_FILTER: &str = "retained";
-/// DLP-owned application candidates.
+/// Label for DLP-owned application candidates.
 const CANDIDATES_FILTER: &str = "candidates";
-/// This validator's delegation records, including appended actions.
+/// Label for canonical delegation-record candidates.
 const RECORDS_FILTER: &str = "records";
-/// Successful ownership-return transactions.
+/// Label for successful ownership-return transactions.
 const RELEASES_FILTER: &str = "releases";
-/// Endpoint prefix requiring TLS.
-/// Opaque heartbeat identifier echoed by the server.
+/// Opaque heartbeat identity echoed to Yellowstone.
 const PING_ID: i32 = 1;
-/// Maximum decoded provider message size in bytes.
+/// Maximum decoded provider message size.
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
-/// Binary memcmp at a field offset supplied by the DLP record layout.
+/// Builds a byte-level field comparison for an account filter.
 fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
     let memcmp = SubscribeRequestFilterAccountsFilterMemcmp {
         offset,
@@ -298,5 +296,5 @@ fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
     }
 }
 
-/// Bounded wait for network and consumer progress.
+/// Budget for network and event-consumer progress.
 const TIMEOUT: Duration = Duration::from_secs(30);
