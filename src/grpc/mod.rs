@@ -2,10 +2,12 @@
 //!
 //! Yellowstone reconnects and may replay, but does not guarantee gapless delivery.
 //! Callers reconcile gaps, deduplicate events, and perform Engine lifecycle changes.
-//! Delegation matching requires a canonical record in the same slot and assumes
-//! at most one delegation per account per slot;
+//! Delegation matching requires same-slot updates to the account and its
+//! derived delegation-record PDA. It assumes at most one delegation per account
+//! per slot;
 //! undelegation detection uses static transaction keys, not lookup-table addresses.
 
+use smallvec::SmallVec;
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use url::Url;
@@ -46,14 +48,14 @@ pub enum Event {
         /// Raw account image, including zero-lamport updates.
         account: AccountBuilder,
     },
-    /// New delegation resolved from an account and its canonical record.
+    /// New delegation matched to the account's delegation record PDA.
     Delegated(Delegation),
-    /// Accounts affected by an ownership return; fetch at or after the given slot.
-    Refetch {
-        /// Distinct accounts affected by the ownership return.
-        pubkeys: Vec<Pubkey>,
+    /// Accounts undelegated in a successful transaction; fetch at or after this slot.
+    Undelegated {
+        /// Distinct undelegated accounts.
+        pubkeys: SmallVec<[Pubkey; 1]>,
         /// Lower bound for the caller's subsequent snapshot.
-        min_context_slot: u64,
+        slot: u64,
     },
     /// Terminal stream failure; queued events precede it.
     Disconnected(Error),

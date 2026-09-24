@@ -5,7 +5,7 @@ use solana_account::{AccountBuilder, AccountMode};
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
-/// Delegation resolved from an application account and its canonical record.
+/// Delegation matched to an application account's delegation record PDA.
 pub struct Delegation {
     /// Application account's public key.
     pub pubkey: Pubkey,
@@ -13,11 +13,9 @@ pub struct Delegation {
     pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
-    /// Creation transaction signature for action provenance and deduplication.
-    pub signature: [u8; 64],
 }
 
-/// Application image awaiting its canonical delegation record.
+/// Application image awaiting its delegation record PDA update.
 struct Candidate {
     /// Application account, not the record PDA.
     pubkey: Pubkey,
@@ -38,17 +36,14 @@ impl Candidate {
             pubkey: self.pubkey,
             account,
             record: record.data,
-            signature: record.signature,
         }
     }
 }
 
 /// Creation metadata retained until its application account arrives.
 struct Record {
-    /// Original program owner from the canonical record.
+    /// Original program owner from the delegation record.
     owner: Pubkey,
-    /// Creation transaction for action provenance.
-    signature: [u8; 64],
     /// Full record, including appended actions.
     data: Vec<u8>,
 }
@@ -57,13 +52,13 @@ struct Record {
 enum PendingDelegation {
     /// Application image arrived first.
     Account(Candidate),
-    /// Canonical record arrived first.
+    /// Delegation record arrived first.
     Record(Record),
     /// Record must not activate an application image in this slot.
     Ignored,
 }
 
-/// Matches application accounts with canonical records within one slot.
+/// Matches application accounts with their delegation record PDA updates in one slot.
 pub(super) struct Delegations {
     /// Only delegations for this validator may activate.
     authority: Pubkey,
@@ -102,21 +97,14 @@ impl Delegations {
         if metadata.authority != self.authority || metadata.delegation_slot != self.slot {
             return Ok(self.observe(key, PendingDelegation::Ignored));
         }
-        let signature = account
-            .txn_signature
-            .as_deref()
-            .ok_or(Error::Protocol("missing delegation transaction signature"))?
-            .try_into()
-            .map_err(|_| Error::Protocol("invalid delegation transaction signature"))?;
         let record = Record {
             owner: metadata.owner,
-            signature,
             data: account.data.clone(),
         };
         Ok(self.observe(key, PendingDelegation::Record(record)))
     }
 
-    /// Pairs an application image with its canonical record PDA.
+    /// Pairs an application image with its delegation record PDA update.
     pub(super) fn account(
         &mut self,
         key: Pubkey,

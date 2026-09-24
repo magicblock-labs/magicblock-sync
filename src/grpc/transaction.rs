@@ -1,5 +1,6 @@
 use super::Error;
 use dlp_api::discriminator::DlpDiscriminator;
+use smallvec::SmallVec;
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, InnerInstruction, SubscribeUpdateTransactionInfo,
@@ -37,8 +38,10 @@ impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
     }
 }
 
-/// Finds distinct ownership returns in a successful transaction and its CPIs.
-pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<Vec<Pubkey>, Error> {
+/// Finds distinct undelegated accounts in a successful transaction and its CPIs.
+pub(super) fn released(
+    tx: &SubscribeUpdateTransactionInfo,
+) -> Result<SmallVec<[Pubkey; 1]>, Error> {
     let meta = tx.meta.as_ref().ok_or(Error::Protocol("missing transaction metadata"))?;
     let message = tx
         .transaction
@@ -59,7 +62,7 @@ pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<Vec<Pubkey
         .iter()
         .flat_map(|group| &group.instructions)
         .map(Instruction::from);
-    let mut released = Vec::new();
+    let mut released = SmallVec::new();
     for instruction in outer.chain(inner) {
         if key(instruction.program as usize)? != dlp {
             continue;

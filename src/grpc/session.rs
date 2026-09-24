@@ -144,16 +144,13 @@ impl Session {
         self.refresh(sink).await
     }
 
-    /// Emits refetch requests for successful ownership returns.
+    /// Reports accounts undelegated by successful transactions.
     async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<(), Error> {
         self.delegations.set_slot(update.slot);
         let transaction = update.transaction.ok_or(Error::Protocol("missing transaction"))?;
         let pubkeys = transaction::released(&transaction)?;
         if !pubkeys.is_empty() {
-            let event = Event::Refetch {
-                pubkeys,
-                min_context_slot: update.slot,
-            };
+            let event = Event::Undelegated { pubkeys, slot: update.slot };
             self.send(event).await?;
         }
         Ok(())
@@ -258,8 +255,8 @@ impl Session {
                 self.delegated(delegation).await?;
             }
         }
-        // Application data can resemble a record. Only the canonical PDA establishes
-        // its role, so the same update may participate in both interpretations.
+        // Application data can resemble a record. Only a matching record PDA
+        // establishes its role, so the update may be considered both ways.
         if let Some(delegation) = self.delegations.account(key, account) {
             self.delegated(delegation).await?;
         }
@@ -285,7 +282,7 @@ impl Session {
 const RETAINED_FILTER: &str = "retained";
 /// Label for DLP-owned application candidates.
 const CANDIDATES_FILTER: &str = "candidates";
-/// Label for canonical delegation-record candidates.
+/// Label for delegation record candidates.
 const RECORDS_FILTER: &str = "records";
 /// Label for successful ownership-return transactions.
 const RELEASES_FILTER: &str = "releases";
