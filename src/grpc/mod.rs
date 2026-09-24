@@ -6,7 +6,7 @@
 //! at most one delegation per account per slot;
 //! undelegation detection uses static transaction keys, not lookup-table addresses.
 
-use solana_account::OwnedAccount;
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use url::Url;
 use yellowstone_grpc_client::{
@@ -37,14 +37,14 @@ pub struct Config {
 
 /// Ordered account and lifecycle events from one provider.
 pub enum Event {
-    /// Retained-account update in `Uninit` mode for caller classification.
+    /// Retained account builder in `Uninit` mode for caller classification.
     Update {
         /// Retained account identity.
         pubkey: Pubkey,
-        /// Confirmed observation slot shared with the freshness watermark.
-        slot: u64,
+        /// Program target when this is a ProgramData subscription.
+        target: Option<Pubkey>,
         /// Raw account image, including zero-lamport updates.
-        account: OwnedAccount,
+        account: AccountBuilder,
     },
     /// New delegation resolved from an account and its canonical record.
     Delegated(Delegation),

@@ -10,7 +10,7 @@ use hyper::{body::Bytes, header::CONTENT_TYPE};
 use json::LazyValue;
 use reqwest::{redirect::Policy, retry, Client};
 use serde::{Deserialize, Serialize};
-use solana_account::OwnedAccount;
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use tokio::time::{self, Instant};
 use url::Url;
@@ -34,7 +34,7 @@ pub struct Snapshot {
     /// Context slot shared by the batch.
     pub slot: u64,
     /// `None` only for an explicit RPC null; invalid accounts fail the batch.
-    pub accounts: Vec<Option<OwnedAccount>>,
+    pub accounts: Vec<Option<AccountBuilder>>,
 }
 
 /// Endpoint with eligibility shared across concurrent fetches.

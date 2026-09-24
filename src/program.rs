@@ -1,6 +1,6 @@
 //! Converts remote loader layouts into Engine's ELF account format.
 
-use solana_account::{AccountBuilder, AccountMode, OwnedAccount};
+use solana_account::{AccountBuilder, AccountMode};
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_loader_v4_interface::state::{LoaderV4State, LoaderV4Status};
 use solana_rent::Rent;
@@ -11,51 +11,65 @@ use crate::Error;
 /// Normalizes programs at their recorded snapshot positions.
 pub(super) fn normalize_batch(
     programs: &[(usize, usize)],
-    accounts: &mut [Option<OwnedAccount>],
+    accounts: &mut [Option<AccountBuilder>],
+    rent: &Rent,
 ) -> Result<(), Error> {
     for &(index, data_index) in programs {
-        let program = accounts[index].take();
+        let Some(program) = accounts[index].take() else { continue };
         let program_data = accounts[data_index].take();
-        if let Some(program) = program {
-            let program = normalize(&program, program_data.as_ref())?;
-            accounts[index].replace(program);
-        }
+        accounts[index].replace(normalize(program, program_data, rent)?);
     }
     Ok(())
 }
 
 /// Produces the executable account representation expected by Engine.
-fn normalize(
-    account: &OwnedAccount,
-    program_data: Option<&OwnedAccount>,
-) -> Result<OwnedAccount, Error> {
+pub(super) fn normalize(
+    account: AccountBuilder,
+    program_data: Option<AccountBuilder>,
+    rent: &Rent,
+) -> Result<AccountBuilder, Error> {
     // Legacy ABI keeps Loader V1 ownership; newer ELF uses Loader V4 ownership.
-    let (data, slot, owner) = match account.owner() {
-        id if id == bpf_loader_deprecated::ID => (account.data(), account.slot(), id),
-        id if id == bpf_loader::ID => (account.data(), account.slot(), loader_v4::ID),
+    match account.read().owner() {
+        id if id == bpf_loader_deprecated::ID => Ok(elf_account(account, id, rent)),
+        id if id == bpf_loader::ID => Ok(elf_account(account, loader_v4::ID, rent)),
         id if id == bpf_loader_upgradeable::ID => {
             let program_data =
                 program_data.ok_or(Error::Program("Loader V3 ProgramData is missing"))?;
-            (v3_elf(program_data)?, program_data.slot(), loader_v4::ID)
+            normalize_data(program_data, rent)
         }
-        id if id == loader_v4::ID => (v4_elf(account)?, account.slot(), id),
-        _ => return Err(Error::Program("unsupported loader")),
-    };
+        id if id == loader_v4::ID => {
+            let elf = v4_elf(account.read().data())?.to_vec();
+            Ok(elf_account(account.data(elf), id, rent))
+        }
+        _ => Err(Error::Program("unsupported loader")),
+    }
+}
 
-    let lamports = Rent::default().minimum_balance(data.len());
-    Ok(AccountBuilder::default()
-        .lamports(lamports)
-        .data(data.to_vec())
+/// Converts a ProgramData notification without requiring its unchanged V3 parent.
+pub(super) fn normalize_data(
+    account: AccountBuilder,
+    rent: &Rent,
+) -> Result<AccountBuilder, Error> {
+    let elf = v3_elf(account.read().data())?.to_vec();
+    Ok(elf_account(account.data(elf), loader_v4::ID, rent))
+}
+
+/// Builds the single executable representation used by snapshots and notifications.
+fn elf_account(
+    account: AccountBuilder,
+    owner: solana_pubkey::Pubkey,
+    rent: &Rent,
+) -> AccountBuilder {
+    let len = account.read().data().len();
+    account
+        .lamports(rent.minimum_balance(len))
         .owner(owner)
         .mode(AccountMode::ReadOnly)
         .executable(true)
-        .slot(slot)
-        .build())
 }
 
-/// Returns the ELF bytes following validated Loader V3 ProgramData metadata.
-fn v3_elf(account: &OwnedAccount) -> Result<&[u8], Error> {
-    let data = account.data();
+/// Returns ELF bytes following validated Loader V3 ProgramData metadata.
+fn v3_elf(data: &[u8]) -> Result<&[u8], Error> {
     let metadata = data
         .get(..UpgradeableLoaderState::size_of_programdata_metadata())
         .ok_or(Error::Program("Loader V3 ProgramData is too short"))?;
@@ -66,9 +80,8 @@ fn v3_elf(account: &OwnedAccount) -> Result<&[u8], Error> {
     Ok(&data[metadata.len()..])
 }
 
-/// Returns deployed or finalized Loader V4 ELF bytes.
-fn v4_elf(account: &OwnedAccount) -> Result<&[u8], Error> {
-    let data = account.data();
+/// Returns ELF bytes of a deployed or finalized Loader V4 program.
+fn v4_elf(data: &[u8]) -> Result<&[u8], Error> {
     let offset = LoaderV4State::program_data_offset();
     let header = data.get(..offset).ok_or(Error::Program("Loader V4 account is too short"))?;
     // Decode the discriminant as bytes so malformed input cannot create an invalid enum.

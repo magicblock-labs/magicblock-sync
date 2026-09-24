@@ -11,6 +11,7 @@ use super::{
     Connection, Error, Event,
 };
 use crate::rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount};
+use crate::AccountSubscription;
 use ahash::AHashMap;
 use fastwebsockets::{Frame, OpCode, Payload};
 use futures::{
@@ -38,7 +39,7 @@ const ACCOUNT_NOTIFICATION: &str = "accountNotification";
 /// Account operations assigned to one connection attempt.
 pub(super) enum Command {
     /// Subscription whose pool capacity is already reserved.
-    Subscribe(Pubkey),
+    Subscribe(AccountSubscription),
     /// Release of an acknowledged provider subscription.
     Unsubscribe {
         /// Account being released.
@@ -95,8 +96,8 @@ pub(super) struct Session {
     pending: AHashMap<u64, Pending>,
     /// Acknowledgement deadlines for pending commands.
     timers: FuturesUnordered<Abortable<Sleep>>,
-    /// Provider subscription IDs routed directly to account keys.
-    active: AHashMap<u64, Pubkey>,
+    /// Provider subscription IDs routed to account keys and update targets.
+    active: AHashMap<u64, AccountSubscription>,
     /// Attempt identity carried by lifecycle outcomes.
     id: Connection,
     /// Registry-only lifecycle channel.
@@ -184,9 +185,9 @@ impl Session {
                             self.output.push(b',');
                         }
                         match command {
-                            Command::Subscribe(pubkey) => {
-                                let params = (pubkey.to_string(), AccountConfig::new(None));
-                                self.request(Command::Subscribe(pubkey), params)?;
+                            Command::Subscribe(account) => {
+                                let params = (account.pubkey.to_string(), AccountConfig::new(None));
+                                self.request(Command::Subscribe(account), params)?;
                             }
                             Command::Unsubscribe { pubkey, remote } => {
                                 self.request(Command::Unsubscribe { pubkey, remote }, [remote])?;
@@ -303,21 +304,22 @@ impl Session {
             return Err(Error::Protocol("invalid notification method"));
         }
         let notification = message.params.ok_or(Error::Protocol("missing notification params"))?;
-        let pubkey = *self
+        let sub = *self
             .active
             .get(&notification.subscription)
             .ok_or(Error::Protocol("unknown remote subscription"))?;
         let account: ContextValue<Option<WireAccount<'_>>> =
             json::from_str(notification.result.as_raw_str())?;
         let slot = account.context.slot;
-        let account = account.value.map(|value| value.decode(slot)).transpose()?;
+        let account =
+            account.value.map(|value| value.decode(slot)).transpose()?.unwrap_or_default();
         // Every valid confirmed update contributes, including explicit absence.
         self.slot.fetch_max(slot, Relaxed);
-        if pubkey == clock::ID {
+        if sub.pubkey == clock::ID {
             return Ok(());
         }
         self.events
-            .send(Event::Update { pubkey, slot, account })
+            .send(Event::Update { sub, account })
             .await
             .map_err(|_| Error::Closed)
     }
@@ -333,10 +335,10 @@ impl Session {
             let error: RpcError = json::from_str(error.as_raw_str())?;
             // Clock is mandatory; rejected unsubscribe leaves remote capacity ambiguous.
             return match pending.command {
-                Command::Subscribe(pubkey) if pubkey != clock::ID => {
+                Command::Subscribe(account) if account.pubkey != clock::ID => {
                     self.notify(Notice::Acknowledged {
                         connection: self.id,
-                        pubkey,
+                        pubkey: account.pubkey,
                         result: Err(Error::Rpc(error)),
                     })
                 }
@@ -352,16 +354,16 @@ impl Session {
                 self.active.remove(&remote);
                 (pubkey, None)
             }
-            Command::Subscribe(pubkey) => {
+            Command::Subscribe(account) => {
                 let remote =
                     result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
-                if self.active.insert(remote, pubkey).is_some() {
+                if self.active.insert(remote, account).is_some() {
                     return Err(Error::Protocol("duplicate remote subscription ID"));
                 }
-                if pubkey == clock::ID {
+                if account.pubkey == clock::ID {
                     return Ok(());
                 }
-                (pubkey, Some(remote))
+                (account.pubkey, Some(remote))
             }
         };
         self.notify(Notice::Acknowledged {

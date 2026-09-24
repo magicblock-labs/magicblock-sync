@@ -7,13 +7,14 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use dlp_api::state::{
     discriminator::{AccountDiscriminator, AccountWithDiscriminator},
     DelegationRecord,
 };
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
+use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc, time::timeout};
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcClient, ReconnectConfig, SubscribeRequestSink,
@@ -38,6 +39,8 @@ pub(super) struct Session {
     config: Config,
     /// Authoritative exact-membership filter, including reconnect snapshots.
     accounts: CompressedAccountFilterSet,
+    /// ProgramData addresses with an alternate Engine target.
+    targets: AHashMap<Pubkey, Pubkey>,
     /// Shared confirmed-update floor, not a replay checkpoint.
     watermark: Arc<AtomicU64>,
     /// Ordered account and lifecycle event delivery.
@@ -55,6 +58,7 @@ impl Session {
     ) -> Result<Self, Error> {
         Ok(Self {
             accounts: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 4)?,
+            targets: AHashMap::new(),
             delegations: Delegations::new(config.authority),
             config,
             watermark,
@@ -164,12 +168,18 @@ impl Session {
         let remove: AHashSet<_> = update.remove.into_iter().collect();
         for key in &remove {
             self.accounts.remove(*key);
+            self.targets.remove(key);
         }
-        for key in update.add {
-            if remove.contains(&key) {
+        for account in update.add {
+            if remove.contains(&account.pubkey) {
                 continue;
             }
-            self.accounts.insert(key)?;
+            self.accounts.insert(account.pubkey)?;
+            if let Some(target) = account.target {
+                self.targets.insert(account.pubkey, target);
+            } else {
+                self.targets.remove(&account.pubkey);
+            }
         }
         self.refresh(sink).await?;
         let _ = update.reply.send(());
@@ -231,12 +241,11 @@ impl Session {
                 .lamports(account.lamports)
                 .executable(account.executable)
                 .slot(slot)
-                .data(data)
-                .build();
+                .data(data);
             self.watermark.fetch_max(slot, Relaxed);
             let event = Event::Update {
                 pubkey: key,
-                slot,
+                target: self.targets.get(&key).copied(),
                 account: image,
             };
             self.send(event).await?;
@@ -259,7 +268,7 @@ impl Session {
 
     /// Raises the shared watermark for a resolved delegation before delivery.
     async fn delegated(&self, delegation: Delegation) -> Result<(), Error> {
-        self.watermark.fetch_max(delegation.account.slot(), Relaxed);
+        self.watermark.fetch_max(delegation.account.read().slot(), Relaxed);
         self.send(Event::Delegated(delegation)).await
     }
 

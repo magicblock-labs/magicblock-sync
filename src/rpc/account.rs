@@ -2,7 +2,7 @@ use std::io;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
-use solana_account::{AccountBuilder, OwnedAccount};
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 
 /// Encoding accepted by the shared account decoder.
@@ -32,21 +32,20 @@ struct Data<'a>(
 );
 
 impl WireAccount<'_> {
-    /// Decodes an account in `Uninit` mode for caller classification.
-    pub(crate) fn decode(self, slot: u64) -> Result<OwnedAccount, DecodeError> {
+    /// Decodes an account builder in `Uninit` mode for caller classification.
+    pub(crate) fn decode(self, slot: u64) -> Result<AccountBuilder, DecodeError> {
         if self.data.1 != ENCODING {
             return Err(DecodeError::Protocol("unsupported account encoding"));
         }
         let owner: Pubkey = self.owner.parse()?;
         let data = STANDARD.decode(self.data.0.as_bytes())?;
         let data = zstd::stream::decode_all(data.as_slice()).map_err(DecodeError::Zstd)?;
-        let account = AccountBuilder::default()
+        Ok(AccountBuilder::default()
             .owner(owner)
             .lamports(self.lamports)
             .executable(self.executable)
             .slot(slot)
-            .data(data);
-        Ok(account.build())
+            .data(data))
     }
 }
 

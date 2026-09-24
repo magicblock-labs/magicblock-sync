@@ -5,10 +5,13 @@
 //! callers restore subscriptions and reconcile missed updates.
 //!
 
-use crate::rpc::{DecodeError, Error as RpcError};
+use crate::{
+    rpc::{DecodeError, Error as RpcError},
+    AccountSubscription,
+};
 use fastwebsockets::WebSocketError;
 use hyper::http;
-use solana_account::OwnedAccount;
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use std::io;
 use tokio_rustls::rustls::pki_types::InvalidDnsNameError;
@@ -50,19 +53,15 @@ pub struct Connection {
 }
 
 /// Account and connection events, ordered within each connection only.
-#[derive(derive_more::Debug)]
 pub enum Event {
     /// A connection can accept subscriptions.
     Connected(Connection),
-    /// Confirmed update, decoded in `Uninit` mode for caller classification.
+    /// Confirmed update builder in `Uninit` mode for caller classification.
     Update {
-        /// Account whose subscription produced this update.
-        pubkey: Pubkey,
-        /// Confirmed provider context slot, not a global order guarantee.
-        slot: u64,
-        /// `None` only when the provider explicitly reports absence.
-        #[debug(skip)]
-        account: Option<OwnedAccount>,
+        /// Observed account and optional ProgramData target.
+        sub: AccountSubscription,
+        /// Decoded account image, including zero-lamport updates.
+        account: AccountBuilder,
     },
     /// All listed subscriptions were lost; earlier queued updates precede this event.
     Dropped {

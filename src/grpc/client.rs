@@ -1,4 +1,5 @@
 use super::{session::Session, Config, Error, Event};
+use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
 use std::sync::{atomic::AtomicU64, Arc};
 use tokio::{
@@ -9,7 +10,7 @@ use tokio::{
 /// Membership change acknowledged after request delivery.
 pub(super) struct SubscriptionUpdate {
     /// Accounts to retain alongside WebSocket coverage.
-    pub(super) add: Vec<Pubkey>,
+    pub(super) add: Vec<AccountSubscription>,
     /// Accounts to stop retaining; removal wins over addition.
     pub(super) remove: Vec<Pubkey>,
     /// Signals delivery, not remote coverage.
@@ -59,11 +60,16 @@ impl Client {
         Ok((client, receiver))
     }
 
-    /// Sends a membership change without waiting for remote coverage. Removal
-    /// wins if a key appears in both lists. Cancelling cannot retract an admitted
+    /// Sends a membership change with optional ProgramData targets, without
+    /// waiting for remote coverage. Removal wins if a key appears in both lists.
+    /// Cancelling cannot retract an admitted
     /// change. On terminal failure this returns [`Error::Closed`], with the cause
     /// in [`Event::Disconnected`].
-    pub async fn update(&self, add: Vec<Pubkey>, remove: Vec<Pubkey>) -> Result<(), Error> {
+    pub async fn update(
+        &self,
+        add: Vec<AccountSubscription>,
+        remove: Vec<Pubkey>,
+    ) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
         self.task
             .updates

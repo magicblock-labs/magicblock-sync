@@ -18,6 +18,7 @@ use super::{
     session::{Command, Notice, Session, COMMAND_CAP},
     Config, Connection, Error, Event,
 };
+use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
 
 /// Maximum public events awaiting consumption across the pool.
@@ -28,8 +29,8 @@ type Reply = oneshot::Sender<Result<(), Error>>;
 
 /// One account operation submitted to the registry.
 struct SubscriptionRequest {
-    /// Account whose subscription state changes.
-    pubkey: Pubkey,
+    /// Account and update target for a subscription.
+    account: AccountSubscription,
     /// Whether this is subscribe rather than unsubscribe.
     subscribe: bool,
     /// Receives admission failure or server acknowledgement.
@@ -81,8 +82,8 @@ impl Drop for Socket {
     }
 }
 
-/// Shared lifetime control without a registry-owned reference cycle.
-struct PoolTask {
+/// Subscription handle. The pool stops when this handle or its event receiver is dropped.
+pub struct Pool {
     /// Bounded queue for caller subscription operations.
     commands: Sender<SubscriptionRequest>,
     /// Confirmed context-slot watermark retained across reconnects.
@@ -91,19 +92,11 @@ struct PoolTask {
     handle: JoinHandle<()>,
 }
 
-impl Drop for PoolTask {
-    /// Stops registry and socket tasks with the last public handle.
+impl Drop for Pool {
+    /// Stops registry and socket tasks when their owner is dropped.
     fn drop(&mut self) {
         self.handle.abort();
     }
-}
-
-/// Cloneable subscription handle. The pool stops when all handles or its event
-/// receiver are dropped.
-#[derive(Clone)]
-pub struct Pool {
-    /// Shared registry lifetime and command sender.
-    task: Arc<PoolTask>,
 }
 
 impl Pool {
@@ -134,45 +127,41 @@ impl Pool {
                 _ = registry.run(requests, incoming) => {},
             }
         });
-        (
-            Self {
-                task: Arc::new(PoolTask { commands, slot, handle: task }),
-            },
-            receiver,
-        )
+        (Self { commands, slot, handle: task }, receiver)
     }
 
     /// Shared confirmed-update watermark, initially zero. It is not the chain
     /// head; callers must not lower or otherwise modify it.
     pub fn slot(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.task.slot)
+        Arc::clone(&self.slot)
     }
 
-    /// Subscribes until server acknowledgement, not an initial snapshot. The key
-    /// must have no existing subscription or pending operation; `Clock` is reserved.
+    /// Subscribes until server acknowledgement, not an initial snapshot.
+    /// `ChainSync` owns admission and supplies distinct non-Clock keys.
+    /// The target is retained in queued updates, including those buffered before
+    /// an unsubscribe completes.
     ///
     /// Capacity failures return immediately. Do not cancel: admitted work may
     /// complete after the caller stops waiting.
-    pub async fn subscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.request(pubkey, true).await
+    pub(crate) async fn subscribe(&self, account: AccountSubscription) -> Result<(), Error> {
+        self.request(account, true).await
     }
 
     /// Releases an acknowledged subscription. Do not overlap or cancel operations
-    /// for the same key; `Clock` is reserved.
+    /// for the same key.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
     /// Connection loss returns [`Error::Disconnected`], with the cause in
     /// [`Event::Dropped`].
-    pub async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.request(pubkey, false).await
+    pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
+        self.request(AccountSubscription { pubkey, target: None }, false).await
     }
 
     /// Waits for registry admission and the server's operation outcome.
-    async fn request(&self, pubkey: Pubkey, subscribe: bool) -> Result<(), Error> {
+    async fn request(&self, account: AccountSubscription, subscribe: bool) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
-        self.task
-            .commands
-            .send(SubscriptionRequest { pubkey, subscribe, reply })
+        self.commands
+            .send(SubscriptionRequest { account, subscribe, reply })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -212,11 +201,11 @@ impl Registry {
             tokio::select! {
                 request = requests.recv() => {
                     let Some(request) = request else { return };
-                    let SubscriptionRequest { pubkey, subscribe, reply } = request;
+                    let SubscriptionRequest { account, subscribe, reply } = request;
                     if subscribe {
-                        self.subscribe(pubkey, reply);
+                        self.subscribe(account, reply);
                     } else {
-                        self.unsubscribe(pubkey, reply);
+                        self.unsubscribe(account.pubkey, reply);
                     }
                 }
                 Some(notice) = notices.recv() => self.notice(notice).await,
@@ -225,7 +214,8 @@ impl Registry {
     }
 
     /// Reserves capacity before waiting for remote acknowledgement.
-    fn subscribe(&mut self, pubkey: Pubkey, reply: Reply) {
+    fn subscribe(&mut self, account: AccountSubscription, reply: Reply) {
+        let pubkey = account.pubkey;
         let index = match self.admit() {
             Ok(index) => index,
             Err(error) => {
@@ -234,7 +224,7 @@ impl Registry {
             }
         };
         let socket = &mut self.sockets[index];
-        if socket.commands.send(Command::Subscribe(pubkey)).is_err() {
+        if socket.commands.send(Command::Subscribe(account)).is_err() {
             let _ = reply.send(Err(Error::Unavailable));
             return;
         }
@@ -354,7 +344,10 @@ impl Registry {
     fn spawn(&self, id: Connection, backoff: Duration, clock: bool) -> Socket {
         let (commands, receiver) = mpsc::unbounded_channel();
         if clock {
-            let _ = commands.send(Command::Subscribe(clock::ID));
+            let _ = commands.send(Command::Subscribe(AccountSubscription {
+                pubkey: clock::ID,
+                target: None,
+            }));
         }
         let task = tokio::spawn(Session::start(
             id,

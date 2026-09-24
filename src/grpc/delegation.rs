@@ -1,7 +1,7 @@
 use super::Error;
 use ahash::AHashMap;
 use dlp_api::{pda::delegation_record_pda_from_delegated_account, state::DelegationRecord};
-use solana_account::{AccountBuilder, AccountMode, OwnedAccount};
+use solana_account::{AccountBuilder, AccountMode};
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
@@ -10,7 +10,7 @@ pub struct Delegation {
     /// Application account's public key.
     pub pubkey: Pubkey,
     /// Account with original owner, `Delegated` mode, and creation slot.
-    pub account: OwnedAccount,
+    pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
     /// Creation transaction signature for action provenance and deduplication.
@@ -33,8 +33,7 @@ impl Candidate {
             .lamports(self.image.lamports)
             .data(self.image.data)
             .slot(slot)
-            .mode(AccountMode::Delegated)
-            .build();
+            .mode(AccountMode::Delegated);
         Delegation {
             pubkey: self.pubkey,
             account,
