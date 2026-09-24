@@ -109,28 +109,15 @@ impl ChainSync {
         missing.sort_unstable_by_key(|account| account.pubkey);
         missing.dedup_by_key(|account| account.pubkey);
 
-        // Companions count against getMultipleAccounts' 100-key limit.
-        let mut start = 0;
-        while start < missing.len() {
-            let mut end = start;
-            let mut size = 0;
-            while let Some(account) = missing.get(end) {
-                let added = 1 + usize::from(account.property == AccountProperty::Program);
-                if size + added > 100 {
-                    break;
-                }
-                size += added;
-                end += 1;
-            }
-            let batch = &missing[start..end];
-            start = end;
-            self.sync_batch(batch, size).await?;
+        // Each request can add one companion, so 50 requests fit the 100-key RPC limit.
+        for batch in missing.chunks(50) {
+            self.sync_batch(batch).await?;
         }
         Ok(())
     }
 
     /// Acquires one bounded batch while retaining each missing account's lease.
-    async fn sync_batch(&self, batch: &[SyncAccount], size: usize) -> Result<(), Error> {
+    async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<(), Error> {
         // Keep primary leases through fetch and materialization to exclude duplicate syncs.
         let mut pending = Vec::new();
         for &account in batch {
@@ -143,7 +130,7 @@ impl ChainSync {
             return Ok(());
         }
 
-        let mut keys = Vec::with_capacity(size);
+        let mut keys = Vec::with_capacity(batch.len() * 2);
         for (account, _) in &pending {
             keys.push(account.pubkey);
             if account.property == AccountProperty::Program {
