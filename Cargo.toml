@@ -3,7 +3,7 @@ name = "magicblock-sync"
 
 description = "Base-layer account synchronization for MagicBlock"
 edition = "2021"
-readme = "README.md"
+readme = false
 version = "0.1.0"
 
 [dependencies]
