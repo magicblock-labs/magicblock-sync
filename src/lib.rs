@@ -18,6 +18,7 @@ pub mod websocket;
 use std::borrow::Borrow;
 
 use engine::Engine;
+use futures::future;
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 
@@ -58,13 +59,15 @@ impl ChainSync {
     }
 
     /// Waits for each missing account's subscription acknowledgement before
-    /// fetching batches of up to 100. HTTP `null` becomes a default account.
+    /// fetching batches of up to 100. Subscriptions within a batch run
+    /// concurrently and all settle before an error is returned. HTTP `null`
+    /// becomes a default account.
     /// Account leases prevent concurrent syncs from fetching and materializing
     /// the same key twice.
     ///
     /// The caller consumes WebSocket events and handles recovery. Subscriptions
-    /// acknowledged before a failure remain active; reconcile them before
-    /// retrying an account that is still absent.
+    /// acknowledged before a subscription or HTTP failure are released before
+    /// returning. Materialization failures are returned without cleanup.
     pub async fn sync<I>(&self, keys: I) -> Result<(), Error>
     where
         I: IntoIterator,
@@ -98,15 +101,40 @@ impl ChainSync {
             if keys.is_empty() {
                 continue;
             }
-            for &key in &keys {
-                self.websocket.subscribe(key).await?;
+            let subscriptions = keys.iter().map(|&key| self.websocket.subscribe(key));
+            let mut subscribed = Vec::with_capacity(keys.len());
+            let mut failure = None;
+            for (&key, result) in keys.iter().zip(future::join_all(subscriptions).await) {
+                match result {
+                    Ok(()) => subscribed.push(key),
+                    Err(error) => {
+                        failure.replace(error);
+                    }
+                }
             }
-            let snapshot = self.fetcher.fetch(&keys, None).await?;
+            if let Some(error) = failure {
+                self.unsubscribe_all(&subscribed).await;
+                return Err(error.into());
+            }
+            let snapshot = match self.fetcher.fetch(&keys, None).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.unsubscribe_all(&subscribed).await;
+                    return Err(error.into());
+                }
+            };
             for ((_, accessor), account) in pending.into_iter().zip(snapshot.accounts) {
                 let account = account.unwrap_or_else(|| AccountBuilder::default().build());
                 accessor.materialize(account, None).await?;
             }
         }
         Ok(())
+    }
+
+    /// Waits for every acknowledged subscription to be released or lost with its socket.
+    async fn unsubscribe_all(&self, keys: &[Pubkey]) {
+        let pending = keys.iter().map(|&key| self.websocket.unsubscribe(key));
+        // Unsubscribe fails only when its socket or the pool stops owning the subscription.
+        let _ = future::join_all(pending).await;
     }
 }
