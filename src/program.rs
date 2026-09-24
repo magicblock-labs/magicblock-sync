@@ -1,40 +1,27 @@
 //! Converts remote loader layouts into Engine's ELF account format.
 
 use solana_account::{AccountBuilder, AccountMode, OwnedAccount};
-use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
+use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_loader_v4_interface::state::{LoaderV4State, LoaderV4Status};
-use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4};
 
-use crate::{AccountProperty, Error, SyncAccount};
+use crate::Error;
 
-/// Replaces program snapshots after all companion accounts have been read.
+/// Normalizes programs at their recorded snapshot positions.
 pub(super) fn normalize_batch(
-    requests: impl Iterator<Item = SyncAccount>,
-    keys: &[Pubkey],
+    programs: &[(usize, usize)],
     accounts: &mut [Option<OwnedAccount>],
-) -> Result<Vec<Pubkey>, Error> {
-    let mut normalized = Vec::new();
-    let mut unused = Vec::new();
-    for request in requests.filter(|request| request.property == AccountProperty::Program) {
-        let key = request.pubkey;
-        let data_key = get_program_data_address(&key);
-        let index = keys.binary_search(&key).expect("requested key is in the batch");
-        let data_index = keys.binary_search(&data_key).expect("companion is in the batch");
-        let program =
-            accounts[index].as_ref().ok_or(Error::Program("program account is missing"))?;
-        // Only Loader V3 needs a persistent ProgramData subscription.
-        if program.owner() != bpf_loader_upgradeable::ID {
-            unused.push(data_key);
+) -> Result<(), Error> {
+    for &(index, data_index) in programs {
+        let program = accounts[index].take();
+        let program_data = accounts[data_index].take();
+        if let Some(program) = program {
+            let program = normalize(&program, program_data.as_ref())?;
+            accounts[index].replace(program);
         }
-        normalized.push((index, normalize(program, accounts[data_index].as_ref())?));
     }
-    // A companion can also be a primary key, so finish reading before replacing snapshots.
-    for (index, program) in normalized {
-        accounts[index] = Some(program);
-    }
-    Ok(unused)
+    Ok(())
 }
 
 /// Produces the executable account representation expected by Engine.

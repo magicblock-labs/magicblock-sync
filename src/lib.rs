@@ -30,7 +30,7 @@ pub enum AccountProperty {
     Writable,
     /// Read-only transaction account.
     Readonly,
-    /// Executable program; its Loader V3 companion is fetched when present.
+    /// Executable program; its derived ProgramData address is also subscribed and fetched.
     Program,
 }
 
@@ -78,9 +78,9 @@ impl ChainSync {
 
     /// Subscribes to and materializes accounts missing from Engine.
     ///
-    /// Program requests fetch their Loader V3 ProgramData companion in the same
-    /// snapshot but materialize only the normalized program. HTTP `null` becomes
-    /// a default non-program account; a missing program is an error.
+    /// Program requests also subscribe to and fetch their derived ProgramData
+    /// address, but only materialize the normalized program. HTTP `null`
+    /// becomes a default account, including for a missing program.
     ///
     /// Pubkeys requested as writable accounts or programs must occur only once.
     /// Repeated payer and read-only requests are collapsed by pubkey.
@@ -109,8 +109,21 @@ impl ChainSync {
         missing.sort_unstable_by_key(|account| account.pubkey);
         missing.dedup_by_key(|account| account.pubkey);
 
-        // Each request can add one companion, so 50 requests fit the 100-key RPC limit.
-        for batch in missing.chunks(50) {
+        // Companions count against getMultipleAccounts' 100-key limit.
+        let mut start = 0;
+        while start < missing.len() {
+            let mut end = start;
+            let mut size = 0;
+            while let Some(account) = missing.get(end) {
+                let added = 1 + usize::from(account.property == AccountProperty::Program);
+                if size + added > 100 {
+                    break;
+                }
+                size += added;
+                end += 1;
+            }
+            let batch = &missing[start..end];
+            start = end;
             self.sync_batch(batch).await?;
         }
         Ok(())
@@ -120,49 +133,40 @@ impl ChainSync {
     async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<(), Error> {
         // Keep primary leases through fetch and materialization to exclude duplicate syncs.
         let mut pending = Vec::new();
+        let mut programs = Vec::new();
+        let mut keys = Vec::with_capacity(batch.len());
         for &account in batch {
             let accessor = self.engine.account(account.pubkey).await;
-            if accessor.read(|_| ())?.is_none() {
-                pending.push((account, accessor));
+            if accessor.read(|_| ())?.is_some() {
+                continue;
             }
+            let index = keys.len();
+            keys.push(account.pubkey);
+            if account.property == AccountProperty::Program {
+                let data_index = keys.len();
+                keys.push(get_program_data_address(&account.pubkey));
+                programs.push((index, data_index));
+            }
+            pending.push((accessor, index));
         }
         if pending.is_empty() {
             return Ok(());
         }
 
-        let mut keys = Vec::with_capacity(batch.len() * 2);
-        for (account, _) in &pending {
-            keys.push(account.pubkey);
-            if account.property == AccountProperty::Program {
-                keys.push(get_program_data_address(&account.pubkey));
-            }
-        }
-        keys.sort_unstable();
-        keys.dedup();
-        self.subscribe_all(&keys).await?;
+        self.subscribe(&keys).await?;
 
         let mut snapshot = match self.fetcher.fetch(&keys, None).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.unsubscribe_all(&keys).await;
+                self.unsubscribe(&keys).await;
                 return Err(error.into());
             }
         };
-        let requests = pending.iter().map(|(account, _)| *account);
-        let mut unused = match program::normalize_batch(requests, &keys, &mut snapshot.accounts) {
-            Ok(unused) => unused,
-            Err(error) => {
-                self.unsubscribe_all(&keys).await;
-                return Err(error);
-            }
-        };
-        // A derived companion may also be an explicitly requested account.
-        unused.retain(|key| {
-            pending.binary_search_by_key(key, |(account, _)| account.pubkey).is_err()
-        });
-        self.unsubscribe_all(&unused).await;
-        for (account, accessor) in pending {
-            let index = keys.binary_search(&account.pubkey).expect("requested key is in the batch");
+        if let Err(error) = program::normalize_batch(&programs, &mut snapshot.accounts) {
+            self.unsubscribe(&keys).await;
+            return Err(error);
+        }
+        for (accessor, index) in pending {
             let account = snapshot.accounts[index]
                 .take()
                 .unwrap_or_else(|| AccountBuilder::default().build());
@@ -172,7 +176,7 @@ impl ChainSync {
     }
 
     /// Waits for every acknowledgement before returning a subscription failure.
-    async fn subscribe_all(&self, keys: &[Pubkey]) -> Result<(), Error> {
+    async fn subscribe(&self, keys: &[Pubkey]) -> Result<(), Error> {
         // Dropping an admitted subscribe future can leave a live subscription behind.
         let subscriptions = keys.iter().map(|&key| self.websocket.subscribe(key));
         let mut subscribed = Vec::with_capacity(keys.len());
@@ -186,14 +190,14 @@ impl ChainSync {
             }
         }
         if let Some(error) = failure {
-            self.unsubscribe_all(&subscribed).await;
+            self.unsubscribe(&subscribed).await;
             return Err(error.into());
         }
         Ok(())
     }
 
     /// Releases acknowledged subscriptions or waits for their socket loss.
-    async fn unsubscribe_all(&self, keys: &[Pubkey]) {
+    async fn unsubscribe(&self, keys: &[Pubkey]) {
         let pending = keys.iter().map(|&key| self.websocket.unsubscribe(key));
         // Failed unsubscriptions have already lost their socket or pool owner.
         let _ = future::join_all(pending).await;
