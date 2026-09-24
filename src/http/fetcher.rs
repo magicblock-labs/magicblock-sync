@@ -9,12 +9,12 @@ use std::{
 use hyper::body::Bytes;
 use json::LazyValue;
 use serde::Deserialize;
+use solana_account::OwnedAccount;
+use solana_pubkey::Pubkey;
 use tokio::time::{self, Instant};
+use url::Url;
 
-use crate::{
-    rpc::{AccountConfig, ContextValue, Request, WireAccount, VERSION},
-    OwnedAccount, Pubkey, Url,
-};
+use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount, VERSION};
 
 use super::Error;
 

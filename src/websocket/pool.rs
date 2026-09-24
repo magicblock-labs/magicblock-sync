@@ -18,7 +18,7 @@ use super::{
     session::{Command, Notice, Session, COMMAND_CAP},
     Config, Connection, Error, Event,
 };
-use crate::Pubkey;
+use solana_pubkey::Pubkey;
 
 /// Maximum events awaiting consumption across the pool.
 const EVENT_CAP: usize = 8192;

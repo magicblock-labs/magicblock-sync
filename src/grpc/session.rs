@@ -54,7 +54,7 @@ impl Session {
         events: mpsc::Sender<Event>,
     ) -> Result<Self, Error> {
         Ok(Self {
-            accounts: CompressedAccountFilterSet::with_capacity(config.max_accounts)?,
+            accounts: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 4)?,
             delegations: Delegations::new(config.authority),
             config,
             watermark,
@@ -74,12 +74,12 @@ impl Session {
         &mut self,
         updates: &mut mpsc::Receiver<SubscriptionUpdate>,
     ) -> Result<(), Error> {
-        let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.clone())?
+        let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
             .connect_timeout(TIMEOUT)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .set_reconnect_config(ReconnectConfig::default());
-        if self.config.endpoint.starts_with(HTTPS_PREFIX) {
+        if self.config.endpoint.scheme() == "https" {
             builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
         }
         let mut client = timeout(TIMEOUT, builder.connect())
@@ -282,7 +282,6 @@ const RECORDS_FILTER: &str = "records";
 /// Successful ownership-return transactions.
 const RELEASES_FILTER: &str = "releases";
 /// Endpoint prefix requiring TLS.
-const HTTPS_PREFIX: &str = "https:";
 /// Opaque heartbeat identifier echoed by the server.
 const PING_ID: i32 = 1;
 /// Maximum decoded provider message size in bytes.

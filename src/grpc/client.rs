@@ -1,5 +1,5 @@
 use super::{session::Session, Config, Error, Event};
-use crate::Pubkey;
+use solana_pubkey::Pubkey;
 use std::sync::{atomic::AtomicU64, Arc};
 use tokio::{
     sync::{mpsc, oneshot},

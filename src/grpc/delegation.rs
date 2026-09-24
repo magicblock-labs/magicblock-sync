@@ -1,8 +1,8 @@
 use super::Error;
-use crate::{OwnedAccount, Pubkey};
 use ahash::AHashMap;
 use dlp_api::{pda::delegation_record_pda_from_delegated_account, state::DelegationRecord};
-use solana_account::{AccountBuilder, AccountMode};
+use solana_account::{AccountBuilder, AccountMode, OwnedAccount};
+use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
 /// A new delegation resolved from its application account and canonical record.

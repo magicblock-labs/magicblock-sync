@@ -18,7 +18,9 @@
 //! lookup-table address resolution is not supported. Fetching, action execution, and
 //! Engine lifecycle transitions remain caller responsibilities.
 
-use crate::{OwnedAccount, Pubkey};
+use solana_account::OwnedAccount;
+use solana_pubkey::Pubkey;
+use url::Url;
 use yellowstone_grpc_client::{
     GeyserGrpcBuilderError, GeyserGrpcClientError, SubscribeRequestSinkError,
 };
@@ -42,13 +44,11 @@ pub use delegation::Delegation;
 /// Connection settings for one Yellowstone provider.
 pub struct Config {
     /// HTTP(S) gRPC endpoint, without authentication embedded in the URL.
-    pub endpoint: String,
+    pub endpoint: Url,
     /// Optional provider `x-token` (including Helius LaserStream API keys).
     pub token: Option<String>,
     /// Delegation authority whose new delegations are discovered.
     pub authority: Pubkey,
-    /// Positive capacity requested for the upstream compressed account filter.
-    pub max_accounts: usize,
 }
 
 /// Ordered account and lifecycle observations from a single provider.

@@ -1,6 +1,6 @@
 use super::Error;
-use crate::Pubkey;
 use dlp_api::discriminator::DlpDiscriminator;
+use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, InnerInstruction, SubscribeUpdateTransactionInfo,
 };

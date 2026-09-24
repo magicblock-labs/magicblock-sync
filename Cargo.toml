@@ -16,11 +16,13 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 json = { version = "0.5.8", package = "sonic-rs" }
+accountsdb = { package = "magicblock-accountsdb", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
+engine = { package = "magicblock-engine", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
 magicblock-delegation-program-api = { git = "https://github.com/magicblock-labs/delegation-program.git", rev = "fb6668c7b5ffd6a89bedee1d13b16402fd0e65de", default-features = false }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
-solana-account = { version = "=4.3.1", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.10.0" }
+solana-account = { version = "=4.3.1", git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
 solana-pubkey = "=4.2.0"
 solana-sdk-ids = "3.1.0"
 thiserror = "2"
@@ -32,3 +34,10 @@ webpki-roots = "1"
 yellowstone-grpc-client = "13.5.1"
 yellowstone-grpc-proto = "12.7.0"
 zstd = "0.13"
+
+[patch.crates-io]
+agave-transaction-view = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
+solana-account = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
+solana-program-runtime = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
+solana-svm = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }
+solana-transaction-context = { git = "https://github.com/magicblock-labs/magicblock-engine.git", tag = "0.11.0" }

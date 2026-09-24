@@ -14,11 +14,10 @@ use tokio_rustls::{
     rustls::{crypto::ring, pki_types::ServerName, ClientConfig, RootCertStore},
     TlsConnector,
 };
-use url::{Host, Position};
+use url::{Host, Position, Url};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::Error;
-use crate::Url;
 
 /// Inbound half that assembles fragmented frames before session-level validation.
 pub(super) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;

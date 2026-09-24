@@ -10,10 +10,7 @@ use super::{
     transport::{self, Reader, Writer, MAX_MESSAGE},
     Connection, Error, Event,
 };
-use crate::{
-    rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount},
-    Pubkey, Url,
-};
+use crate::rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount};
 use ahash::AHashMap;
 use fastwebsockets::{Frame, OpCode, Payload};
 use futures::{
@@ -23,11 +20,13 @@ use futures::{
 };
 use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
+use solana_pubkey::Pubkey;
 use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     time::{self, Instant, MissedTickBehavior, Sleep},
 };
+use url::Url;
 
 /// Establishes confirmed updates for one account.
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";

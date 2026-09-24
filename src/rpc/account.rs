@@ -2,11 +2,11 @@ use std::borrow::Cow;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
-use solana_account::AccountBuilder;
+use solana_account::{AccountBuilder, OwnedAccount};
+use solana_pubkey::Pubkey;
 
 /// Compressed representation supported by the shared account decoder.
 pub(super) const ENCODING: &str = "base64+zstd";
-use crate::{OwnedAccount, Pubkey};
 
 /// Borrowed account representation shared by HTTP snapshots and WebSocket updates.
 #[derive(Deserialize)]
