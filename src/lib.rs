@@ -37,10 +37,11 @@ pub enum AccountProperty {
     Program,
 }
 
-/// Pubkey and role of an account requested for synchronization.
+/// One primary account requested for synchronization. ProgramData companions
+/// are derived from [`AccountProperty::Program`] requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncAccount {
-    /// Account address.
+    /// Address to materialize in Engine, not a derived ProgramData companion.
     pub pubkey: Pubkey,
     /// Role used to select program handling.
     pub property: AccountProperty,
@@ -57,7 +58,7 @@ pub struct AccountSubscription {
 
 /// Acquires missing base-chain accounts for Engine with live WebSocket subscriptions.
 pub struct ChainSync {
-    /// Holds account leases through materialization.
+    /// Acquires missing-account leases and materializes their snapshots.
     engine: Engine,
     /// Supplies confirmed snapshots for missing accounts.
     fetcher: Fetcher,
@@ -65,8 +66,8 @@ pub struct ChainSync {
     websocket: Pool,
 }
 
-/// Applies transport images without participating in acquisition or HTTP fetching.
-struct Worker {
+/// Applies streamed account images independently of HTTP snapshot acquisition.
+struct AccountUpdateWorker {
     engine: Engine,
     websocket: Receiver<websocket::Event>,
     grpc: Receiver<grpc::Event>,
@@ -75,8 +76,6 @@ struct Worker {
 /// Failure to acquire or apply a base-chain account image.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Engine account lookup failed: {0}")]
-    AccountsDb(#[from] accountsdb::AccountsDBError),
     #[error("HTTP account fetch failed: {0}")]
     Fetch(#[from] http::Error),
     #[error("WebSocket subscription failed: {0}")]
@@ -89,7 +88,7 @@ pub enum Error {
     ProgramData(#[from] Box<bincode::ErrorKind>),
 }
 
-impl Worker {
+impl AccountUpdateWorker {
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -124,7 +123,7 @@ impl Worker {
         account: AccountBuilder,
     ) -> Result<(), Error> {
         let AccountSubscription { pubkey, target } = subscription;
-        let accessor = self.engine.account(target.unwrap_or(pubkey)).await;
+        let accessor = self.engine.account(target.unwrap_or(pubkey)).await?;
         let account = if target.is_some() {
             program::normalize_data(account, self.engine.rent())?
         } else if account.read().flags().contains(StateFlags::EXECUTABLE) {
@@ -148,7 +147,7 @@ impl ChainSync {
         websocket_rx: Receiver<websocket::Event>,
         grpc: Receiver<grpc::Event>,
     ) -> Self {
-        let worker = Worker {
+        let worker = AccountUpdateWorker {
             engine: engine.clone(),
             websocket: websocket_rx,
             grpc,
@@ -178,28 +177,16 @@ impl ChainSync {
         I: IntoIterator,
         I::Item: Borrow<SyncAccount>,
     {
-        let mut missing = {
-            let accounts = self.engine.accounts();
-            let loader = accounts.loader();
-            let mut missing = Vec::new();
-            for account in requests {
-                let account = *account.borrow();
-                if !loader.contains(&account.pubkey)? {
-                    missing.push(account);
-                }
-            }
-            missing
-        };
-        // Lock primary accounts in the same order across concurrent syncs.
-        missing.sort_unstable_by_key(|account| account.pubkey);
-        missing.dedup_by_key(|account| account.pubkey);
+        let mut accounts: Vec<_> = requests.into_iter().map(|account| *account.borrow()).collect();
+        accounts.sort_unstable_by_key(|account| account.pubkey);
+        accounts.dedup_by_key(|account| account.pubkey);
 
-        // Companions count against getMultipleAccounts' 100-key limit.
+        // Bound each acquisition wave so its primary keys and companions fit one RPC batch.
         let mut start = 0;
-        while start < missing.len() {
+        while start < accounts.len() {
             let mut end = start;
             let mut size = 0;
-            while let Some(account) = missing.get(end) {
+            while let Some(account) = accounts.get(end) {
                 let added = 1 + usize::from(account.property == AccountProperty::Program);
                 if size + added > 100 {
                     break;
@@ -207,43 +194,46 @@ impl ChainSync {
                 size += added;
                 end += 1;
             }
-            let batch = &missing[start..end];
+            let batch = &accounts[start..end];
             start = end;
             self.sync_batch(batch).await?;
         }
         Ok(())
     }
 
-    /// Acquires one bounded batch while retaining each missing account's lease.
+    /// Retains the missing-account leases through subscription, fetch, and
+    /// materialization so another acquisition cannot duplicate the fetch.
     async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<(), Error> {
+        // Engine scans presence and locks missing primary accounts in pubkey order.
+        let keys: Vec<_> = batch.iter().map(|account| account.pubkey).collect();
+        let accessors = self.engine.missing_accounts(&keys).await?;
+        if accessors.is_empty() {
+            return Ok(());
+        }
+        // Derived from the pubkey-sorted batch for binary-search membership.
+        let program_keys: Vec<_> = batch
+            .iter()
+            .filter(|account| account.property == AccountProperty::Program)
+            .map(|account| account.pubkey)
+            .collect();
         // Keep primary leases through fetch and materialization to exclude duplicate syncs.
-        let mut pending = Vec::new();
+        let mut pending = Vec::with_capacity(accessors.len());
         let mut programs = Vec::new();
         let mut subscriptions = Vec::with_capacity(batch.len() * 2);
-        for &account in batch {
-            let accessor = self.engine.account(account.pubkey).await;
-            if accessor.read(|_| ())?.is_some() {
-                continue;
-            }
+        for accessor in accessors {
+            let pubkey = accessor.pubkey();
             let index = subscriptions.len();
-            subscriptions.push(AccountSubscription {
-                pubkey: account.pubkey,
-                target: None,
-            });
-            if account.property == AccountProperty::Program {
+            subscriptions.push(AccountSubscription { pubkey, target: None });
+            if program_keys.binary_search(&pubkey).is_ok() {
                 let data_index = subscriptions.len();
                 subscriptions.push(AccountSubscription {
-                    pubkey: get_program_data_address(&account.pubkey),
-                    target: Some(account.pubkey),
+                    pubkey: get_program_data_address(&pubkey),
+                    target: Some(pubkey),
                 });
                 programs.push((index, data_index));
             }
             pending.push((accessor, index));
         }
-        if pending.is_empty() {
-            return Ok(());
-        }
-
         self.subscribe(&subscriptions).await?;
         let keys: Vec<_> = subscriptions.iter().map(|subscription| subscription.pubkey).collect();
         let mut snapshot = match self.fetcher.fetch(&keys, None).await {

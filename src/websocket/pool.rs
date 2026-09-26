@@ -64,12 +64,12 @@ struct Socket {
 }
 
 impl Socket {
-    /// Requires both observed readiness and an open command channel.
+    /// Connecting or closed socket tasks cannot accept user subscriptions.
     fn healthy(&self) -> bool {
         self.ready && !self.commands.is_closed()
     }
 
-    /// Counts user and internal `Clock` subscriptions against capacity.
+    /// The internal `Clock` subscription consumes provider capacity too.
     fn occupied(&self) -> usize {
         self.accounts.len() + usize::from(self.clock)
     }
@@ -191,7 +191,8 @@ struct Registry {
 }
 
 impl Registry {
-    /// Processes caller commands and socket outcomes in one ownership task.
+    /// Serializes caller operations with socket outcomes before changing routes
+    /// or waking waiting callers.
     async fn run(
         &mut self,
         mut requests: Receiver<SubscriptionRequest>,
@@ -374,7 +375,8 @@ impl Registry {
         self.occupied * 4 >= self.capacity * 3
     }
 
-    /// Gives each configured provider one growth opportunity.
+    /// Tries every provider so one full or disconnected provider does not
+    /// prevent healthy providers from adding capacity.
     fn grow(&mut self) {
         for provider in 0..self.config.providers.len() {
             self.grow_provider(provider);

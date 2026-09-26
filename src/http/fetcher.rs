@@ -29,7 +29,8 @@ const ATTEMPT: Duration = Duration::from_secs(2);
 /// Shared delay after transient provider failure.
 const COOLDOWN: Duration = Duration::from_millis(100);
 
-/// Confirmed account snapshot in request order, with accounts in `Uninit` mode.
+/// Confirmed account snapshot with one account per requested key in request order.
+/// Accounts enter in `Uninit` mode.
 pub struct Snapshot {
     /// Context slot shared by the batch.
     pub slot: u64,
@@ -45,7 +46,7 @@ struct Provider {
     until: AtomicU64,
 }
 
-/// Positional arguments for one account batch.
+/// Preserves key positions because `getMultipleAccounts` returns values in request order.
 #[derive(Serialize)]
 struct BatchParams(
     /// Requested pubkeys in response order.
@@ -55,7 +56,7 @@ struct BatchParams(
 );
 
 /// Selected provider and its stable error-reporting index.
-struct Candidate<'a> {
+struct SelectedProvider<'a> {
     /// Position in the configured endpoint list.
     index: usize,
     /// Endpoint and its shared cooldown state.
@@ -78,8 +79,11 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    /// Uses a nonempty list of same-chain HTTP(S) endpoints.
+    /// Rejects an empty provider list and shares provider cooldowns across fetches.
     pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self, Error> {
+        if providers.is_empty() {
+            return Err(Error::NoProviders);
+        }
         let client = Client::builder().redirect(Policy::none()).retry(retry::never()).build()?;
         let providers = providers
             .into_iter()
@@ -113,9 +117,9 @@ impl Fetcher {
         let request = Request::new(1, GET_MULTIPLE_ACCOUNTS, params);
         let body = Bytes::from(json::to_vec(&request)?);
         let mut last = None;
-        while let Some(Candidate { index, provider }) = self.available(deadline).await {
+        while let Some(SelectedProvider { index, provider }) = self.available(deadline).await {
             let end = (Instant::now() + ATTEMPT).min(deadline);
-            let result = self.attempt(provider, body.clone(), end).await;
+            let result = self.attempt(provider, body.clone(), end, keys.len()).await;
             let error = match result {
                 Ok(snapshot) => return Ok(snapshot),
                 Err(error) => error,
@@ -135,8 +139,9 @@ impl Fetcher {
         Err(Error::Deadline { last })
     }
 
-    /// Chooses an eligible provider, waiting only when all are cooling down.
-    async fn available(&self, deadline: Instant) -> Option<Candidate<'_>> {
+    /// Waits for the next cooldown only when no provider is eligible; returns
+    /// `None` once the overall deadline has elapsed.
+    async fn available(&self, deadline: Instant) -> Option<SelectedProvider<'_>> {
         while Instant::now() < deadline {
             let len = self.providers.len();
             let start = self.cursor.fetch_add(1, Relaxed) % len;
@@ -146,7 +151,7 @@ impl Fetcher {
                 let provider = &self.providers[index];
                 let until = provider.until.load(Relaxed);
                 if until <= now {
-                    return Some(Candidate { index, provider });
+                    return Some(SelectedProvider { index, provider });
                 }
                 wake = wake.min(self.epoch + Duration::from_millis(until));
             }
@@ -155,12 +160,14 @@ impl Fetcher {
         None
     }
 
-    /// Fetches and decodes one complete snapshot from the chosen provider.
+    /// Rejects a short or long result before decoding, preserving the snapshot's
+    /// one-value-per-key contract for callers that use positional indices.
     async fn attempt(
         &self,
         provider: &Provider,
         body: Bytes,
         end: Instant,
+        expected: usize,
     ) -> Result<Snapshot, Error> {
         let response = self
             .client
@@ -181,6 +188,9 @@ impl Fetcher {
         let result = response.result.ok_or(Error::Protocol("missing HTTP result"))?;
         let result: ContextValue<Vec<Option<WireAccount<'_>>>> =
             json::from_str(result.as_raw_str())?;
+        if result.value.len() != expected {
+            return Err(Error::Protocol("account result count differs from request"));
+        }
         let slot = result.context.slot;
         let accounts = result
             .value

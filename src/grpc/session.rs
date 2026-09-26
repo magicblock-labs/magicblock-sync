@@ -50,7 +50,7 @@ pub(super) struct Session {
 }
 
 impl Session {
-    /// Allocates the retained-account filter for one provider session.
+    /// Keeps the exact retained-account filter across Yellowstone reconnects.
     pub(super) fn new(
         config: Config,
         watermark: Arc<AtomicU64>,
@@ -109,7 +109,8 @@ impl Session {
         }
     }
 
-    /// Routes provider updates without changing transport recovery ownership.
+    /// Handles ping, account, and transaction updates; other provider messages
+    /// do not change retained membership or delegation state.
     async fn process(
         &mut self,
         update: SubscribeUpdate,
@@ -183,7 +184,8 @@ impl Session {
         Ok(())
     }
 
-    /// Builds filters for retained accounts, delegation discovery, and returns.
+    /// Sends exact retained membership alongside DLP delegation discovery and
+    /// successful ownership-return transaction filters, including on reconnect.
     fn request(&mut self) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             commitment: Some(CommitmentLevel::Confirmed as i32),

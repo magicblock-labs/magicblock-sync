@@ -32,7 +32,8 @@ struct Data<'a>(
 );
 
 impl WireAccount<'_> {
-    /// Decodes an account builder in `Uninit` mode for caller classification.
+    /// Validates the declared encoding and owner, then stamps the response slot.
+    /// The resulting builder remains `Uninit` for the caller to classify.
     pub(crate) fn decode(self, slot: u64) -> Result<AccountBuilder, DecodeError> {
         if self.data.1 != ENCODING {
             return Err(DecodeError::Protocol("unsupported account encoding"));

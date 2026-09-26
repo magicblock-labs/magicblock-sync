@@ -17,7 +17,6 @@ struct Instruction<'a> {
 }
 
 impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
-    /// Borrows a top-level instruction without copying its payload.
     fn from(instruction: &'a CompiledInstruction) -> Self {
         Self {
             program: instruction.program_id_index,
@@ -28,7 +27,6 @@ impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
 }
 
 impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
-    /// Borrows a CPI instruction in the same shape as a top-level instruction.
     fn from(instruction: &'a InnerInstruction) -> Self {
         Self {
             program: instruction.program_id_index,

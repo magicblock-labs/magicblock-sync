@@ -34,7 +34,7 @@ pub struct Provider {
     pub subs_per_connection: usize,
 }
 
-/// Nonempty provider list for confirmed subscriptions.
+/// Provider settings for confirmed subscriptions; an empty list has no capacity.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     /// Provider order determines connection identities.

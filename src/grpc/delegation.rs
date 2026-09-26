@@ -9,23 +9,23 @@ use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 pub struct Delegation {
     /// Application account's public key.
     pub pubkey: Pubkey,
-    /// Account with original owner, `Delegated` mode, and creation slot.
+    /// Account with original owner, `Delegated` mode, and matched delegation slot.
     pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
 }
 
-/// Application image awaiting its delegation record PDA update.
-struct Candidate {
+/// DLP-owned application image awaiting its delegation record PDA update.
+struct PendingAccount {
     /// Application account, not the record PDA.
     pubkey: Pubkey,
     /// Raw image whose original owner is still unresolved.
     image: SubscribeUpdateAccountInfo,
 }
 
-impl Candidate {
-    /// Restores the original owner and creation slot from the matched record.
-    fn resolve(self, record: Record, slot: u64) -> Delegation {
+impl PendingAccount {
+    /// Restores the original owner and matched delegation slot.
+    fn resolve(self, record: PendingRecord, slot: u64) -> Delegation {
         let account = AccountBuilder::default()
             .owner(record.owner)
             .lamports(self.image.lamports)
@@ -40,8 +40,8 @@ impl Candidate {
     }
 }
 
-/// Creation metadata retained until its application account arrives.
-struct Record {
+/// Validated delegation record update awaiting its application account.
+struct PendingRecord {
     /// Original program owner from the delegation record.
     owner: Pubkey,
     /// Full record, including appended actions.
@@ -51,9 +51,9 @@ struct Record {
 /// One side of an unresolved same-slot delegation.
 enum PendingDelegation {
     /// Application image arrived first.
-    Account(Candidate),
+    Account(PendingAccount),
     /// Delegation record arrived first.
-    Record(Record),
+    Record(PendingRecord),
     /// Record must not activate an application image in this slot.
     Ignored,
 }
@@ -69,7 +69,8 @@ pub(super) struct Delegations {
 }
 
 impl Delegations {
-    /// Starts matching with no pending observations.
+    /// Restricts matches to this authority; the first stream update establishes
+    /// the matching slot.
     pub(super) fn new(authority: Pubkey) -> Self {
         Self {
             authority,
@@ -86,7 +87,8 @@ impl Delegations {
         }
     }
 
-    /// Validates a record candidate and pairs it with a pending application image.
+    /// Only a record for this authority and slot can activate an application
+    /// image. Other records leave an ignored marker for the rest of the slot.
     pub(super) fn record(
         &mut self,
         key: Pubkey,
@@ -97,22 +99,23 @@ impl Delegations {
         if metadata.authority != self.authority || metadata.delegation_slot != self.slot {
             return Ok(self.observe(key, PendingDelegation::Ignored));
         }
-        let record = Record {
+        let record = PendingRecord {
             owner: metadata.owner,
             data: account.data.clone(),
         };
         Ok(self.observe(key, PendingDelegation::Record(record)))
     }
 
-    /// Pairs an application image with its delegation record PDA update.
+    /// Keys the application image by its derived record PDA so either update
+    /// order can complete a same-slot match.
     pub(super) fn account(
         &mut self,
         key: Pubkey,
         account: SubscribeUpdateAccountInfo,
     ) -> Option<Delegation> {
         let record = delegation_record_pda_from_delegated_account(&key);
-        let candidate = Candidate { pubkey: key, image: account };
-        self.observe(record, PendingDelegation::Account(candidate))
+        let pending = PendingAccount { pubkey: key, image: account };
+        self.observe(record, PendingDelegation::Account(pending))
     }
 
     /// Resolves opposite halves or retains the latest unmatched observation.

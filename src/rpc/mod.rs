@@ -28,7 +28,7 @@ pub(crate) struct Request<P> {
 }
 
 impl<P> Request<P> {
-    /// Uses the common protocol version with typed operation arguments.
+    /// Fixes the envelope to JSON-RPC 2.0 while leaving request IDs to the transport.
     pub(crate) fn new(id: u64, method: &'static str, params: P) -> Self {
         Self {
             jsonrpc: VERSION,
@@ -53,7 +53,7 @@ pub(crate) struct AccountConfig {
 }
 
 impl AccountConfig {
-    /// Applies shared encoding and finality with an optional HTTP slot floor.
+    /// Requests confirmed `base64+zstd` accounts; only HTTP sets a slot floor.
     pub(crate) fn new(min_context_slot: Option<u64>) -> Self {
         Self {
             encoding: ENCODING,
