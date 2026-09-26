@@ -1,7 +1,7 @@
 //! Streams confirmed retained-account and delegation events from Yellowstone.
 //!
 //! Yellowstone reconnects and may replay, but does not guarantee gapless delivery.
-//! Callers reconcile gaps, deduplicate events, and perform Engine lifecycle changes.
+//! Consumers reconcile gaps and deduplicate events before applying lifecycle changes.
 //! Delegation matching requires same-slot updates to the account and its
 //! derived delegation-record PDA. It assumes at most one delegation per account
 //! per slot;
@@ -50,11 +50,11 @@ pub enum Event {
     },
     /// New delegation matched to the account's delegation record PDA.
     Delegated(Delegation),
-    /// Accounts undelegated in a successful transaction; fetch at or after this slot.
+    /// Accounts undelegated in a successful transaction at this slot.
     Undelegated {
         /// Distinct undelegated accounts.
         pubkeys: SmallVec<[Pubkey; 1]>,
-        /// Lower bound for the caller's subsequent snapshot.
+        /// Confirmed undelegation slot.
         slot: u64,
     },
     /// Terminal stream failure; queued events precede it.

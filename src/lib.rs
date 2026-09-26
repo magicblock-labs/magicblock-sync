@@ -3,7 +3,8 @@
 //! [`ChainSync`] subscribes before fetching missing accounts. Ordinary accounts
 //! enter Engine in `Uninit` mode; executable programs enter as read-only ELF
 //! accounts. A background worker applies WebSocket and gRPC account notifications.
-//! Connection recovery and delegation lifecycle are not handled.
+//! Connection recovery and subscription removal after undelegation are not handled;
+//! a later ordinary update can recreate a removed account.
 
 pub mod grpc;
 pub mod http;
@@ -11,11 +12,16 @@ mod program;
 pub mod rpc;
 pub mod websocket;
 
-use std::borrow::Borrow;
+use std::{
+    borrow::Borrow,
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
 
-use engine::Engine;
+use dlp_api::{args::PostDelegationActions, state::DelegationRecord, Decrypt};
+use engine::{Engine, PostFinalize};
 use futures::future;
-use solana_account::{AccountBuilder, StateFlags};
+use solana_account::{AccountBuilder, AccountMode, StateFlags};
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
@@ -66,13 +72,6 @@ pub struct ChainSync {
     websocket: Pool,
 }
 
-/// Applies streamed account images independently of HTTP snapshot acquisition.
-struct AccountUpdateWorker {
-    engine: Engine,
-    websocket: Receiver<websocket::Event>,
-    grpc: Receiver<grpc::Event>,
-}
-
 /// Failure to acquire or apply a base-chain account image.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -86,19 +85,37 @@ pub enum Error {
     Program(&'static str),
     #[error("invalid ProgramData: {0}")]
     ProgramData(#[from] Box<bincode::ErrorKind>),
+    #[error("invalid delegation record: {0}")]
+    Record(&'static str),
+    #[error("invalid delegation actions: {0}")]
+    Actions(#[from] borsh::io::Error),
+    #[error("delegation action decryption failed: {0}")]
+    Decrypt(#[from] dlp_api::decrypt::DecryptError),
 }
 
-impl AccountUpdateWorker {
-    async fn run(mut self) {
+impl ChainSync {
+    /// Applies streamed account images and lifecycle events.
+    async fn run(
+        sync: Weak<Self>,
+        mut websocket: Receiver<websocket::Event>,
+        mut grpc: Receiver<grpc::Event>,
+    ) {
         loop {
             tokio::select! {
-                Some(event) = self.websocket.recv() => self.websocket(event).await,
-                Some(event) = self.grpc.recv() => self.grpc(event).await,
+                Some(event) = websocket.recv() => {
+                    let Some(sync) = sync.upgrade() else { break; };
+                    sync.on_websocket(event).await;
+                },
+                Some(event) = grpc.recv() => {
+                    let Some(sync) = sync.upgrade() else { break; };
+                    sync.on_grpc(event).await;
+                },
+                else => break,
             }
         }
     }
 
-    async fn websocket(&self, event: websocket::Event) {
+    async fn on_websocket(&self, event: websocket::Event) {
         let websocket::Event::Update { sub, account } = event else {
             return;
         };
@@ -107,13 +124,80 @@ impl AccountUpdateWorker {
         }
     }
 
-    async fn grpc(&self, event: grpc::Event) {
-        let grpc::Event::Update { pubkey, target, account } = event else {
-            return;
-        };
-        if let Err(error) = self.apply(AccountSubscription { pubkey, target }, account).await {
-            tracing::error!(source = "gRPC", %pubkey, ?target, %error, "account update failed");
+    async fn on_grpc(&self, event: grpc::Event) {
+        match event {
+            grpc::Event::Update { pubkey, target, account } => {
+                if let Err(error) =
+                    self.apply(AccountSubscription { pubkey, target }, account).await
+                {
+                    tracing::error!(source = "gRPC", %pubkey, ?target, %error, "account update failed");
+                }
+            }
+            grpc::Event::Delegated(delegation) => {
+                let pubkey = delegation.pubkey;
+                if let Err(error) = self.delegated(delegation).await {
+                    tracing::error!(%pubkey, %error, "delegation failed");
+                }
+            }
+            grpc::Event::Undelegated { pubkeys, slot } => {
+                for pubkey in pubkeys {
+                    if let Err(error) = self.undelegated(pubkey, slot).await {
+                        tracing::error!(%pubkey, slot, %error, "undelegation failed");
+                    }
+                }
+            }
+            grpc::Event::Disconnected(error) => tracing::warn!(%error, "gRPC disconnected"),
         }
+    }
+
+    async fn delegated(&self, delegation: grpc::Delegation) -> Result<(), Error> {
+        let grpc::Delegation { pubkey, account, record } = delegation;
+        let appended = record
+            .get(DelegationRecord::size_with_discriminator()..)
+            .ok_or(Error::Record("record too short"))?;
+        let actions = if !appended.is_empty() {
+            let compact: PostDelegationActions = borsh::from_slice(appended)?;
+            let actions = compact.decrypt_with_keypair(self.engine.signer())?;
+            let mut dependencies = BTreeMap::new();
+            for action in &actions {
+                dependencies.insert(action.program_id, AccountProperty::Program);
+                for meta in &action.accounts {
+                    let property =
+                        dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
+                    if meta.is_writable {
+                        *property = AccountProperty::Writable;
+                    }
+                }
+            }
+            // The target is acquired after its other action dependencies.
+            dependencies.remove(&pubkey);
+            let dependencies = dependencies
+                .into_iter()
+                .map(|(pubkey, property)| SyncAccount { pubkey, property });
+            self.sync(dependencies).await?;
+            Some(PostFinalize {
+                source_program: account.read().owner(),
+                actions,
+            })
+        } else {
+            None
+        };
+        let accessor = self.engine.account(pubkey).await?;
+        accessor.materialize(account, actions).await?;
+        Ok(())
+    }
+
+    async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<(), Error> {
+        let accessor = self.engine.account(pubkey).await?;
+        let Some((mode, observed)) = accessor.observed() else {
+            return Ok(());
+        };
+        if slot < observed || (mode.authoritative() && mode != AccountMode::Transient) {
+            tracing::warn!(%pubkey, slot, observed, ?mode, "undelegation cannot remove account");
+            return Ok(());
+        }
+        accessor.delete().await?;
+        Ok(())
     }
 
     /// Reconciles one remote image after taking Engine's account mutation lease.
@@ -134,26 +218,20 @@ impl AccountUpdateWorker {
         accessor.materialize(account, None).await?;
         Ok(())
     }
-}
 
-impl ChainSync {
     /// Creates a synchronizer and starts its detached notification worker.
-    /// It logs account failures and ignores non-account events. The receivers
-    /// remain open for the worker's lifetime; shutdown coordination is left to the host.
+    /// It logs account and lifecycle failures. Dropping the last handle stops
+    /// the WebSocket pool; shutdown coordination is left to the host.
     pub fn new(
         engine: Engine,
         fetcher: Fetcher,
         websocket: Pool,
         websocket_rx: Receiver<websocket::Event>,
         grpc: Receiver<grpc::Event>,
-    ) -> Self {
-        let worker = AccountUpdateWorker {
-            engine: engine.clone(),
-            websocket: websocket_rx,
-            grpc,
-        };
-        tokio::spawn(worker.run());
-        Self { engine, fetcher, websocket }
+    ) -> Arc<Self> {
+        let sync = Arc::new(Self { engine, fetcher, websocket });
+        tokio::spawn(Self::run(Arc::downgrade(&sync), websocket_rx, grpc));
+        sync
     }
 
     /// Subscribes to and materializes accounts missing from Engine.
@@ -167,12 +245,12 @@ impl ChainSync {
     /// Pubkeys requested as writable accounts or programs must occur only once.
     /// Repeated payer and read-only requests are collapsed by pubkey.
     /// Requested primary accounts must not overlap a requested program's derived
-    /// ProgramData address. Mutable access serializes acquisition waves.
+    /// ProgramData address. Engine leases serialize overlapping acquisitions.
     ///
     /// Each batch waits for subscription acknowledgements before fetching. A
     /// subscription, fetch, or program-normalization failure releases that
     /// batch's subscriptions. Materialization errors return without cleanup.
-    pub async fn sync<I>(&mut self, requests: I) -> Result<(), Error>
+    pub async fn sync<I>(&self, requests: I) -> Result<(), Error>
     where
         I: IntoIterator,
         I::Item: Borrow<SyncAccount>,
@@ -245,16 +323,15 @@ impl ChainSync {
         };
         let prune: Vec<_> = programs
             .iter()
-            .filter_map(|&(index, data_index)| {
-                let account = snapshot.accounts[index].as_ref()?.read();
-                let idx =
-                    if account.owner() == bpf_loader_upgradeable::ID { index } else { data_index };
+            .filter_map(|&(idx, data_idx)| {
+                let account = snapshot.accounts[idx].as_ref()?.read();
+                let program_is_split = account.owner() == bpf_loader_upgradeable::ID;
+                let idx = if program_is_split { idx } else { data_idx };
                 Some(keys[idx])
             })
             .collect();
-        if let Err(error) =
-            program::normalize_batch(&programs, &mut snapshot.accounts, self.engine.rent())
-        {
+        let rent = self.engine.rent();
+        if let Err(error) = program::normalize_batch(&programs, &mut snapshot.accounts, rent) {
             self.unsubscribe(&keys).await;
             return Err(error);
         }
