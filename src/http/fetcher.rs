@@ -95,9 +95,6 @@ impl Fetcher {
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot, Error> {
         let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
         let deadline = Instant::now() + OVERALL;
-        if !(1..=100).contains(&keys.len()) {
-            return Err(Error::BatchSize);
-        }
         let params = BatchParams(
             keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
             AccountConfig::new(Some(minimum)),

@@ -7,8 +7,6 @@ use crate::rpc::{DecodeError, Error as RpcError};
 pub enum Error {
     #[error("fetch requires at least one HTTP provider")]
     NoProviders,
-    #[error("fetch requires between 1 and 100 keys")]
-    BatchSize,
     /// Failure from a configured provider, identified by its input index.
     #[error("HTTP provider {provider}: {source}")]
     Provider {
