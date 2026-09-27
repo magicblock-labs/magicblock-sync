@@ -17,7 +17,7 @@ use tokio::{
 
 use super::{
     session::{Command, Notice, Session, COMMAND_CAP},
-    Config, Connection, Error, Event,
+    Config, Connection, Error, Event, Result,
 };
 use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
@@ -31,7 +31,7 @@ pub(crate) struct Pool {
 }
 
 /// Completion channel for one caller operation.
-type Reply = oneshot::Sender<Result<(), Error>>;
+type Reply = oneshot::Sender<Result<()>>;
 
 /// One account operation submitted to the registry.
 enum SubscriptionRequest {
@@ -154,7 +154,7 @@ impl Pool {
     ///
     /// Capacity failures return immediately. Do not cancel: admitted work may
     /// complete after the caller stops waiting.
-    pub(crate) async fn subscribe(&self, account: AccountSubscription) -> Result<(), Error> {
+    pub(crate) async fn subscribe(&self, account: AccountSubscription) -> Result<()> {
         self.request(SubscriptionRequest::Subscribe, account).await
     }
 
@@ -164,7 +164,7 @@ impl Pool {
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
     /// Connection loss returns [`Error::Disconnected`], with the cause in
     /// [`Event::Dropped`].
-    pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
+    pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<()> {
         self.request(SubscriptionRequest::Unsubscribe, pubkey).await
     }
 
@@ -173,7 +173,7 @@ impl Pool {
         &self,
         make: impl FnOnce(T, Reply) -> SubscriptionRequest,
         value: T,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let (reply, result) = oneshot::channel();
         self.commands.send(make(value, reply)).await.map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
@@ -287,7 +287,7 @@ impl Registry {
     }
 
     /// Finds ready capacity without queuing behind connection attempts.
-    fn admit(&mut self) -> Result<usize, Error> {
+    fn admit(&mut self) -> Result<usize> {
         let len = self.sockets.len();
         if let Some(index) = (self.cursor..len).chain(0..self.cursor).find(|&i| {
             let socket = &self.sockets[i];
@@ -347,7 +347,7 @@ impl Registry {
                     .collect();
                 // The failed task has finished publishing updates. Publish loss before replacing
                 // it or accepting new user subscriptions, preserving this connection's event order.
-                let _ = self.events.send(Event::Dropped { connection, pubkeys, error }).await;
+                let _ = self.events.send(Event::Dropped { pubkeys, error }).await;
                 let id = Connection {
                     generation: connection.generation + 1,
                     ..connection
@@ -367,7 +367,7 @@ impl Registry {
         &mut self,
         connection: Connection,
         pubkey: Pubkey,
-        result: Result<Option<u64>, Error>,
+        result: Result<Option<u64>>,
     ) {
         let socket = &mut self.sockets[connection.index];
         let Occupied(mut entry) = socket.accounts.entry(pubkey) else { return };

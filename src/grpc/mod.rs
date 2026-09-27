@@ -39,6 +39,8 @@ pub enum Error {
     Capacity(#[from] TableFullError),
 }
 
+pub(super) type Result<T> = std::result::Result<T, Error>;
+
 /// Shared delegation authority and Yellowstone account-update streams.
 pub struct Config {
     /// Authority whose delegation lifecycle every stream observes.
@@ -95,7 +97,7 @@ pub(super) use client::Command;
 pub(super) use delegation::Delegation;
 
 /// Validates a provider public key at the stream boundary.
-fn pubkey(bytes: &[u8]) -> Result<Pubkey, Error> {
+fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
     bytes
         .try_into()
         .map(Pubkey::new_from_array)

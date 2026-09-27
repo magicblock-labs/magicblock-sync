@@ -8,7 +8,7 @@ use std::{
 
 use super::{
     transport::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event,
+    Connection, Error, Event, Result,
 };
 use crate::rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount};
 use crate::AccountSubscription;
@@ -60,7 +60,7 @@ pub(super) enum Notice {
         /// Account whose operation completed.
         pubkey: Pubkey,
         /// Provider subscription ID on subscribe, none on unsubscribe.
-        result: Result<Option<u64>, Error>,
+        result: Result<Option<u64>>,
     },
     /// All subscriptions on this attempt were lost.
     Dropped {
@@ -154,7 +154,7 @@ impl Session {
         &mut self,
         reader: Reader,
         commands: &mut UnboundedReceiver<Command>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let mut heartbeat = time::interval_at(Instant::now() + HEARTBEAT, HEARTBEAT);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut awaiting_pong = false;
@@ -253,7 +253,7 @@ impl Session {
     }
 
     /// Correlates and serializes an operation with its deadline.
-    fn request(&mut self, command: Command, params: impl Serialize) -> Result<(), Error> {
+    fn request(&mut self, command: Command, params: impl Serialize) -> Result<()> {
         let (timer, registration) = AbortHandle::new_pair();
         self.timers.push(Abortable::new(
             time::sleep_until(Instant::now() + TIMEOUT),
@@ -272,7 +272,7 @@ impl Session {
     }
 
     /// Accepts single or batched RPC envelopes, rejecting malformed batch tails.
-    async fn message(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    async fn message(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
             // The lazy iterator stops at `]`; validate the whole message to reject trailing data.
             let batch: LazyValue<'_> = json::from_slice(bytes)?;
@@ -290,7 +290,7 @@ impl Session {
     }
 
     /// Validates routing before decoding a response or account update.
-    async fn envelope(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    async fn envelope(&mut self, bytes: &[u8]) -> Result<()> {
         let message: Envelope<'_> = json::from_slice(bytes)?;
         if let Some(id) = message.id {
             if message.result.is_some() == message.error.is_some() {
@@ -330,7 +330,7 @@ impl Session {
         pending: Pending,
         result: Option<LazyValue<'_>>,
         error: Option<LazyValue<'_>>,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         if let Some(error) = error {
             let error: RpcError = json::from_str(error.as_raw_str())?;
             // Clock is mandatory; rejected unsubscribe leaves remote capacity ambiguous.
@@ -374,7 +374,7 @@ impl Session {
     }
 
     /// Preserves per-socket lifecycle order without blocking public updates.
-    fn notify(&self, notice: Notice) -> Result<(), Error> {
+    fn notify(&self, notice: Notice) -> Result<()> {
         self.notices.send(notice).map_err(|_| Error::Closed)
     }
 }

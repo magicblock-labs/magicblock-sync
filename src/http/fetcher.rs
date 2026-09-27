@@ -1,4 +1,5 @@
 use std::{
+    result::Result as DecodeResult,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::*},
         Arc,
@@ -17,7 +18,7 @@ use url::Url;
 
 use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
-use super::Error;
+use super::{Error, Result};
 
 /// Confirmed account snapshot with one account per requested key in request order.
 /// Accounts enter in `Uninit` mode.
@@ -68,7 +69,7 @@ struct SelectedProvider<'a> {
 
 impl Fetcher {
     /// Rejects an empty provider list and shares provider cooldowns across fetches.
-    pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self, Error> {
+    pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self> {
         if providers.is_empty() {
             return Err(Error::NoProviders);
         }
@@ -92,7 +93,7 @@ impl Fetcher {
     ///
     /// Transient failures retry within a ten-second budget. Malformed responses
     /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
-    pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot, Error> {
+    pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
         let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
         let deadline = Instant::now() + OVERALL;
         let params = BatchParams(
@@ -153,7 +154,7 @@ impl Fetcher {
         body: Bytes,
         end: Instant,
         expected: usize,
-    ) -> Result<Snapshot, Error> {
+    ) -> Result<Snapshot> {
         let response = self
             .client
             .post(provider.url.clone())
@@ -181,7 +182,7 @@ impl Fetcher {
             .value
             .into_iter()
             .map(|account| account.map(|account| account.decode(slot)).transpose())
-            .collect::<Result<_, _>>()?;
+            .collect::<DecodeResult<_, _>>()?;
         Ok(Snapshot { accounts })
     }
 }

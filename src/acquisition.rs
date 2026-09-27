@@ -6,12 +6,12 @@ use solana_sdk_ids::bpf_loader_upgradeable;
 
 use crate::{
     delegation, grpc, http::Snapshot, program, AccountProperty, AccountSubscription, ChainSync,
-    Error, SyncAccount,
+    Result, SyncAccount,
 };
 
 impl ChainSync {
     /// Acquires missing accounts and applies the fetched snapshot and any delegation actions.
-    pub(super) async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<(), Error> {
+    pub(super) async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<()> {
         // Engine rechecks presence under ordered leases, preventing overlapping syncs from
         // fetching the same missing accounts.
         let keys: Vec<_> = batch.iter().map(|account| account.pubkey).collect();
@@ -28,7 +28,7 @@ impl ChainSync {
     }
 
     /// Subscribes, fetches, and normalizes planned accounts, cleaning up subscriptions on failure.
-    async fn fetch_batch(&self, plan: &FetchPlan<'_>) -> Result<(Snapshot, Vec<Pubkey>), Error> {
+    async fn fetch_batch(&self, plan: &FetchPlan<'_>) -> Result<(Snapshot, Vec<Pubkey>)> {
         self.subscribe(&plan.subscriptions).await?;
         let result = async {
             let mut snapshot = self.fetcher.fetch(&plan.keys, None).await?;
@@ -38,7 +38,7 @@ impl ChainSync {
         }
         .await;
         if result.is_err() {
-            let pubkeys = plan.subscriptions.iter().map(|subscription| subscription.pubkey);
+            let pubkeys = plan.subscriptions.iter().map(|sub| sub.pubkey);
             self.unsubscribe(pubkeys).await;
         }
         result
@@ -49,7 +49,7 @@ impl ChainSync {
         &self,
         plan: FetchPlan<'_>,
         snapshot: &mut Snapshot,
-    ) -> Result<Vec<PendingDelegation>, Error> {
+    ) -> Result<Vec<PendingDelegation>> {
         let mut actions = Vec::new();
         for pending in plan.accounts {
             let pubkey = pending.accessor.pubkey();
@@ -86,7 +86,7 @@ impl ChainSync {
     }
 
     /// Applies deferred delegations after the batch's account leases have been released.
-    async fn apply_delegations(&self, actions: Vec<PendingDelegation>) -> Result<(), Error> {
+    async fn apply_delegations(&self, actions: Vec<PendingDelegation>) -> Result<()> {
         for PendingDelegation { delegation, payer } in actions {
             let pubkey = delegation.pubkey;
             // Action dependencies may include another key from this batch.
@@ -99,7 +99,7 @@ impl ChainSync {
     }
 
     /// Waits for every subscription request and removes successful subscriptions if any fail.
-    async fn subscribe(&self, subscriptions: &[AccountSubscription]) -> Result<(), Error> {
+    async fn subscribe(&self, subscriptions: &[AccountSubscription]) -> Result<()> {
         // Settle every admitted request so acknowledged subscriptions can be cleaned up.
         let requests = subscriptions.iter().map(|&sub| self.websocket.subscribe(sub));
         let mut subscribed = Vec::with_capacity(subscriptions.len());

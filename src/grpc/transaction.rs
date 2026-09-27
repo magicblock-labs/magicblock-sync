@@ -1,4 +1,4 @@
-use super::Error;
+use super::{Error, Result};
 use dlp_api::discriminator::DlpDiscriminator;
 use smallvec::SmallVec;
 use solana_pubkey::Pubkey;
@@ -37,9 +37,7 @@ impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
 }
 
 /// Finds distinct undelegated accounts in a successful transaction and its CPIs.
-pub(super) fn released(
-    tx: &SubscribeUpdateTransactionInfo,
-) -> Result<SmallVec<[Pubkey; 1]>, Error> {
+pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[Pubkey; 1]>> {
     let meta = tx.meta.as_ref().ok_or(Error::Protocol("missing transaction metadata"))?;
     let message = tx
         .transaction

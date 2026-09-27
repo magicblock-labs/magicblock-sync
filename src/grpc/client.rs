@@ -4,7 +4,7 @@ use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
 use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
 
-use super::{session::Session, Error, Event, StreamConfig};
+use super::{session::Session, Event, Result, StreamConfig};
 use crate::AccountSubscription;
 
 /// One serialized change to a stream's logical account interest.
@@ -29,7 +29,7 @@ impl Client {
         slot: Arc<AtomicU64>,
         events: mpsc::Sender<Event>,
         manager: &mut ShutdownManager,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         let (commands, requests) = mpsc::unbounded_channel();
         let session = Session::new(id, config, authority, slot, events.clone())?;
         let mut shutdown = manager.handle(Service::ChainSyncGrpc(id));

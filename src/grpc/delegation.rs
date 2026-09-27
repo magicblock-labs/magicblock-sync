@@ -1,4 +1,4 @@
-use super::Error;
+use super::Result;
 use ahash::AHashMap;
 use dlp_api::{pda::delegation_record_pda_from_delegated_account, state::DelegationRecord};
 use solana_account::AccountBuilder;
@@ -88,7 +88,7 @@ impl Delegations {
         key: Pubkey,
         account: &SubscribeUpdateAccountInfo,
         metadata: &DelegationRecord,
-    ) -> Result<Option<Delegation>, Error> {
+    ) -> Result<Option<Delegation>> {
         // Keep an ignored marker so a later application update cannot form a match.
         if !crate::delegation::belongs_to(metadata, self.authority)
             || metadata.delegation_slot != self.slot

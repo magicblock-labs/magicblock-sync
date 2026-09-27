@@ -117,6 +117,9 @@ pub enum Error {
     Decrypt(#[from] dlp_api::decrypt::DecryptError),
 }
 
+/// Result of a synchronization operation.
+pub type Result<T> = std::result::Result<T, Error>;
+
 impl ChainSync {
     /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
     /// The worker and transports join Engine's coordinated shutdown.
@@ -124,7 +127,7 @@ impl ChainSync {
         engine: Engine,
         config: ChainSyncConfig,
         shutdown: &mut ShutdownManager,
-    ) -> Result<Arc<Self>, Error> {
+    ) -> Result<Arc<Self>> {
         if config.grpc.streams.is_empty() {
             return Err(Error::NoGrpcStreams);
         }
@@ -148,7 +151,7 @@ impl ChainSync {
                     shutdown,
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<grpc::Result<Vec<_>>>()?;
         let sync = Arc::new(Self { engine, fetcher, websocket, grpc });
         let shutdown = shutdown.handle(Service::ChainSyncWorker);
         tokio::spawn(Self::run(
@@ -177,7 +180,7 @@ impl ChainSync {
     /// Writable and program pubkeys must be unique; repeated payer and read-only
     /// requests are collapsed. Requested accounts must not overlap a program's
     /// derived ProgramData address.
-    pub async fn sync<I>(&self, requests: I) -> Result<(), Error>
+    pub async fn sync<I>(&self, requests: I) -> Result<()>
     where
         I: IntoIterator,
         I::Item: Borrow<SyncAccount>,

@@ -1,4 +1,7 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    result::Result as TlsResult,
+    sync::{Arc, LazyLock},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use fastwebsockets::{handshake, FragmentCollectorRead, WebSocket, WebSocketWrite};
@@ -17,7 +20,7 @@ use tokio_rustls::{
 use url::{Host, Position, Url};
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use super::Error;
+use super::{Error, Result};
 
 /// Inbound half that assembles fragmented frames for session validation.
 pub(super) type Reader = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
@@ -29,7 +32,7 @@ pub(super) type Writer = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
 pub(super) const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// Shared TLS configuration, initialized only for secure endpoints.
-static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLock::new(|| {
+static TLS: LazyLock<TlsResult<TlsConnector, tokio_rustls::rustls::Error>> = LazyLock::new(|| {
     let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()?
         .with_root_certificates(RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned()))
@@ -38,7 +41,7 @@ static TLS: LazyLock<Result<TlsConnector, tokio_rustls::rustls::Error>> = LazyLo
 });
 
 /// Opens a provider socket; the caller bounds connection setup time.
-pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
+pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer)> {
     let host = match url.host().ok_or(Error::Protocol("provider URL has no host"))? {
         Host::Ipv6(ip) => ip.to_string(),
         host => host.to_string(),
@@ -63,7 +66,7 @@ pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer), Error> {
 }
 
 /// Verifies the server key and rejects unsolicited WebSocket extensions.
-async fn upgrade<S>(url: &Url, stream: S) -> Result<WebSocket<TokioIo<Upgraded>>, Error>
+async fn upgrade<S>(url: &Url, stream: S) -> Result<WebSocket<TokioIo<Upgraded>>>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {

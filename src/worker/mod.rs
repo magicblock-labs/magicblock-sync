@@ -19,8 +19,8 @@ use self::coverage::{Coverage, Source};
 use crate::{
     delegation,
     grpc::{self, Command},
-    program, websocket, AccountProperty, AccountSubscription, ChainSync, Error, SyncAccount,
-    DUPLICATION_DELAY,
+    program, websocket, AccountProperty, AccountSubscription, ChainSync, Error, Result,
+    SyncAccount, DUPLICATION_DELAY,
 };
 
 impl ChainSync {
@@ -67,11 +67,7 @@ impl ChainSync {
     }
 
     /// Applies WebSocket coverage changes and filters buffered account updates.
-    async fn on_websocket(
-        &self,
-        event: websocket::Event,
-        coverage: &mut Coverage,
-    ) -> Result<(), Error> {
+    async fn on_websocket(&self, event: websocket::Event, coverage: &mut Coverage) -> Result<()> {
         match event {
             websocket::Event::Acknowledged(sub) => {
                 let gen = coverage.acknowledged(sub);
@@ -102,12 +98,7 @@ impl ChainSync {
     }
 
     /// Drops a source and ends gRPC interest if no confirmed copy survives.
-    async fn lost(
-        &self,
-        coverage: &mut Coverage,
-        source: Source,
-        pubkey: Pubkey,
-    ) -> Result<(), Error> {
+    async fn lost(&self, coverage: &mut Coverage, source: Source, pubkey: Pubkey) -> Result<()> {
         let (ended, target) = coverage.lost(source, pubkey);
         if ended {
             self.grpc_client(pubkey).command(Command::Remove(pubkey));
@@ -119,7 +110,7 @@ impl ChainSync {
     }
 
     /// Removes a target only when Engine still considers it non-authoritative.
-    async fn evict(&self, target: Pubkey) -> Result<(), Error> {
+    async fn evict(&self, target: Pubkey) -> Result<()> {
         if let Some(accessor) = self.engine.account(target).await?.into_eviction() {
             accessor.delete().await?;
         }
@@ -127,7 +118,7 @@ impl ChainSync {
     }
 
     /// Applies per-stream coverage, account, and delegation lifecycle events.
-    async fn on_grpc(&self, event: grpc::Event, coverage: &mut Coverage) -> Result<(), Error> {
+    async fn on_grpc(&self, event: grpc::Event, coverage: &mut Coverage) -> Result<()> {
         match event {
             grpc::Event::Confirmed { stream, pubkey, gen } => {
                 coverage.confirmed(stream, pubkey, gen);
@@ -141,20 +132,20 @@ impl ChainSync {
                 let sub = AccountSubscription { pubkey, target };
                 if coverage.grpc_contains(stream, sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        tracing::error!(source = "gRPC", stream, %pubkey, %error, "account update failed");
+                        error!(source = "gRPC", stream, %pubkey, %error, "account update failed");
                     }
                 }
             }
             grpc::Event::Delegated(delegation) => {
                 let pubkey = delegation.pubkey;
                 if let Err(error) = self.delegated(delegation).await {
-                    tracing::error!(%pubkey, %error, "delegation failed");
+                    error!(%pubkey, %error, "delegation failed");
                 }
             }
             grpc::Event::Undelegated { pubkeys, slot } => {
                 for pubkey in pubkeys {
                     if let Err(error) = self.undelegated(pubkey, slot).await {
-                        tracing::error!(%pubkey, slot, %error, "undelegation failed");
+                        error!(%pubkey, slot, %error, "undelegation failed");
                     }
                 }
             }
@@ -163,7 +154,7 @@ impl ChainSync {
     }
 
     /// Loads dependencies for delegated actions before materializing the delegated account.
-    pub(super) async fn delegated(&self, delegation: grpc::Delegation) -> Result<(), Error> {
+    pub(super) async fn delegated(&self, delegation: grpc::Delegation) -> Result<()> {
         let grpc::Delegation { pubkey, account, record } = delegation;
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
         let actions = if !appended.is_empty() {
@@ -198,13 +189,13 @@ impl ChainSync {
 
     /// Deletes the account only when the event is current and the observed mode permits
     /// removal.
-    async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<(), Error> {
+    async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<()> {
         let accessor = self.engine.account(pubkey).await?;
         let Some((mode, observed)) = accessor.observed() else {
             return Ok(());
         };
         if slot < observed || (mode.authoritative() && mode != AccountMode::Transient) {
-            tracing::warn!(%pubkey, slot, observed, ?mode, "undelegation cannot remove account");
+            warn!(%pubkey, slot, observed, ?mode, "undelegation cannot remove account");
             return Ok(());
         }
         accessor.delete().await?;
@@ -216,7 +207,7 @@ impl ChainSync {
         &self,
         subscription: AccountSubscription,
         account: AccountBuilder,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let AccountSubscription { pubkey, target } = subscription;
         let accessor = self.engine.account(target.unwrap_or(pubkey)).await?;
         let account = match target {

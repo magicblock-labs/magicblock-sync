@@ -39,6 +39,8 @@ pub enum Error {
     Account(#[from] DecodeError),
 }
 
+type Result<T> = std::result::Result<T, Error>;
+
 pub(super) use fetcher::{Fetcher, Snapshot};
 
 impl Error {

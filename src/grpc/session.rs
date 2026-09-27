@@ -19,6 +19,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver},
     time::Instant,
 };
+use tracing::warn;
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcClient, GeyserGrpcClientError, ReconnectConfig, SubscribeRequestSink,
 };
@@ -33,7 +34,8 @@ use yellowstone_grpc_proto::{
 };
 
 use super::{
-    client::Command, delegation::Delegations, transaction, Delegation, Error, Event, StreamConfig,
+    client::Command, delegation::Delegations, transaction, Delegation, Error, Event, Result,
+    StreamConfig,
 };
 use crate::{AccountSubscription, DUPLICATION_DELAY};
 
@@ -75,7 +77,7 @@ impl Session {
         authority: Pubkey,
         watermark: Arc<AtomicU64>,
         events: mpsc::Sender<Event>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         Ok(Self {
             id,
             accounts: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 4)?,
@@ -89,15 +91,12 @@ impl Session {
     }
 
     /// Returns a terminal stream failure after reporting lost coverage.
-    pub(super) async fn run(
-        mut self,
-        mut commands: UnboundedReceiver<Command>,
-    ) -> Result<(), Error> {
+    pub(super) async fn run(mut self, mut commands: UnboundedReceiver<Command>) -> Result<()> {
         loop {
             let Err(error) = self.subscribe(&mut commands).await else { return Ok(()) };
             let _ = self.events.send(Event::Lost(self.id)).await;
             if recoverable(&error) {
-                tracing::warn!(%error, "gRPC unavailable; retrying");
+                warn!(%error, "gRPC unavailable; retrying");
                 tokio::time::sleep(RETRY_DELAY).await;
             } else {
                 return Err(error);
@@ -106,7 +105,7 @@ impl Session {
     }
 
     /// Lets Yellowstone reconnect while processing filter changes and updates.
-    async fn subscribe(&mut self, commands: &mut UnboundedReceiver<Command>) -> Result<(), Error> {
+    async fn subscribe(&mut self, commands: &mut UnboundedReceiver<Command>) -> Result<()> {
         let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
             .connect_timeout(TIMEOUT)
@@ -120,14 +119,11 @@ impl Session {
         self.sync_filter()?;
         let request = self.request();
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
-        let current: Vec<_> = self
-            .desired
-            .iter()
-            .filter_map(|(&pubkey, entry)| {
-                self.accounts.contains(pubkey).then_some((pubkey, entry.gen))
-            })
-            .collect();
-        self.confirm(current).await;
+        for (&pubkey, entry) in &self.desired {
+            if self.accounts.contains(pubkey) {
+                self.confirm([(pubkey, entry.gen)]).await;
+            }
+        }
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -148,7 +144,7 @@ impl Session {
         &mut self,
         update: SubscribeUpdate,
         sink: &mut SubscribeRequestSink,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         match update.update_oneof {
             Some(UpdateOneof::Ping(_)) => self.ping(sink).await?,
             Some(UpdateOneof::Account(account)) => self.account(account).await?,
@@ -159,12 +155,12 @@ impl Session {
     }
 
     /// Sends the complete current physical filter on the live stream.
-    async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
+    async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
         sink.send(self.request()).await.map_err(Into::into)
     }
 
     /// Answers a heartbeat, then restores the full subscription request.
-    async fn ping(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
+    async fn ping(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
         let request = SubscribeRequest {
             ping: Some(SubscribeRequestPing { id: PING_ID }),
             ..Default::default()
@@ -174,7 +170,7 @@ impl Session {
     }
 
     /// Reports accounts undelegated by successful transactions.
-    async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<(), Error> {
+    async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<()> {
         self.delegations.set_slot(update.slot);
         let transaction = update.transaction.ok_or(Error::Protocol("missing transaction"))?;
         let pubkeys = transaction::released(&transaction)?;
@@ -186,11 +182,7 @@ impl Session {
     }
 
     /// Applies logical interest immediately and sends its full filter only when it changes.
-    async fn command(
-        &mut self,
-        command: Command,
-        sink: &mut SubscribeRequestSink,
-    ) -> Result<(), Error> {
+    async fn command(&mut self, command: Command, sink: &mut SubscribeRequestSink) -> Result<()> {
         match command {
             Command::Track { sub, gen } => {
                 let entry = Desired { sub, gen, ts: Instant::now() };
@@ -214,7 +206,7 @@ impl Session {
     }
 
     /// Prunes removed keys and adds aged keys without reallocating an unchanged filter.
-    fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>, Error> {
+    fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>> {
         let remove: Vec<_> = self
             .accounts
             .iter()
@@ -283,7 +275,7 @@ impl Session {
     }
 
     /// Routes retained updates and discovers same-slot delegation pairs.
-    async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<(), Error> {
+    async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
         let mut account = update.account.ok_or(Error::Protocol("missing account image"))?;

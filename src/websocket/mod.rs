@@ -2,7 +2,7 @@
 //!
 //! Drain the event receiver while awaiting pool operations. Acknowledgement
 //! confirms a subscription, not an initial snapshot. On connection loss,
-//! callers may retry missing coverage periodically. Each attempt uses ready capacity
+//! callers may retry missing coverage. Each attempt uses ready capacity
 //! or fails without queuing behind a reconnect.
 //!
 
@@ -54,6 +54,8 @@ pub enum Error {
     Tls(#[from] tokio_rustls::rustls::Error),
 }
 
+type Result<T> = std::result::Result<T, Error>;
+
 /// Endpoint and capacity limits for one provider.
 #[derive(Clone, Debug)]
 pub struct Provider {
@@ -76,7 +78,7 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct Connection {
     /// Index in [`Config::providers`].
-    pub(super) provider: usize,
+    provider: usize,
     /// Stable pool entry reused by replacement attempts.
     index: usize,
     /// Incremented on reconnect to distinguish old and replacement sockets.
