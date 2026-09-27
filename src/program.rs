@@ -8,8 +8,7 @@ use solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, 
 
 use crate::Error;
 
-/// Replaces each present program with its Engine ELF image and consumes its
-/// ProgramData companion. A missing program remains absent.
+/// Normalizes present programs in place, consuming each ProgramData companion.
 pub(super) fn normalize_batch(
     programs: &[(usize, usize)],
     accounts: &mut [Option<AccountBuilder>],
@@ -23,7 +22,7 @@ pub(super) fn normalize_batch(
     Ok(())
 }
 
-/// Accepts supported loader layouts; Loader V3 requires its ProgramData image.
+/// Accepts supported loader layouts; Loader V3 requires its ProgramData account.
 /// The resulting ELF account is read-only and rent-funded for its normalized size.
 pub(super) fn normalize(
     account: AccountBuilder,
@@ -47,8 +46,7 @@ pub(super) fn normalize(
     }
 }
 
-/// Uses a ProgramData update to refresh the target program without refetching
-/// its unchanged Loader V3 parent.
+/// Converts Loader V3 ProgramData into Engine's ELF representation.
 pub(super) fn normalize_data(
     account: AccountBuilder,
     rent: &Rent,
@@ -57,7 +55,7 @@ pub(super) fn normalize_data(
     Ok(elf_account(account.data(elf), loader_v4::ID, rent))
 }
 
-/// Sets the normalized ELF's owner, rent-exempt balance, and read-only mode.
+/// Configures a normalized ELF account for read-only Engine execution.
 fn elf_account(
     account: AccountBuilder,
     owner: solana_pubkey::Pubkey,
@@ -71,7 +69,7 @@ fn elf_account(
         .executable(true)
 }
 
-/// Requires a Loader V3 ProgramData header before exposing the following ELF.
+/// Returns the ELF payload from a valid Loader V3 ProgramData account.
 fn v3_elf(data: &[u8]) -> Result<&[u8], Error> {
     let metadata = data
         .get(..UpgradeableLoaderState::size_of_programdata_metadata())
@@ -83,7 +81,7 @@ fn v3_elf(data: &[u8]) -> Result<&[u8], Error> {
     Ok(&data[metadata.len()..])
 }
 
-/// Rejects retracted or invalid Loader V4 status before exposing its ELF.
+/// Returns deployed Loader V4 ELF and rejects invalid or retracted states.
 fn v4_elf(data: &[u8]) -> Result<&[u8], Error> {
     let offset = LoaderV4State::program_data_offset();
     let header = data.get(..offset).ok_or(Error::Program("Loader V4 account is too short"))?;

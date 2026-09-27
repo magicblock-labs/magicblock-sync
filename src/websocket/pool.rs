@@ -21,8 +21,15 @@ use super::{
 use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
 
-/// Maximum public events awaiting consumption across the pool.
-const EVENT_CAP: usize = 8192;
+/// Subscription handle. The pool stops when this handle or its event receiver is dropped.
+pub struct Pool {
+    /// Bounded queue for caller subscription operations.
+    commands: Sender<SubscriptionRequest>,
+    /// Confirmed context-slot watermark retained across reconnects.
+    slot: Arc<AtomicU64>,
+    /// Aborted when the final pool handle drops.
+    handle: JoinHandle<()>,
+}
 
 /// Completion channel for one caller operation.
 type Reply = oneshot::Sender<Result<(), Error>>;
@@ -80,16 +87,6 @@ impl Drop for Socket {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-/// Subscription handle. The pool stops when this handle or its event receiver is dropped.
-pub struct Pool {
-    /// Bounded queue for caller subscription operations.
-    commands: Sender<SubscriptionRequest>,
-    /// Confirmed context-slot watermark retained across reconnects.
-    slot: Arc<AtomicU64>,
-    /// Aborted when the final pool handle drops.
-    handle: JoinHandle<()>,
 }
 
 impl Drop for Pool {
@@ -279,7 +276,6 @@ impl Registry {
                 let socket = &mut self.sockets[connection.index];
                 socket.ready = true;
                 socket.backoff = Duration::ZERO;
-                let _ = self.events.send(Event::Connected(connection)).await;
             }
             Notice::Acknowledged { connection, pubkey, result } => {
                 // Acknowledgements do not trigger pool growth.
@@ -419,3 +415,6 @@ impl Registry {
         self.capacity += self.config.providers[provider].subs_per_connection;
     }
 }
+
+/// Maximum public events awaiting consumption across the pool.
+const EVENT_CAP: usize = 8192;

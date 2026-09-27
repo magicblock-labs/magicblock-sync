@@ -1,7 +1,7 @@
 use super::Error;
 use ahash::AHashMap;
 use dlp_api::{pda::delegation_record_pda_from_delegated_account, state::DelegationRecord};
-use solana_account::{AccountBuilder, AccountMode};
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
@@ -15,26 +15,31 @@ pub struct Delegation {
     pub record: Vec<u8>,
 }
 
-/// DLP-owned application image awaiting its delegation record PDA update.
+/// Matches application accounts with their delegation record PDA updates in one slot.
+pub(super) struct Delegations {
+    /// Only delegations for this validator may activate.
+    authority: Pubkey,
+    /// Slot shared by pending observations; replay may move backward.
+    slot: u64,
+    /// Unresolved halves and ignored markers keyed by record PDA.
+    pending: AHashMap<Pubkey, PendingDelegation>,
+}
+
+/// DLP-owned application account state awaiting its matching delegation-record update.
 struct PendingAccount {
     /// Application account, not the record PDA.
     pubkey: Pubkey,
-    /// Raw image whose original owner is still unresolved.
-    image: SubscribeUpdateAccountInfo,
+    /// Raw streamed account state awaiting restoration of its original owner.
+    acc: SubscribeUpdateAccountInfo,
 }
 
 impl PendingAccount {
-    /// Restores the original owner and matched delegation slot.
+    /// Builds Engine account state from the application update and its matching record.
     fn resolve(self, record: PendingRecord, slot: u64) -> Delegation {
-        let account = AccountBuilder::default()
-            .owner(record.owner)
-            .lamports(self.image.lamports)
-            .data(self.image.data)
-            .slot(slot)
-            .mode(AccountMode::Delegated);
+        let account = AccountBuilder::default().lamports(self.acc.lamports).data(self.acc.data);
         Delegation {
             pubkey: self.pubkey,
-            account,
+            account: crate::delegation::account(account, record.owner, slot),
             record: record.data,
         }
     }
@@ -50,27 +55,16 @@ struct PendingRecord {
 
 /// One side of an unresolved same-slot delegation.
 enum PendingDelegation {
-    /// Application image arrived first.
+    /// Application account update arrived first.
     Account(PendingAccount),
     /// Delegation record arrived first.
     Record(PendingRecord),
-    /// Record must not activate an application image in this slot.
+    /// Record must not activate an application account update in this slot.
     Ignored,
 }
 
-/// Matches application accounts with their delegation record PDA updates in one slot.
-pub(super) struct Delegations {
-    /// Only delegations for this validator may activate.
-    authority: Pubkey,
-    /// Slot shared by pending observations; replay may move backward.
-    slot: u64,
-    /// Unresolved halves and ignored markers keyed by record PDA.
-    pending: AHashMap<Pubkey, PendingDelegation>,
-}
-
 impl Delegations {
-    /// Restricts matches to this authority; the first stream update establishes
-    /// the matching slot.
+    /// Tracks delegations for one validator.
     pub(super) fn new(authority: Pubkey) -> Self {
         Self {
             authority,
@@ -88,7 +82,7 @@ impl Delegations {
     }
 
     /// Only a record for this authority and slot can activate an application
-    /// image. Other records leave an ignored marker for the rest of the slot.
+    /// update. Other records leave an ignored marker for the rest of the slot.
     pub(super) fn record(
         &mut self,
         key: Pubkey,
@@ -96,7 +90,9 @@ impl Delegations {
         metadata: &DelegationRecord,
     ) -> Result<Option<Delegation>, Error> {
         // Keep an ignored marker so a later application update cannot form a match.
-        if metadata.authority != self.authority || metadata.delegation_slot != self.slot {
+        if !crate::delegation::belongs_to(metadata, self.authority)
+            || metadata.delegation_slot != self.slot
+        {
             return Ok(self.observe(key, PendingDelegation::Ignored));
         }
         let record = PendingRecord {
@@ -106,19 +102,19 @@ impl Delegations {
         Ok(self.observe(key, PendingDelegation::Record(record)))
     }
 
-    /// Keys the application image by its derived record PDA so either update
-    /// order can complete a same-slot match.
+    /// Adds an application account update to the pending same-slot delegation match.
     pub(super) fn account(
         &mut self,
-        key: Pubkey,
-        account: SubscribeUpdateAccountInfo,
+        pubkey: Pubkey,
+        acc: SubscribeUpdateAccountInfo,
     ) -> Option<Delegation> {
-        let record = delegation_record_pda_from_delegated_account(&key);
-        let pending = PendingAccount { pubkey: key, image: account };
+        // Record updates are keyed by this account's derived delegation-record PDA.
+        let record = delegation_record_pda_from_delegated_account(&pubkey);
+        let pending = PendingAccount { pubkey, acc };
         self.observe(record, PendingDelegation::Account(pending))
     }
 
-    /// Resolves opposite halves or retains the latest unmatched observation.
+    /// Completes a delegation when both matching updates are present.
     fn observe(&mut self, key: Pubkey, incoming: PendingDelegation) -> Option<Delegation> {
         use PendingDelegation::*;
 
@@ -130,6 +126,8 @@ impl Delegations {
             (Account(account), Record(record)) | (Record(record), Account(account)) => {
                 return Some(account.resolve(record, self.slot));
             }
+            // An irrelevant record blocks activation for this slot; otherwise keep
+            // the newest unmatched update for a later counterpart.
             (Ignored, _) | (_, Ignored) => Ignored,
             (_, pending) => pending,
         };

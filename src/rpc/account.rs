@@ -5,8 +5,18 @@ use serde::Deserialize;
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 
-/// Encoding accepted by the shared account decoder.
-pub(super) const ENCODING: &str = "base64+zstd";
+/// Invalid encoded account data shared by HTTP and WebSocket responses.
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    #[error("invalid account base64: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("invalid account owner: {0}")]
+    Owner(#[from] solana_pubkey::ParsePubkeyError),
+    #[error("invalid account zstd: {0}")]
+    Zstd(#[source] io::Error),
+    #[error("invalid provider message: {0}")]
+    Protocol(&'static str),
+}
 
 /// Borrowed RPC account before owner and payload validation.
 #[derive(Deserialize)]
@@ -21,15 +31,6 @@ pub(crate) struct WireAccount<'a> {
     /// Executable flag from the provider.
     executable: bool,
 }
-
-/// Encoded payload and its encoding label.
-#[derive(Deserialize)]
-struct Data<'a>(
-    /// Base64-encoded compressed account bytes.
-    &'a str,
-    /// Encoding declared by the provider.
-    &'a str,
-);
 
 impl WireAccount<'_> {
     /// Validates the declared encoding and owner, then stamps the response slot.
@@ -50,15 +51,14 @@ impl WireAccount<'_> {
     }
 }
 
-/// Invalid encoded account data shared by HTTP and WebSocket responses.
-#[derive(Debug, thiserror::Error)]
-pub enum DecodeError {
-    #[error("invalid account base64: {0}")]
-    Base64(#[from] base64::DecodeError),
-    #[error("invalid account owner: {0}")]
-    Owner(#[from] solana_pubkey::ParsePubkeyError),
-    #[error("invalid account zstd: {0}")]
-    Zstd(#[source] io::Error),
-    #[error("invalid provider message: {0}")]
-    Protocol(&'static str),
-}
+/// Encoding accepted by the shared account decoder.
+pub(super) const ENCODING: &str = "base64+zstd";
+
+/// Encoded payload and its encoding label.
+#[derive(Deserialize)]
+struct Data<'a>(
+    /// Base64-encoded compressed account bytes.
+    &'a str,
+    /// Encoding declared by the provider.
+    &'a str,
+);

@@ -19,23 +19,26 @@ use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
 use super::Error;
 
-/// RPC operation that returns one shared context for the batch.
-const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
-
-/// Total budget across attempts and provider cooldowns.
-const OVERALL: Duration = Duration::from_secs(10);
-/// Per-provider attempt budget, capped by the overall deadline.
-const ATTEMPT: Duration = Duration::from_secs(2);
-/// Shared delay after transient provider failure.
-const COOLDOWN: Duration = Duration::from_millis(100);
-
 /// Confirmed account snapshot with one account per requested key in request order.
 /// Accounts enter in `Uninit` mode.
 pub struct Snapshot {
-    /// Context slot shared by the batch.
-    pub slot: u64,
     /// `None` only for an explicit RPC null; invalid accounts fail the batch.
     pub accounts: Vec<Option<AccountBuilder>>,
+}
+
+/// Fetches confirmed account batches with same-chain provider failover.
+/// Callers split batches and manage subscriptions.
+pub struct Fetcher {
+    /// Reusable HTTP connections without implicit redirects or retries.
+    client: reqwest::Client,
+    /// Stable endpoint order used for error reporting.
+    providers: Vec<Provider>,
+    /// Confirmed WebSocket watermark sampled at fetch entry.
+    slot: Arc<AtomicU64>,
+    /// Rotating first candidate for provider selection.
+    cursor: AtomicUsize,
+    /// Monotonic origin for cooldown timestamps.
+    epoch: Instant,
 }
 
 /// Endpoint with eligibility shared across concurrent fetches.
@@ -61,21 +64,6 @@ struct SelectedProvider<'a> {
     index: usize,
     /// Endpoint and its shared cooldown state.
     provider: &'a Provider,
-}
-
-/// Fetches confirmed account batches with same-chain provider failover.
-/// Callers split batches and manage subscriptions.
-pub struct Fetcher {
-    /// Reusable HTTP connections without implicit redirects or retries.
-    client: reqwest::Client,
-    /// Stable endpoint order used for error reporting.
-    providers: Vec<Provider>,
-    /// Confirmed WebSocket watermark sampled at fetch entry.
-    slot: Arc<AtomicU64>,
-    /// Rotating first candidate for provider selection.
-    cursor: AtomicUsize,
-    /// Monotonic origin for cooldown timestamps.
-    epoch: Instant,
 }
 
 impl Fetcher {
@@ -197,7 +185,7 @@ impl Fetcher {
             .into_iter()
             .map(|account| account.map(|account| account.decode(slot)).transpose())
             .collect::<Result<_, _>>()?;
-        Ok(Snapshot { slot, accounts })
+        Ok(Snapshot { accounts })
     }
 }
 
@@ -211,3 +199,12 @@ struct Response<'a> {
     #[serde(borrow)]
     error: Option<LazyValue<'a>>,
 }
+
+/// RPC operation that returns one shared context for the batch.
+const GET_MULTIPLE_ACCOUNTS: &str = "getMultipleAccounts";
+/// Total budget across attempts and provider cooldowns.
+const OVERALL: Duration = Duration::from_secs(10);
+/// Per-provider attempt budget, capped by the overall deadline.
+const ATTEMPT: Duration = Duration::from_secs(2);
+/// Shared delay after transient provider failure.
+const COOLDOWN: Duration = Duration::from_millis(100);

@@ -5,15 +5,22 @@ use derive_more::Display;
 use json::Value;
 use serde::{Deserialize, Serialize};
 
-mod account;
-
 pub use account::DecodeError;
+
+/// The provider's JSON-RPC error, including optional diagnostic data.
+#[derive(Debug, Deserialize, Display, derive_more::Error)]
+#[display("RPC {code}: {message}")]
+pub struct Error {
+    /// Provider's JSON-RPC error code, retained without reclassification.
+    pub code: i64,
+    /// Provider's human-readable explanation.
+    pub message: String,
+    /// Optional provider-specific diagnostics preserved for the caller.
+    pub data: Option<Value>,
+}
+
 pub(crate) use account::WireAccount;
 
-/// Finality shared by snapshots and subscriptions.
-const COMMITMENT: &str = "confirmed";
-/// Protocol version required by the RPC envelope.
-pub(crate) const VERSION: &str = "2.0";
 /// Typed request wrapped in the common JSON-RPC envelope.
 #[derive(Serialize)]
 pub(crate) struct Request<P> {
@@ -81,14 +88,9 @@ pub(crate) struct ContextValue<T> {
     pub(crate) value: T,
 }
 
-/// The provider's JSON-RPC error, including optional diagnostic data.
-#[derive(Debug, Deserialize, Display, derive_more::Error)]
-#[display("RPC {code}: {message}")]
-pub struct Error {
-    /// Provider's JSON-RPC error code, retained without reclassification.
-    pub code: i64,
-    /// Provider's human-readable explanation.
-    pub message: String,
-    /// Optional provider-specific diagnostics preserved for the caller.
-    pub data: Option<Value>,
-}
+/// Protocol version required by the RPC envelope.
+pub(crate) const VERSION: &str = "2.0";
+/// Finality shared by snapshots and subscriptions.
+const COMMITMENT: &str = "confirmed";
+
+mod account;

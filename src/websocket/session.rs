@@ -403,7 +403,7 @@ struct Envelope<'a> {
 struct Notification<'a> {
     /// Provider-issued ID valid only on this connection.
     subscription: u64,
-    /// Account image decoded after subscription routing.
+    /// Account state decoded after subscription routing.
     #[serde(borrow)]
     result: LazyValue<'a>,
 }

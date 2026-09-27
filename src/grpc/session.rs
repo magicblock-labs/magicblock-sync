@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use dlp_api::state::{
     discriminator::{AccountDiscriminator, AccountWithDiscriminator},
     DelegationRecord,
@@ -15,7 +15,7 @@ use dlp_api::state::{
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
-use tokio::{sync::mpsc, time::timeout};
+use tokio::sync::mpsc;
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcClient, ReconnectConfig, SubscribeRequestSink,
 };
@@ -81,27 +81,22 @@ impl Session {
         let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
             .connect_timeout(TIMEOUT)
+            .timeout(TIMEOUT)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .set_reconnect_config(ReconnectConfig::default());
         if self.config.endpoint.scheme() == "https" {
             builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
         }
-        let mut client = timeout(TIMEOUT, builder.connect())
-            .await
-            .map_err(|_| Error::Timeout("connection"))??;
+        let mut client = builder.connect().await?;
         let request = self.request();
-        let subscription = client.subscribe_with_request(Some(request));
-        let (mut sink, mut stream) = timeout(TIMEOUT, subscription)
-            .await
-            .map_err(|_| Error::Timeout("subscribe"))??;
+        let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
         loop {
             tokio::select! {
                 update = updates.recv() => {
                     let Some(update) = update else { return Ok(()) };
                     self.update_subscription(update, &mut sink).await?;
                 }
-                update = timeout(TIMEOUT, stream.next()) => {
-                    let update = update.map_err(|_| Error::Timeout("stream"))?;
+                update = stream.next() => {
                     let update = update.ok_or(Error::Closed)??;
                     self.process(update, &mut sink).await?;
                 }
@@ -127,9 +122,7 @@ impl Session {
 
     /// Sends the complete current membership filter for this stream and reconnects.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
-        timeout(TIMEOUT, sink.send(self.request()))
-            .await
-            .map_err(|_| Error::Timeout("subscription update"))??;
+        sink.send(self.request()).await?;
         Ok(())
     }
 
@@ -139,9 +132,7 @@ impl Session {
             ping: Some(SubscribeRequestPing { id: PING_ID }),
             ..Default::default()
         };
-        timeout(TIMEOUT, sink.send(request))
-            .await
-            .map_err(|_| Error::Timeout("ping"))??;
+        sink.send(request).await?;
         self.refresh(sink).await
     }
 
@@ -163,15 +154,9 @@ impl Session {
         update: SubscriptionUpdate,
         sink: &mut SubscribeRequestSink,
     ) -> Result<(), Error> {
-        let remove: AHashSet<_> = update.remove.into_iter().collect();
-        for key in &remove {
-            self.accounts.remove(*key);
-            self.targets.remove(key);
-        }
+        let mut changed = false;
         for account in update.add {
-            if remove.contains(&account.pubkey) {
-                continue;
-            }
+            changed |= !self.accounts.contains(account.pubkey);
             self.accounts.insert(account.pubkey)?;
             if let Some(target) = account.target {
                 self.targets.insert(account.pubkey, target);
@@ -179,7 +164,9 @@ impl Session {
                 self.targets.remove(&account.pubkey);
             }
         }
-        self.refresh(sink).await?;
+        if changed {
+            self.refresh(sink).await?;
+        }
         let _ = update.reply.send(());
         Ok(())
     }
@@ -252,7 +239,7 @@ impl Session {
         if !candidate {
             return Ok(());
         }
-        if let Ok(record) = DelegationRecord::try_from_bytes_with_discriminator(&account.data) {
+        if let Some(record) = crate::delegation::record(&account.data) {
             if let Some(delegation) = self.delegations.record(key, &account, record)? {
                 self.delegated(delegation).await?;
             }
@@ -273,9 +260,9 @@ impl Session {
 
     /// Bounds consumer backpressure so a stalled receiver terminates the stream.
     async fn send(&self, event: Event) -> Result<(), Error> {
-        timeout(TIMEOUT, self.events.send(event))
+        tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, self.events.send(event))
             .await
-            .map_err(|_| Error::Timeout("event delivery"))?
+            .map_err(|_| Error::EventDeliveryTimeout)?
             .map_err(|_| Error::Closed)
     }
 }
@@ -304,5 +291,7 @@ fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
     }
 }
 
-/// Budget for network and event-consumer progress.
+/// Yellowstone transport request and connection budget.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds local event-consumer backpressure independently of transport timeouts.
+const EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);

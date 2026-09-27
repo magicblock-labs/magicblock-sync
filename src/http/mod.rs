@@ -2,10 +2,6 @@
 
 use crate::rpc::{DecodeError, Error as RpcError};
 
-mod fetcher;
-
-pub use fetcher::{Fetcher, Snapshot};
-
 /// HTTP snapshot failures, retaining provider context and the latest retry cause.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -45,6 +41,8 @@ pub enum Error {
     Account(#[from] DecodeError),
 }
 
+pub(super) use fetcher::{Fetcher, Snapshot};
+
 impl Error {
     /// Distinguishes transient endpoint failures from final decoding failures.
     fn retryable(&self) -> bool {
@@ -59,3 +57,5 @@ impl Error {
         }
     }
 }
+
+mod fetcher;
