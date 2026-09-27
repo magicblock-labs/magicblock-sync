@@ -41,20 +41,28 @@ pub enum Error {
     Capacity(#[from] TableFullError),
 }
 
-/// Settings for one Yellowstone provider.
+/// Shared delegation authority and Yellowstone account-update streams.
 pub struct Config {
+    /// Authority whose delegation lifecycle every stream observes.
+    pub authority: Pubkey,
+    /// At least one provider stream; accounts use at most one at a time.
+    pub streams: Vec<StreamConfig>,
+}
+
+/// Connection settings for one Yellowstone provider.
+pub struct StreamConfig {
     /// HTTP(S) endpoint without URL-embedded credentials.
     pub endpoint: Url,
     /// Optional provider `x-token`.
     pub token: Option<String>,
-    /// Authority whose delegations are observed.
-    pub authority: Pubkey,
 }
 
 /// Ordered account and lifecycle events from one provider.
 pub(super) enum Event {
     /// Retained account builder in `Uninit` mode for caller classification.
     Update {
+        /// Provider stream that delivered this retained update.
+        stream: usize,
         /// Retained account identity.
         pubkey: Pubkey,
         /// Program target when this is a ProgramData subscription.
@@ -71,11 +79,29 @@ pub(super) enum Event {
         /// Confirmed undelegation slot.
         slot: u64,
     },
+    /// A retained filter was sent on a live stream for this logical generation.
+    Confirmed {
+        /// Stream that sent or already retained the account filter.
+        stream: usize,
+        /// Exact retained account key.
+        pubkey: Pubkey,
+        /// Owner-issued identity of the current logical subscription.
+        generation: u64,
+    },
+    /// The outer stream attempt ended; Yellowstone's internal reconnect does not emit this.
+    Lost(usize),
     /// Terminal stream failure; queued events precede it.
-    Disconnected(Error),
+    Disconnected {
+        /// Stream that cannot recover.
+        stream: usize,
+        /// Terminal transport or protocol cause.
+        error: Error,
+    },
 }
 
 pub(super) use client::Client;
+pub(super) use client::Command;
+pub(super) use client::EVENT_CAPACITY;
 pub(super) use delegation::Delegation;
 
 /// Validates a provider public key at the stream boundary.

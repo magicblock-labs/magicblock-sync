@@ -2,41 +2,44 @@
 //!
 //! [`ChainSync`] subscribes before fetching missing read-only accounts and payers.
 //! Writable accounts are fetched with their delegation records but not subscribed over
-//! WebSocket; all requested accounts are retained on the gRPC stream.
+//! WebSocket. Acknowledged WebSocket subscriptions gain one load-balanced gRPC copy
+//! after 30 minutes. A gRPC-only account keeps trying to restore WebSocket coverage.
 //! Ordinary accounts enter Engine in `Uninit` mode; executable programs enter as
 //! read-only ELF accounts. A background worker applies WebSocket and gRPC events.
-//! WebSocket recovery and subscription removal after undelegation are not reconciled
-//! here. A later base-chain update can recreate a removed account.
+//! A later base-chain update can recreate an undelegated account.
 
+/// Missing-account fetch planning and initial materialization.
+mod acquisition;
+/// Delegation record parsing and account conversion.
 mod delegation;
+/// Yellowstone subscriptions and lifecycle events.
 mod grpc;
+/// Confirmed HTTP account snapshots.
 mod http;
+/// Executable and ProgramData normalization.
 mod program;
+/// Shared RPC wire types and account decoding.
 mod rpc;
+/// Confirmed WebSocket subscription pool.
 mod websocket;
+/// Stream application and delayed gRPC coverage.
+mod worker;
 
-use std::{
-    borrow::Borrow,
-    collections::BTreeMap,
-    sync::{Arc, Weak},
-};
+use std::{borrow::Borrow, sync::Arc, time::Duration};
 
-use dlp_api::{
-    args::PostDelegationActions, pda::delegation_record_pda_from_delegated_account, Decrypt,
-};
-use engine::{Engine, PostFinalize};
-use futures::future;
-use solana_account::{AccountBuilder, AccountMode, StateFlags};
-use solana_loader_v3_interface::get_program_data_address;
+use engine::Engine;
+use nucleus::shutdown::{Service, ShutdownManager};
 use solana_pubkey::Pubkey;
-use solana_sdk_ids::bpf_loader_upgradeable;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc;
 use url::Url;
 
-use crate::http::{Fetcher, Snapshot};
+use crate::http::Fetcher;
 use crate::websocket::Pool;
 
-pub use grpc::{Config as GrpcConfig, Error as GrpcError};
+/// WS acknowledgement age and cadence for gRPC filter and WS restoration scans.
+const DUPLICATION_DELAY: Duration = Duration::from_secs(30 * 60);
+
+pub use grpc::{Config as GrpcConfig, Error as GrpcError, StreamConfig as GrpcStreamConfig};
 pub use http::Error as HttpError;
 pub use rpc::{DecodeError, Error as RpcError};
 pub use websocket::{
@@ -49,7 +52,7 @@ pub struct ChainSyncConfig {
     pub http: Vec<Url>,
     /// WebSocket subscription providers.
     pub websocket: WebSocketConfig,
-    /// Yellowstone update provider, including the delegation authority.
+    /// Yellowstone update streams and their shared delegation authority.
     pub grpc: GrpcConfig,
 }
 
@@ -84,8 +87,8 @@ pub struct ChainSync {
     fetcher: Fetcher,
     /// Tracks accounts before their snapshots are fetched.
     websocket: Pool,
-    /// Keeps the gRPC stream alive for the synchronizer's lifetime.
-    grpc: grpc::Client,
+    /// Keeps all gRPC streams alive for the synchronizer's lifetime.
+    grpc: Vec<grpc::Client>,
 }
 
 /// Failure to acquire or apply base-chain account state.
@@ -97,6 +100,8 @@ pub enum Error {
     Subscribe(#[from] WebSocketError),
     #[error("gRPC operation failed: {0}")]
     Grpc(#[from] GrpcError),
+    #[error("at least one gRPC stream is required")]
+    NoGrpcStreams,
     #[error("Engine account operation failed: {0}")]
     Engine(#[from] engine::EngineError),
     #[error("invalid program: {0}")]
@@ -113,15 +118,37 @@ pub enum Error {
 
 impl ChainSync {
     /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
-    /// Worker failures are logged. Dropping the last handle stops the provider
-    /// tasks; the host remains responsible for Engine shutdown.
-    pub fn new(engine: Engine, config: ChainSyncConfig) -> Result<Arc<Self>, Error> {
+    /// The worker is registered with Engine's coordinated shutdown manager.
+    pub fn new(
+        engine: Engine,
+        config: ChainSyncConfig,
+        shutdown: &mut ShutdownManager,
+    ) -> Result<Arc<Self>, Error> {
+        if config.grpc.streams.is_empty() {
+            return Err(Error::NoGrpcStreams);
+        }
         let (websocket, websocket_rx) = Pool::new(config.websocket);
         let slot = websocket.slot();
         let fetcher = Fetcher::new(config.http, Arc::clone(&slot))?;
-        let (grpc, grpc_rx) = grpc::Client::new(config.grpc, slot)?;
+        let (events, grpc_rx) = mpsc::channel(grpc::EVENT_CAPACITY);
+        let authority = config.grpc.authority;
+        let grpc = config
+            .grpc
+            .streams
+            .into_iter()
+            .enumerate()
+            .map(|(id, stream)| {
+                grpc::Client::new(id, stream, authority, Arc::clone(&slot), events.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let sync = Arc::new(Self { engine, fetcher, websocket, grpc });
-        tokio::spawn(Self::run(Arc::downgrade(&sync), websocket_rx, grpc_rx));
+        let shutdown = shutdown.handle(Service::ChainSync);
+        tokio::spawn(Self::run(
+            Arc::downgrade(&sync),
+            websocket_rx,
+            grpc_rx,
+            shutdown,
+        ));
         Ok(sync)
     }
 
@@ -132,8 +159,8 @@ impl ChainSync {
     /// Programs include ProgramData; writable accounts and payers include their
     /// derived delegation record. Records are fetched only. A payer's WebSocket
     /// subscription is removed when its initial snapshot resolves as delegated here.
-    /// Requested accounts and ProgramData targets are retained on gRPC for automatic
-    /// application of later updates.
+    /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes.
+    /// A gRPC-only subscription periodically retries WebSocket restoration.
     ///
     /// An account is resolved as delegated only when its primary and delegation-record
     /// snapshots are DLP-owned and the record names this Engine. Other snapshots retain
@@ -166,383 +193,17 @@ impl ChainSync {
             }
             let batch = &accounts[start..end];
             start = end;
-            self.grpc.retain(grpc_subscriptions(batch)).await?;
             self.sync_batch(batch).await?;
         }
         Ok(())
     }
-
-    /// Selects between both streams and handles events only while the synchronizer can be
-    /// upgraded.
-    async fn run(
-        sync: Weak<Self>,
-        mut websocket: Receiver<websocket::Event>,
-        mut grpc: Receiver<grpc::Event>,
-    ) {
-        loop {
-            tokio::select! {
-                Some(event) = websocket.recv() => {
-                    let Some(sync) = sync.upgrade() else { break; };
-                    sync.on_websocket(event).await;
-                },
-                Some(event) = grpc.recv() => {
-                    let Some(sync) = sync.upgrade() else { break; };
-                    sync.on_grpc(event).await;
-                },
-                else => break,
-            }
-        }
-    }
-
-    /// Applies a WebSocket account update and logs failures without stopping the worker.
-    async fn on_websocket(&self, event: websocket::Event) {
-        match event {
-            websocket::Event::Update { sub, account } => {
-                if let Err(error) = self.apply(sub, account).await {
-                    tracing::error!(source = "WS", %sub.pubkey, %error, "account update failed");
-                }
-            }
-            websocket::Event::Dropped { connection, pubkeys, error } => {
-                tracing::warn!(?connection, lost = pubkeys.len(), %error, "WebSocket subscriptions lost");
-            }
-        }
-    }
-
-    /// Applies gRPC account and lifecycle events, logging per-account failures.
-    async fn on_grpc(&self, event: grpc::Event) {
-        match event {
-            grpc::Event::Update { pubkey, target, account } => {
-                let sub = AccountSubscription { pubkey, target };
-                if let Err(error) = self.apply(sub, account).await {
-                    tracing::error!(source = "gRPC", %pubkey, %error, "account update failed");
-                }
-            }
-            grpc::Event::Delegated(delegation) => {
-                let pubkey = delegation.pubkey;
-                if let Err(error) = self.delegated(delegation).await {
-                    tracing::error!(%pubkey, %error, "delegation failed");
-                }
-            }
-            grpc::Event::Undelegated { pubkeys, slot } => {
-                for pubkey in pubkeys {
-                    if let Err(error) = self.undelegated(pubkey, slot).await {
-                        tracing::error!(%pubkey, slot, %error, "undelegation failed");
-                    }
-                }
-            }
-            grpc::Event::Disconnected(error) => tracing::warn!(%error, "gRPC disconnected"),
-        }
-    }
-
-    /// Loads dependencies for delegated actions before materializing the delegated account.
-    async fn delegated(&self, delegation: grpc::Delegation) -> Result<(), Error> {
-        let grpc::Delegation { pubkey, account, record } = delegation;
-        let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
-        let actions = if !appended.is_empty() {
-            let compact: PostDelegationActions = borsh::from_slice(appended)?;
-            let actions = compact.decrypt_with_keypair(self.engine.signer())?;
-            let mut dependencies = BTreeMap::new();
-            for action in &actions {
-                dependencies.insert(action.program_id, AccountProperty::Program);
-                for meta in &action.accounts {
-                    let property =
-                        dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
-                    if meta.is_writable {
-                        *property = AccountProperty::Writable;
-                    }
-                }
-            }
-            // The target is acquired after its other action dependencies.
-            dependencies.remove(&pubkey);
-            let dependencies = dependencies
-                .into_iter()
-                .map(|(pubkey, property)| SyncAccount { pubkey, property });
-            self.sync(dependencies).await?;
-            let source_program = account.read().owner();
-            Some(PostFinalize { source_program, actions })
-        } else {
-            None
-        };
-        let accessor = self.engine.account(pubkey).await?;
-        accessor.materialize(account, actions).await?;
-        Ok(())
-    }
-
-    /// Deletes the account only when the event is current and the observed mode permits
-    /// removal.
-    async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<(), Error> {
-        let accessor = self.engine.account(pubkey).await?;
-        let Some((mode, observed)) = accessor.observed() else {
-            return Ok(());
-        };
-        if slot < observed || (mode.authoritative() && mode != AccountMode::Transient) {
-            tracing::warn!(%pubkey, slot, observed, ?mode, "undelegation cannot remove account");
-            return Ok(());
-        }
-        accessor.delete().await?;
-        Ok(())
-    }
-
-    /// Applies a streamed account update to its subscribed account or program target.
-    async fn apply(
-        &self,
-        subscription: AccountSubscription,
-        account: AccountBuilder,
-    ) -> Result<(), Error> {
-        let AccountSubscription { pubkey, target } = subscription;
-        let accessor = self.engine.account(target.unwrap_or(pubkey)).await?;
-        let account = match target {
-            Some(_) => program::normalize_data(account, self.engine.rent())?,
-            None if account.read().flags().contains(StateFlags::EXECUTABLE) => {
-                program::normalize(account, None, self.engine.rent())?
-            }
-            None => account,
-        };
-        accessor.materialize(account, None).await?;
-        Ok(())
-    }
-
-    /// Acquires missing accounts and applies the fetched snapshot and any delegation actions.
-    async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<(), Error> {
-        // Engine rechecks presence under ordered leases, preventing overlapping syncs from
-        // fetching the same missing accounts.
-        let keys: Vec<_> = batch.iter().map(|account| account.pubkey).collect();
-        let accessors = self.engine.missing_accounts(&keys).await?;
-        if accessors.is_empty() {
-            return Ok(());
-        }
-        let plan = FetchPlan::new(batch, accessors);
-        let (mut snapshot, prune) = self.fetch_batch(&plan).await?;
-        let actions = self.materialize_batch(plan, &mut snapshot).await?;
-        self.apply_delegations(actions).await?;
-        self.unsubscribe(prune).await;
-        Ok(())
-    }
-
-    /// Subscribes, fetches, and normalizes planned accounts, cleaning up subscriptions on failure.
-    async fn fetch_batch(&self, plan: &FetchPlan<'_>) -> Result<(Snapshot, Vec<Pubkey>), Error> {
-        self.subscribe(&plan.subscriptions).await?;
-        let result = async {
-            let mut snapshot = self.fetcher.fetch(&plan.keys, None).await?;
-            let prune = plan.pruned_subscriptions(&snapshot);
-            program::normalize_batch(&plan.programs, &mut snapshot.accounts, self.engine.rent())?;
-            Ok((snapshot, prune))
-        }
-        .await;
-        if result.is_err() {
-            let pubkeys = plan.subscriptions.iter().map(|subscription| subscription.pubkey);
-            self.unsubscribe(pubkeys).await;
-        }
-        result
-    }
-
-    /// Materializes snapshot accounts and returns delegated accounts with deferred actions.
-    async fn materialize_batch(
-        &self,
-        plan: FetchPlan<'_>,
-        snapshot: &mut Snapshot,
-    ) -> Result<Vec<PendingDelegation>, Error> {
-        let mut actions = Vec::new();
-        for pending in plan.accounts {
-            let pubkey = pending.accessor.pubkey();
-            let account = snapshot.accounts[pending.index].take().unwrap_or_default();
-            let delegation = pending.record_index.and_then(|index| {
-                delegation::snapshot_record(
-                    &account,
-                    snapshot.accounts[index].as_ref(),
-                    self.engine.authority(),
-                )
-            });
-            let Some((metadata, record)) = delegation else {
-                pending.accessor.materialize(account, None).await?;
-                continue;
-            };
-            let account = delegation::account(account, metadata.owner, metadata.delegation_slot);
-            if delegation::appended(record).is_some_and(|actions| !actions.is_empty()) {
-                actions.push(PendingDelegation {
-                    delegation: grpc::Delegation {
-                        pubkey,
-                        account,
-                        record: record.to_vec(),
-                    },
-                    payer: pending.property == AccountProperty::Payer,
-                });
-            } else {
-                pending.accessor.materialize(account, None).await?;
-                if pending.property == AccountProperty::Payer {
-                    self.unsubscribe([pubkey]).await;
-                }
-            }
-        }
-        Ok(actions)
-    }
-
-    /// Applies deferred delegations after the batch's account leases have been released.
-    async fn apply_delegations(&self, actions: Vec<PendingDelegation>) -> Result<(), Error> {
-        for PendingDelegation { delegation, payer } in actions {
-            let pubkey = delegation.pubkey;
-            // Action dependencies may include another key from this batch.
-            Box::pin(self.delegated(delegation)).await?;
-            if payer {
-                self.unsubscribe([pubkey]).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Waits for every subscription request and removes successful subscriptions if any fail.
-    async fn subscribe(&self, subscriptions: &[AccountSubscription]) -> Result<(), Error> {
-        // Settle every admitted request so acknowledged subscriptions can be cleaned up.
-        let requests =
-            subscriptions.iter().map(|&subscription| self.websocket.subscribe(subscription));
-        let mut subscribed = Vec::with_capacity(subscriptions.len());
-        let mut failure = None;
-        for (subscription, result) in subscriptions.iter().zip(future::join_all(requests).await) {
-            match result {
-                Ok(()) => subscribed.push(subscription.pubkey),
-                Err(error) => {
-                    failure.replace(error);
-                }
-            }
-        }
-        if let Some(error) = failure {
-            self.unsubscribe(subscribed).await;
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    /// Releases subscriptions; failed releases mean their socket or pool entry is already gone.
-    async fn unsubscribe(&self, keys: impl IntoIterator<Item = Pubkey>) {
-        let pending = keys.into_iter().map(|key| self.websocket.unsubscribe(key));
-        // A failed request means the socket or pool owner already removed it.
-        let _ = future::join_all(pending).await;
-    }
-}
-
-/// One leased account and its positions in the ordered HTTP fetch batch.
-struct PendingAccount<'engine> {
-    /// Lease held through snapshot processing unless the account is deferred for actions.
-    accessor: engine::AccountAccessor<'engine>,
-    /// Selects companion-account and payer cleanup behavior.
-    property: AccountProperty,
-    /// Position of the primary account in `FetchPlan::keys`.
-    index: usize,
-    /// Position of the delegation record, when this account needs one.
-    record_index: Option<usize>,
-}
-
-/// Delegation deferred until the batch's other account leases are released.
-struct PendingDelegation {
-    /// Resolved account and its full delegation record.
-    delegation: grpc::Delegation,
-    /// Whether successful materialization should remove the payer subscription.
-    payer: bool,
-}
-
-/// Ordered fetch inputs and subscriptions derived from a batch of missing accounts.
-struct FetchPlan<'engine> {
-    /// Missing account leases paired with their positions and requested properties.
-    accounts: Vec<PendingAccount<'engine>>,
-    /// Primary and companion keys in HTTP response order.
-    keys: Vec<Pubkey>,
-    /// Accounts subscribed before the HTTP request.
-    subscriptions: Vec<AccountSubscription>,
-    /// Program and ProgramData positions used during normalization.
-    programs: Vec<(usize, usize)>,
 }
 
 /// Account subscription and optional target for ProgramData account updates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AccountSubscription {
     /// Address observed by the transport.
-    pub pubkey: Pubkey,
+    pubkey: Pubkey,
     /// Program to update when `pubkey` is its Loader V3 ProgramData account.
-    pub target: Option<Pubkey>,
-}
-
-impl<'e> FetchPlan<'e> {
-    /// Pairs ordered missing-account leases with requests and derives fetch inputs.
-    fn new(batch: &[SyncAccount], accessors: Vec<engine::AccountAccessor<'e>>) -> Self {
-        // Engine returns missing accessors in pubkey order, matching the sorted request batch.
-        let mut accessors = accessors.into_iter().peekable();
-        let mut plan = Self {
-            accounts: Vec::with_capacity(accessors.len()),
-            keys: Vec::with_capacity(batch.len() * 2),
-            subscriptions: Vec::with_capacity(batch.len() * 2),
-            programs: Vec::new(),
-        };
-        for request in batch {
-            let Some(accessor) = accessors.next_if(|accessor| accessor.pubkey() == request.pubkey)
-            else {
-                continue;
-            };
-            let pubkey = request.pubkey;
-            let index = plan.keys.len();
-            plan.keys.push(pubkey);
-            if request.property != AccountProperty::Writable {
-                plan.subscriptions.push(AccountSubscription { pubkey, target: None });
-            }
-            let record_index = match request.property {
-                AccountProperty::Payer | AccountProperty::Writable => {
-                    let index = plan.keys.len();
-                    plan.keys.push(delegation_record_pda_from_delegated_account(&pubkey));
-                    Some(index)
-                }
-                AccountProperty::Program => {
-                    let data = get_program_data_address(&pubkey);
-                    let data_index = plan.keys.len();
-                    plan.keys.push(data);
-                    plan.subscriptions.push(AccountSubscription {
-                        pubkey: data,
-                        target: Some(pubkey),
-                    });
-                    plan.programs.push((index, data_index));
-                    None
-                }
-                AccountProperty::Readonly => None,
-            };
-            plan.accounts.push(PendingAccount {
-                accessor,
-                property: request.property,
-                index,
-                record_index,
-            });
-        }
-        plan
-    }
-
-    /// Selects the program or ProgramData subscription to release after normalization.
-    fn pruned_subscriptions(&self, snapshot: &Snapshot) -> Vec<Pubkey> {
-        self.programs
-            .iter()
-            .filter_map(|&(program_index, data_index)| {
-                let program = snapshot.accounts[program_index].as_ref()?.read();
-                let index = if program.owner() == bpf_loader_upgradeable::ID {
-                    program_index
-                } else {
-                    data_index
-                };
-                Some(self.keys[index])
-            })
-            .collect()
-    }
-}
-
-/// Tracks primary accounts and ProgramData targets for streamed updates.
-fn grpc_subscriptions(accounts: &[SyncAccount]) -> Vec<AccountSubscription> {
-    let mut subscriptions = BTreeMap::new();
-    for account in accounts {
-        subscriptions.insert(account.pubkey, None);
-        if account.property == AccountProperty::Program {
-            subscriptions.insert(
-                get_program_data_address(&account.pubkey),
-                Some(account.pubkey),
-            );
-        }
-    }
-    subscriptions
-        .into_iter()
-        .map(|(pubkey, target)| AccountSubscription { pubkey, target })
-        .collect()
+    target: Option<Pubkey>,
 }

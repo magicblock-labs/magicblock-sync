@@ -15,9 +15,9 @@ use dlp_api::state::{
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 use yellowstone_grpc_client::{
-    ClientTlsConfig, GeyserGrpcClient, ReconnectConfig, SubscribeRequestSink,
+    ClientTlsConfig, GeyserGrpcClient, GeyserGrpcClientError, ReconnectConfig, SubscribeRequestSink,
 };
 use yellowstone_grpc_proto::{
     cuckoo::CompressedAccountFilterSet,
@@ -26,21 +26,26 @@ use yellowstone_grpc_proto::{
         subscribe_request_filter_accounts_filter_memcmp::Data, subscribe_update::UpdateOneof,
     },
     prelude::*,
+    tonic,
 };
 
 use super::{
-    client::SubscriptionUpdate, delegation::Delegations, transaction, Config, Delegation, Error,
-    Event,
+    client::Command, delegation::Delegations, transaction, Delegation, Error, Event, StreamConfig,
 };
+use crate::{AccountSubscription, DUPLICATION_DELAY};
 
-/// Owns retained membership and delegation state for one provider stream.
+/// Desired account interest and delegation state for one provider stream.
 pub(super) struct Session {
-    /// Endpoint, authority, and provider credentials.
-    config: Config,
-    /// Authoritative exact-membership filter, including reconnect snapshots.
+    /// Stable index in the configured provider list.
+    id: usize,
+    /// Endpoint and provider credentials.
+    config: StreamConfig,
+    /// Authority observed for delegation lifecycle events.
+    authority: Pubkey,
+    /// Last full filter sent on this live stream.
     accounts: CompressedAccountFilterSet,
-    /// ProgramData addresses with an alternate Engine target.
-    targets: AHashMap<Pubkey, Pubkey>,
+    /// Logical interest, including WS copies still within the duplication delay.
+    desired: AHashMap<Pubkey, Desired>,
     /// Shared confirmed-update floor, not a replay checkpoint.
     watermark: Arc<AtomicU64>,
     /// Ordered account and lifecycle event delivery.
@@ -49,35 +54,54 @@ pub(super) struct Session {
     delegations: Delegations,
 }
 
+/// One WS-confirmed account awaiting or retaining a gRPC filter entry.
+struct Desired {
+    /// Exact key and optional ProgramData target.
+    sub: AccountSubscription,
+    /// Owner-issued logical subscription generation.
+    generation: u64,
+    /// WS acknowledgement that starts the duplication delay.
+    since: Instant,
+}
+
 impl Session {
     /// Keeps the exact retained-account filter across Yellowstone reconnects.
     pub(super) fn new(
-        config: Config,
+        id: usize,
+        config: StreamConfig,
+        authority: Pubkey,
         watermark: Arc<AtomicU64>,
         events: mpsc::Sender<Event>,
     ) -> Result<Self, Error> {
         Ok(Self {
+            id,
             accounts: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 4)?,
-            targets: AHashMap::new(),
-            delegations: Delegations::new(config.authority),
+            desired: AHashMap::new(),
+            delegations: Delegations::new(authority),
             config,
+            authority,
             watermark,
             events,
         })
     }
 
     /// Reports a terminal stream failure after earlier queued events.
-    pub(super) async fn run(mut self, mut updates: mpsc::Receiver<SubscriptionUpdate>) {
-        if let Err(error) = self.subscribe(&mut updates).await {
-            let _ = self.events.send(Event::Disconnected(error)).await;
+    pub(super) async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        loop {
+            let Err(error) = self.subscribe(&mut commands).await else { return };
+            let _ = self.events.send(Event::Lost(self.id)).await;
+            if recoverable(&error) {
+                tracing::warn!(%error, "gRPC unavailable; retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            } else {
+                let _ = self.events.send(Event::Disconnected { stream: self.id, error }).await;
+                return;
+            }
         }
     }
 
-    /// Lets Yellowstone reconnect while processing membership changes and updates.
-    async fn subscribe(
-        &mut self,
-        updates: &mut mpsc::Receiver<SubscriptionUpdate>,
-    ) -> Result<(), Error> {
+    /// Lets Yellowstone reconnect while processing filter changes and updates.
+    async fn subscribe(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<(), Error> {
         let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
             .connect_timeout(TIMEOUT)
@@ -88,13 +112,22 @@ impl Session {
             builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
         }
         let mut client = builder.connect().await?;
+        self.sync_filter()?;
         let request = self.request();
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
+        let current: Vec<_> = self
+            .desired
+            .iter()
+            .filter_map(|(&pubkey, entry)| {
+                self.accounts.contains(pubkey).then_some((pubkey, entry.generation))
+            })
+            .collect();
+        self.confirm(current).await?;
         loop {
             tokio::select! {
-                update = updates.recv() => {
-                    let Some(update) = update else { return Ok(()) };
-                    self.update_subscription(update, &mut sink).await?;
+                command = commands.recv() => {
+                    let Some(command) = command else { return Ok(()) };
+                    self.command(command, &mut sink).await?;
                 }
                 update = stream.next() => {
                     let update = update.ok_or(Error::Closed)??;
@@ -105,7 +138,7 @@ impl Session {
     }
 
     /// Handles ping, account, and transaction updates; other provider messages
-    /// do not change retained membership or delegation state.
+    /// do not change retained-account interest or delegation state.
     async fn process(
         &mut self,
         update: SubscribeUpdate,
@@ -120,7 +153,7 @@ impl Session {
         Ok(())
     }
 
-    /// Sends the complete current membership filter for this stream and reconnects.
+    /// Sends the complete current physical filter on the live stream.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
         sink.send(self.request()).await?;
         Ok(())
@@ -148,30 +181,71 @@ impl Session {
         Ok(())
     }
 
-    /// Applies a membership batch before acknowledging request delivery.
-    async fn update_subscription(
+    /// Applies logical interest immediately and sends its full filter only when it changes.
+    async fn command(
         &mut self,
-        update: SubscriptionUpdate,
+        command: Command,
         sink: &mut SubscribeRequestSink,
     ) -> Result<(), Error> {
-        let mut changed = false;
-        for account in update.add {
-            changed |= !self.accounts.contains(account.pubkey);
-            self.accounts.insert(account.pubkey)?;
-            if let Some(target) = account.target {
-                self.targets.insert(account.pubkey, target);
-            } else {
-                self.targets.remove(&account.pubkey);
+        match command {
+            Command::Track(sub, generation, since) => {
+                self.desired.insert(sub.pubkey, Desired { sub, generation, since });
+                if self.accounts.contains(sub.pubkey) {
+                    self.confirm([(sub.pubkey, generation)]).await?;
+                }
+            }
+            Command::Remove(pubkey) => {
+                self.desired.remove(&pubkey);
+            }
+            Command::Rebuild => {
+                let added = self.sync_filter()?;
+                if let Some(added) = added {
+                    self.refresh(sink).await?;
+                    self.confirm(added).await?;
+                }
             }
         }
-        if changed {
-            self.refresh(sink).await?;
-        }
-        let _ = update.reply.send(());
         Ok(())
     }
 
-    /// Sends exact retained membership alongside DLP delegation discovery and
+    /// Prunes removed keys and adds aged keys without reallocating an unchanged filter.
+    fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>, Error> {
+        let remove: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|bytes| Pubkey::new_from_array(*bytes))
+            .filter(|pubkey| !self.desired.contains_key(pubkey))
+            .collect();
+        for pubkey in &remove {
+            self.accounts.remove(*pubkey);
+        }
+        let mut added = Vec::new();
+        for (&pubkey, entry) in &self.desired {
+            if !self.accounts.contains(pubkey) && entry.since.elapsed() >= DUPLICATION_DELAY {
+                self.accounts.insert(pubkey)?;
+                added.push((pubkey, entry.generation));
+            }
+        }
+        Ok((!remove.is_empty() || !added.is_empty()).then_some(added))
+    }
+
+    /// Reports account filter delivery to the single coverage owner.
+    async fn confirm(
+        &self,
+        confirmations: impl IntoIterator<Item = (Pubkey, u64)>,
+    ) -> Result<(), Error> {
+        for (pubkey, generation) in confirmations {
+            self.send(Event::Confirmed {
+                stream: self.id,
+                pubkey,
+                generation,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Sends the exact retained-account filter alongside DLP delegation discovery and
     /// successful ownership-return transaction filters, including on reconnect.
     fn request(&mut self) -> SubscribeRequest {
         let mut request = SubscribeRequest {
@@ -192,7 +266,7 @@ impl Session {
         let authority_offset =
             AccountDiscriminator::SPACE + offset_of!(DelegationRecord, authority);
         let discriminator = DelegationRecord::discriminator().to_bytes().to_vec();
-        let authority = self.config.authority.to_bytes().to_vec();
+        let authority = self.authority.to_bytes().to_vec();
         let filters = vec![memcmp(0, discriminator), memcmp(authority_offset as u64, authority)];
         let records = SubscribeRequestFilterAccounts {
             owner,
@@ -219,7 +293,7 @@ impl Session {
         let mut account = update.account.ok_or(Error::Protocol("missing account image"))?;
         let key = super::pubkey(&account.pubkey)?;
         let candidate = account.owner == dlp_api::id().as_ref();
-        if self.accounts.contains(key) {
+        if let Some(desired) = self.desired.get(&key).filter(|_| self.accounts.contains(key)) {
             let owner = super::pubkey(&account.owner)?;
             let data = if candidate { account.data.clone() } else { mem::take(&mut account.data) };
             let image = AccountBuilder::default()
@@ -230,8 +304,9 @@ impl Session {
                 .data(data);
             self.watermark.fetch_max(slot, Relaxed);
             let event = Event::Update {
+                stream: self.id,
                 pubkey: key,
-                target: self.targets.get(&key).copied(),
+                target: desired.sub.target,
                 account: image,
             };
             self.send(event).await?;
@@ -267,7 +342,7 @@ impl Session {
     }
 }
 
-/// Label for exact retained-account membership.
+/// Label for the exact retained-account filter.
 const RETAINED_FILTER: &str = "retained";
 /// Label for DLP-owned application candidates.
 const CANDIDATES_FILTER: &str = "candidates";
@@ -295,3 +370,23 @@ fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds local event-consumer backpressure independently of transport timeouts.
 const EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay before reconnecting after a recoverable transport failure.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Transport interruptions are retried; invalid configuration and stream data are terminal.
+fn recoverable(error: &Error) -> bool {
+    match error {
+        Error::Client(GeyserGrpcClientError::TonicStatus(status)) | Error::Status(status) => {
+            !matches!(
+                status.code(),
+                tonic::Code::Unauthenticated
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::InvalidArgument
+            )
+        }
+        Error::Client(GeyserGrpcClientError::TransportError(_))
+        | Error::Send(_)
+        | Error::Closed => true,
+        _ => false,
+    }
+}

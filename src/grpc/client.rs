@@ -1,73 +1,63 @@
-use super::{session::Session, Config, Error, Event};
-use crate::AccountSubscription;
-use derive_more::Deref;
 use std::sync::{atomic::AtomicU64, Arc};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
 
-/// Last-handle lifetime control for the provider task.
-pub struct ClientTask {
-    /// Aborted when all client handles are dropped.
-    handle: JoinHandle<()>,
-    /// Bounded membership-update queue.
-    updates: mpsc::Sender<SubscriptionUpdate>,
+use solana_pubkey::Pubkey;
+use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+
+use super::{session::Session, Error, Event, StreamConfig};
+use crate::AccountSubscription;
+
+/// One serialized change to a stream's logical account interest.
+pub(crate) enum Command {
+    /// Tracks an acknowledged WS account until its filter becomes eligible.
+    Track(AccountSubscription, u64, Instant),
+    /// Ends logical interest immediately; remote removal waits for a rebuild.
+    Remove(Pubkey),
+    /// Sends the full filter only when aged additions or removals changed it.
+    Rebuild,
 }
 
-/// Cloneable control handle for one provider's event stream.
-#[derive(Clone, Deref)]
-pub struct Client(Arc<ClientTask>);
+/// Control handle and lifetime owner for one Yellowstone stream.
+pub(crate) struct Client {
+    /// Aborted when the synchronizer drops this handle.
+    handle: JoinHandle<()>,
+    /// Ordered stream commands.
+    commands: mpsc::Sender<Command>,
+}
 
-impl Drop for ClientTask {
-    /// Stops the provider task when the final handle is released.
+impl Drop for Client {
+    /// Stops stream I/O when its control handle is released.
     fn drop(&mut self) {
         self.handle.abort();
     }
 }
 
 impl Client {
-    /// Starts on the current Tokio runtime. Use [`crate::websocket::Pool::slot`]
-    /// to share freshness with HTTP and WebSockets, not as a replay checkpoint.
-    pub fn new(
-        config: Config,
+    /// Starts one stream while sharing ordered events and the HTTP freshness watermark.
+    pub(crate) fn new(
+        id: usize,
+        config: StreamConfig,
+        authority: Pubkey,
         slot: Arc<AtomicU64>,
-    ) -> Result<(Self, mpsc::Receiver<Event>), Error> {
-        let (updates, requests) = mpsc::channel(UPDATE_CAPACITY);
-        let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
-        let session = Session::new(config, slot, events.clone())?;
+        events: mpsc::Sender<Event>,
+    ) -> Result<Self, Error> {
+        let (commands, requests) = mpsc::channel(COMMAND_CAPACITY);
+        let session = Session::new(id, config, authority, slot, events.clone())?;
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = events.closed() => {},
                 _ = session.run(requests) => {},
             }
         });
-        let task = Arc::new(ClientTask { updates, handle });
-        let client = Self(task);
-        Ok((client, receiver))
+        Ok(Self { commands, handle })
     }
 
-    /// Retains accounts and optional ProgramData targets without waiting for
-    /// remote coverage. Cancelling cannot retract an admitted change.
-    pub async fn retain(&self, add: Vec<AccountSubscription>) -> Result<(), Error> {
-        let (reply, result) = oneshot::channel();
-        self.updates
-            .send(SubscriptionUpdate { add, reply })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)
+    /// Queues a logical change without waiting for remote filter delivery.
+    pub(crate) async fn command(&self, command: Command) -> Result<(), Error> {
+        self.commands.send(command).await.map_err(|_| Error::Closed)
     }
 }
 
-/// Membership change acknowledged after request delivery.
-pub(super) struct SubscriptionUpdate {
-    /// Accounts to retain alongside WebSocket coverage.
-    pub(super) add: Vec<AccountSubscription>,
-    /// Signals delivery, not remote coverage.
-    pub(super) reply: oneshot::Sender<()>,
-}
-
-/// Maximum queued membership changes.
-const UPDATE_CAPACITY: usize = 64;
-/// Maximum queued account and lifecycle events.
-const EVENT_CAPACITY: usize = 8192;
+/// Maximum queued logical changes per Yellowstone stream.
+const COMMAND_CAPACITY: usize = 8192;
+/// Maximum queued account and lifecycle events from all streams.
+pub(crate) const EVENT_CAPACITY: usize = 8192;

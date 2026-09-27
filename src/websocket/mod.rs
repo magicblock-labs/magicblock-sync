@@ -2,7 +2,8 @@
 //!
 //! Drain the event receiver while awaiting pool operations. Acknowledgement
 //! confirms a subscription, not an initial snapshot. On connection loss,
-//! callers restore subscriptions and reconcile missed updates.
+//! callers may retry missing coverage periodically. Each attempt uses ready capacity
+//! or fails without queuing behind a reconnect.
 //!
 
 use crate::{
@@ -84,6 +85,15 @@ pub(super) struct Connection {
 
 /// Account and connection events, ordered within each connection only.
 pub(super) enum Event {
+    /// Server acknowledged a user subscription at `at`.
+    Acknowledged {
+        sub: AccountSubscription,
+        at: tokio::time::Instant,
+        /// Background acknowledgements cannot start a new logical subscription.
+        background: bool,
+    },
+    /// Caller requested intentional removal, before server acknowledgement.
+    Removed(Pubkey),
     /// Confirmed update builder in `Uninit` mode for caller classification.
     Update {
         /// Observed account and optional ProgramData target.
@@ -91,11 +101,11 @@ pub(super) enum Event {
         /// Decoded account state, including zero-lamport updates.
         account: AccountBuilder,
     },
-    /// All listed subscriptions were lost; earlier queued updates precede this event.
+    /// Lost subscriptions; earlier queued updates precede this event.
     Dropped {
         /// Failed attempt identity; its replacement has a new generation.
         connection: Connection,
-        /// Lost user subscriptions, excluding internal `Clock`.
+        /// Lost user subscriptions, excluding internal `Clock` and cancelled operations.
         pubkeys: Vec<Pubkey>,
         /// Cause of loss, including event-delivery failure.
         error: Error,

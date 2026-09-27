@@ -12,6 +12,7 @@ use tokio::{
         oneshot,
     },
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -22,7 +23,7 @@ use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
 
 /// Subscription handle. The pool stops when this handle or its event receiver is dropped.
-pub struct Pool {
+pub(crate) struct Pool {
     /// Bounded queue for caller subscription operations.
     commands: Sender<SubscriptionRequest>,
     /// Confirmed context-slot watermark retained across reconnects.
@@ -35,21 +36,28 @@ pub struct Pool {
 type Reply = oneshot::Sender<Result<(), Error>>;
 
 /// One account operation submitted to the registry.
-struct SubscriptionRequest {
-    /// Account and update target for a subscription.
-    account: AccountSubscription,
-    /// Whether this is subscribe rather than unsubscribe.
-    subscribe: bool,
-    /// Receives admission failure or server acknowledgement.
-    reply: Reply,
+enum SubscriptionRequest {
+    /// Subscribes once; a reply is needed only when the caller awaits acknowledgement.
+    Subscribe(AccountSubscription, Option<Reply>),
+    /// Releases a subscription; a reply marks an intentional logical removal.
+    Unsubscribe(Pubkey, Option<Reply>),
 }
 
 /// Per-account state that occupies socket capacity.
 enum Subscription {
-    /// Operation awaiting a server acknowledgement.
-    Pending(Reply),
-    /// Acknowledged subscription with its provider ID.
-    Active(u64),
+    /// Subscribe request awaiting a server acknowledgement.
+    Pending {
+        /// Caller waiter; absent for a background subscription.
+        reply: Option<Reply>,
+        /// Account and optional ProgramData target to publish on acknowledgement.
+        account: AccountSubscription,
+        /// Unsubscribe waiter if removal overtook the subscribe acknowledgement.
+        cancel: Option<Reply>,
+    },
+    /// Acknowledged subscription with its provider ID and background origin.
+    Active(u64, bool),
+    /// Release following an acknowledged or cancelled subscription.
+    Releasing(Reply),
 }
 
 /// Pool entry whose capacity remains allocated across reconnects.
@@ -141,26 +149,54 @@ impl Pool {
     /// Capacity failures return immediately. Do not cancel: admitted work may
     /// complete after the caller stops waiting.
     pub(crate) async fn subscribe(&self, account: AccountSubscription) -> Result<(), Error> {
-        self.request(account, true).await
+        self.request(
+            |account, reply| SubscriptionRequest::Subscribe(account, Some(reply)),
+            account,
+        )
+        .await
     }
 
-    /// Releases an acknowledged subscription. Do not overlap or cancel operations
-    /// for the same key.
+    /// Attempts one background subscription; a later scan retries if it lacks coverage.
+    pub(crate) async fn subscribe_background(
+        &self,
+        account: AccountSubscription,
+    ) -> Result<(), Error> {
+        self.commands
+            .send(SubscriptionRequest::Subscribe(account, None))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
+    /// Cancels an outstanding background subscription without removing a new caller subscription.
+    pub(crate) async fn cancel_background(&self, pubkey: Pubkey) -> Result<(), Error> {
+        self.commands
+            .send(SubscriptionRequest::Unsubscribe(pubkey, None))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
+    /// Releases a subscription, including an in-flight background attempt.
+    /// Do not overlap ordinary subscribe and unsubscribe operations for the same key.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
     /// Connection loss returns [`Error::Disconnected`], with the cause in
     /// [`Event::Dropped`].
     pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.request(AccountSubscription { pubkey, target: None }, false).await
+        self.request(
+            |pubkey, reply| SubscriptionRequest::Unsubscribe(pubkey, Some(reply)),
+            pubkey,
+        )
+        .await
     }
 
     /// Waits for registry admission and the server's operation outcome.
-    async fn request(&self, account: AccountSubscription, subscribe: bool) -> Result<(), Error> {
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(T, Reply) -> SubscriptionRequest,
+        value: T,
+    ) -> Result<(), Error> {
         let (reply, result) = oneshot::channel();
-        self.commands
-            .send(SubscriptionRequest { account, subscribe, reply })
-            .await
-            .map_err(|_| Error::Closed)?;
+        self.commands.send(make(value, reply)).await.map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
     }
 }
@@ -199,11 +235,24 @@ impl Registry {
             tokio::select! {
                 request = requests.recv() => {
                     let Some(request) = request else { return };
-                    let SubscriptionRequest { account, subscribe, reply } = request;
-                    if subscribe {
-                        self.subscribe(account, reply);
-                    } else {
-                        self.unsubscribe(account.pubkey, reply);
+                    match request {
+                        SubscriptionRequest::Subscribe(account, reply) => {
+                            if self.routes.contains_key(&account.pubkey) {
+                                // The old request must release its provider ID before this key can be reused.
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(Err(Error::Unavailable));
+                                }
+                            } else {
+                                self.subscribe(account, reply);
+                            }
+                        }
+                        SubscriptionRequest::Unsubscribe(pubkey, reply) => {
+                            if reply.is_some() {
+                                // Logical removal precedes remote acknowledgement and buffered updates.
+                                let _ = self.events.send(Event::Removed(pubkey)).await;
+                            }
+                            self.unsubscribe(pubkey, reply);
+                        }
                     }
                 }
                 Some(notice) = notices.recv() => self.notice(notice).await,
@@ -212,21 +261,24 @@ impl Registry {
     }
 
     /// Reserves capacity before waiting for remote acknowledgement.
-    fn subscribe(&mut self, account: AccountSubscription, reply: Reply) {
+    fn subscribe(&mut self, account: AccountSubscription, reply: Option<Reply>) {
         let pubkey = account.pubkey;
         let index = match self.admit() {
             Ok(index) => index,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                self.rejected(account, reply, error);
                 return;
             }
         };
         let socket = &mut self.sockets[index];
         if socket.commands.send(Command::Subscribe(account)).is_err() {
-            let _ = reply.send(Err(Error::Unavailable));
+            self.rejected(account, reply, Error::Unavailable);
             return;
         }
-        socket.accounts.insert(pubkey, Subscription::Pending(reply));
+        socket.accounts.insert(
+            pubkey,
+            Subscription::Pending { reply, account, cancel: None },
+        );
         self.routes.insert(pubkey, index);
         self.cursor = (index + 1) % self.sockets.len();
         let needed_growth = self.should_grow();
@@ -236,20 +288,47 @@ impl Registry {
         }
     }
 
+    /// Completes a waited subscribe or logs a failed background attempt.
+    fn rejected(&self, account: AccountSubscription, reply: Option<Reply>, error: Error) {
+        if let Some(reply) = reply {
+            let _ = reply.send(Err(error));
+        } else {
+            tracing::warn!(pubkey = %account.pubkey, %error, "WebSocket subscription rejected");
+        }
+    }
+
     /// Keeps capacity occupied until acknowledgement or socket loss.
-    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
+    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Option<Reply>) {
         let Some(&index) = self.routes.get(&pubkey) else {
             // Connection loss can remove the subscription before the caller unsubscribes.
-            let _ = reply.send(Ok(()));
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(()));
+            }
             return;
         };
         let socket = &mut self.sockets[index];
+        if reply.is_none()
+            && !matches!(
+                socket.accounts.get(&pubkey),
+                Some(Subscription::Pending { reply: None, .. } | Subscription::Active(_, true))
+            )
+        {
+            return;
+        }
+        let reply = reply.unwrap_or_else(|| oneshot::channel().0);
         let Some(state) = socket.accounts.get_mut(&pubkey) else { return };
-        let Subscription::Active(remote) = state else { return };
-        let remote = *remote;
-        *state = Subscription::Pending(reply);
-        // If I/O has just stopped, its queued loss notice completes this waiter.
-        let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
+        match state {
+            Subscription::Active(remote, _) => {
+                let remote = *remote;
+                *state = Subscription::Releasing(reply);
+                // If I/O has just stopped, its queued loss notice completes this waiter.
+                let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
+            }
+            Subscription::Pending { cancel, .. } => *cancel = Some(reply),
+            Subscription::Releasing(_) => {
+                let _ = reply.send(Ok(()));
+            }
+        }
     }
 
     /// Finds ready capacity without queuing behind connection attempts.
@@ -279,7 +358,7 @@ impl Registry {
             }
             Notice::Acknowledged { connection, pubkey, result } => {
                 // Acknowledgements do not trigger pool growth.
-                return self.acknowledge(connection, pubkey, result);
+                return self.acknowledge(connection, pubkey, result).await;
             }
             Notice::Dropped { connection, error } => {
                 let socket = &mut self.sockets[connection.index];
@@ -290,12 +369,27 @@ impl Registry {
                 let pubkeys = socket
                     .accounts
                     .drain()
-                    .map(|(pubkey, entry)| {
+                    .filter_map(|(pubkey, entry)| {
                         self.routes.remove(&pubkey);
-                        if let Subscription::Pending(reply) = entry {
-                            let _ = reply.send(Err(Error::Disconnected));
-                        }
-                        pubkey
+                        let report = match entry {
+                            Subscription::Pending { reply, cancel, .. } => {
+                                // Cancelled subscriptions do not report a source loss.
+                                let report = cancel.is_none();
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(Err(Error::Disconnected));
+                                }
+                                if let Some(reply) = cancel {
+                                    let _ = reply.send(Err(Error::Disconnected));
+                                }
+                                report
+                            }
+                            Subscription::Releasing(reply) => {
+                                let _ = reply.send(Err(Error::Disconnected));
+                                false
+                            }
+                            Subscription::Active(_, _) => true,
+                        };
+                        report.then_some(pubkey)
                     })
                     .collect();
                 // The failed task has finished publishing updates. Publish loss before replacing
@@ -316,7 +410,7 @@ impl Registry {
     }
 
     /// Commits the server outcome before completing the caller's operation.
-    fn acknowledge(
+    async fn acknowledge(
         &mut self,
         connection: Connection,
         pubkey: Pubkey,
@@ -324,17 +418,56 @@ impl Registry {
     ) {
         let socket = &mut self.sockets[connection.index];
         let Occupied(mut entry) = socket.accounts.entry(pubkey) else { return };
-        let pending = match result.as_ref() {
-            Ok(Some(remote)) => entry.insert(Subscription::Active(*remote)),
-            // Subscribe rejection and unsubscribe acknowledgement both free subscription capacity.
-            _ => {
+        match result {
+            Ok(Some(remote)) => {
+                let Subscription::Pending { account, reply, .. } = entry.get() else { return };
+                let account = *account;
+                let background = reply.is_none();
+                let Subscription::Pending { reply, cancel, .. } =
+                    entry.insert(Subscription::Active(remote, background))
+                else {
+                    unreachable!()
+                };
+                if let Some(cancel) = cancel {
+                    *entry.get_mut() = Subscription::Releasing(cancel);
+                    let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
+                } else {
+                    let _ = self
+                        .events
+                        .send(Event::Acknowledged {
+                            sub: account,
+                            at: Instant::now(),
+                            background,
+                        })
+                        .await;
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            result => {
                 self.routes.remove(&pubkey);
                 self.occupied -= 1;
-                entry.remove()
+                match entry.remove() {
+                    Subscription::Pending { reply, cancel, .. } => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(result.map(|_| ()));
+                        } else if cancel.is_none() {
+                            if let Err(error) = result {
+                                tracing::warn!(%pubkey, %error, "WebSocket subscription rejected");
+                            }
+                        }
+                        if let Some(cancel) = cancel {
+                            let _ = cancel.send(Ok(()));
+                        }
+                    }
+                    Subscription::Releasing(reply) => {
+                        let _ = reply.send(result.map(|_| ()));
+                    }
+                    Subscription::Active(_, _) => unreachable!(),
+                }
             }
-        };
-        let Subscription::Pending(reply) = pending else { return };
-        let _ = reply.send(result.map(|_| ()));
+        }
     }
 
     /// Starts an attempt with internal `Clock` ahead of user commands.
