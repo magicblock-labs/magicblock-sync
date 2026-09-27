@@ -35,17 +35,10 @@ pub(super) struct Coverage {
 
 impl Coverage {
     /// Records a WS acknowledgement and returns its current generation for gRPC reuse.
-    pub(super) fn acknowledged(
-        &mut self,
-        sub: AccountSubscription,
-        background: bool,
-    ) -> Option<u64> {
+    pub(super) fn acknowledged(&mut self, sub: AccountSubscription) -> u64 {
         if let Some(entry) = self.entries.get_mut(&sub.pubkey) {
             entry.ws = true;
-            return Some(entry.generation);
-        }
-        if background {
-            return None;
+            return entry.generation;
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -58,7 +51,7 @@ impl Coverage {
                 grpc: None,
             },
         );
-        Some(generation)
+        generation
     }
 
     /// Removes the logical subscription, including any in-flight transport request.
@@ -101,14 +94,6 @@ impl Coverage {
         self.entries
             .get(&sub.pubkey)
             .is_some_and(|entry| entry.sub == sub && entry.grpc == Some(stream))
-    }
-
-    /// Returns gRPC-only subscriptions lacking a WebSocket copy.
-    pub(super) fn missing_ws(&self) -> impl Iterator<Item = AccountSubscription> + '_ {
-        self.entries
-            .values()
-            .filter(|entry| entry.grpc.is_some() && !entry.ws)
-            .map(|entry| entry.sub)
     }
 
     /// Lists keys covered by a failed gRPC stream before removing that source.

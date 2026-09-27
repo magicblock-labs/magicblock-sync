@@ -5,6 +5,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
 use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::{
@@ -12,7 +13,6 @@ use tokio::{
         oneshot,
     },
     task::JoinHandle,
-    time::Instant,
 };
 
 use super::{
@@ -22,14 +22,12 @@ use super::{
 use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
 
-/// Subscription handle. The pool stops when this handle or its event receiver is dropped.
+/// Subscription handle for a shutdown-managed WebSocket pool.
 pub(crate) struct Pool {
     /// Bounded queue for caller subscription operations.
     commands: Sender<SubscriptionRequest>,
     /// Confirmed context-slot watermark retained across reconnects.
     slot: Arc<AtomicU64>,
-    /// Aborted when the final pool handle drops.
-    handle: JoinHandle<()>,
 }
 
 /// Completion channel for one caller operation.
@@ -37,25 +35,25 @@ type Reply = oneshot::Sender<Result<(), Error>>;
 
 /// One account operation submitted to the registry.
 enum SubscriptionRequest {
-    /// Subscribes once; a reply is needed only when the caller awaits acknowledgement.
-    Subscribe(AccountSubscription, Option<Reply>),
-    /// Releases a subscription; a reply marks an intentional logical removal.
-    Unsubscribe(Pubkey, Option<Reply>),
+    /// Subscribes once and reports the server acknowledgement.
+    Subscribe(AccountSubscription, Reply),
+    /// Releases a subscription and reports the server outcome.
+    Unsubscribe(Pubkey, Reply),
 }
 
 /// Per-account state that occupies socket capacity.
 enum Subscription {
     /// Subscribe request awaiting a server acknowledgement.
     Pending {
-        /// Caller waiter; absent for a background subscription.
-        reply: Option<Reply>,
+        /// Caller waiting for the server acknowledgement.
+        reply: Reply,
         /// Account and optional ProgramData target to publish on acknowledgement.
         account: AccountSubscription,
         /// Unsubscribe waiter if removal overtook the subscribe acknowledgement.
         cancel: Option<Reply>,
     },
-    /// Acknowledged subscription with its provider ID and background origin.
-    Active(u64, bool),
+    /// Acknowledged subscription with its provider ID.
+    Active(u64),
     /// Release following an acknowledged or cancelled subscription.
     Releasing(Reply),
 }
@@ -97,17 +95,11 @@ impl Drop for Socket {
     }
 }
 
-impl Drop for Pool {
-    /// Stops registry and socket tasks when their owner is dropped.
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
 impl Pool {
     /// Starts connecting on the current Tokio runtime without waiting for
-    /// readiness. Connection failures arrive as [`Event::Dropped`].
-    pub fn new(config: Config) -> (Self, Receiver<Event>) {
+    /// readiness. The pool and its socket tasks stop on coordinated shutdown.
+    /// Connection failures arrive as [`Event::Dropped`].
+    pub fn new(config: Config, manager: &mut ShutdownManager) -> (Self, Receiver<Event>) {
         let (commands, requests) = mpsc::channel(COMMAND_CAP);
         let (events, receiver) = mpsc::channel(EVENT_CAP);
         let (notices, incoming) = mpsc::unbounded_channel();
@@ -123,16 +115,30 @@ impl Pool {
             cursor: 0,
             slot: Arc::clone(&slot),
         };
-        let task = tokio::spawn(async move {
+        let mut shutdown = manager.handle(Service::ChainSyncWebSocket);
+        tokio::spawn(async move {
             for provider in 0..registry.config.providers.len() {
                 registry.open(provider, true);
             }
             tokio::select! {
+                biased;
+                _ = shutdown.signalled() => {},
                 _ = events.closed() => {},
                 _ = registry.run(requests, incoming) => {},
             }
+            for socket in &mut registry.sockets {
+                socket.task.abort();
+                let _ = (&mut socket.task).await;
+            }
+            drop(registry);
+            let reason = if shutdown.requested() {
+                ShutdownReason::Signalled
+            } else {
+                ShutdownReason::Unexpected
+            };
+            shutdown.terminate(reason);
         });
-        (Self { commands, slot, handle: task }, receiver)
+        (Self { commands, slot }, receiver)
     }
 
     /// Shared confirmed-update watermark, initially zero. It is not the chain
@@ -149,44 +155,17 @@ impl Pool {
     /// Capacity failures return immediately. Do not cancel: admitted work may
     /// complete after the caller stops waiting.
     pub(crate) async fn subscribe(&self, account: AccountSubscription) -> Result<(), Error> {
-        self.request(
-            |account, reply| SubscriptionRequest::Subscribe(account, Some(reply)),
-            account,
-        )
-        .await
+        self.request(SubscriptionRequest::Subscribe, account).await
     }
 
-    /// Attempts one background subscription; a later scan retries if it lacks coverage.
-    pub(crate) async fn subscribe_background(
-        &self,
-        account: AccountSubscription,
-    ) -> Result<(), Error> {
-        self.commands
-            .send(SubscriptionRequest::Subscribe(account, None))
-            .await
-            .map_err(|_| Error::Closed)
-    }
-
-    /// Cancels an outstanding background subscription without removing a new caller subscription.
-    pub(crate) async fn cancel_background(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.commands
-            .send(SubscriptionRequest::Unsubscribe(pubkey, None))
-            .await
-            .map_err(|_| Error::Closed)
-    }
-
-    /// Releases a subscription, including an in-flight background attempt.
+    /// Releases a subscription, including an in-flight attempt.
     /// Do not overlap ordinary subscribe and unsubscribe operations for the same key.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
     /// Connection loss returns [`Error::Disconnected`], with the cause in
     /// [`Event::Dropped`].
     pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.request(
-            |pubkey, reply| SubscriptionRequest::Unsubscribe(pubkey, Some(reply)),
-            pubkey,
-        )
-        .await
+        self.request(SubscriptionRequest::Unsubscribe, pubkey).await
     }
 
     /// Waits for registry admission and the server's operation outcome.
@@ -239,18 +218,14 @@ impl Registry {
                         SubscriptionRequest::Subscribe(account, reply) => {
                             if self.routes.contains_key(&account.pubkey) {
                                 // The old request must release its provider ID before this key can be reused.
-                                if let Some(reply) = reply {
-                                    let _ = reply.send(Err(Error::Unavailable));
-                                }
+                                let _ = reply.send(Err(Error::Unavailable));
                             } else {
                                 self.subscribe(account, reply);
                             }
                         }
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
-                            if reply.is_some() {
-                                // Logical removal precedes remote acknowledgement and buffered updates.
-                                let _ = self.events.send(Event::Removed(pubkey)).await;
-                            }
+                            // Logical removal precedes remote acknowledgement and buffered updates.
+                            let _ = self.events.send(Event::Removed(pubkey)).await;
                             self.unsubscribe(pubkey, reply);
                         }
                     }
@@ -261,18 +236,18 @@ impl Registry {
     }
 
     /// Reserves capacity before waiting for remote acknowledgement.
-    fn subscribe(&mut self, account: AccountSubscription, reply: Option<Reply>) {
+    fn subscribe(&mut self, account: AccountSubscription, reply: Reply) {
         let pubkey = account.pubkey;
         let index = match self.admit() {
             Ok(index) => index,
             Err(error) => {
-                self.rejected(account, reply, error);
+                let _ = reply.send(Err(error));
                 return;
             }
         };
         let socket = &mut self.sockets[index];
         if socket.commands.send(Command::Subscribe(account)).is_err() {
-            self.rejected(account, reply, Error::Unavailable);
+            let _ = reply.send(Err(Error::Unavailable));
             return;
         }
         socket.accounts.insert(
@@ -288,37 +263,17 @@ impl Registry {
         }
     }
 
-    /// Completes a waited subscribe or logs a failed background attempt.
-    fn rejected(&self, account: AccountSubscription, reply: Option<Reply>, error: Error) {
-        if let Some(reply) = reply {
-            let _ = reply.send(Err(error));
-        } else {
-            tracing::warn!(pubkey = %account.pubkey, %error, "WebSocket subscription rejected");
-        }
-    }
-
     /// Keeps capacity occupied until acknowledgement or socket loss.
-    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Option<Reply>) {
+    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
         let Some(&index) = self.routes.get(&pubkey) else {
             // Connection loss can remove the subscription before the caller unsubscribes.
-            if let Some(reply) = reply {
-                let _ = reply.send(Ok(()));
-            }
+            let _ = reply.send(Ok(()));
             return;
         };
         let socket = &mut self.sockets[index];
-        if reply.is_none()
-            && !matches!(
-                socket.accounts.get(&pubkey),
-                Some(Subscription::Pending { reply: None, .. } | Subscription::Active(_, true))
-            )
-        {
-            return;
-        }
-        let reply = reply.unwrap_or_else(|| oneshot::channel().0);
         let Some(state) = socket.accounts.get_mut(&pubkey) else { return };
         match state {
-            Subscription::Active(remote, _) => {
+            Subscription::Active(remote) => {
                 let remote = *remote;
                 *state = Subscription::Releasing(reply);
                 // If I/O has just stopped, its queued loss notice completes this waiter.
@@ -375,9 +330,7 @@ impl Registry {
                             Subscription::Pending { reply, cancel, .. } => {
                                 // Cancelled subscriptions do not report a source loss.
                                 let report = cancel.is_none();
-                                if let Some(reply) = reply {
-                                    let _ = reply.send(Err(Error::Disconnected));
-                                }
+                                let _ = reply.send(Err(Error::Disconnected));
                                 if let Some(reply) = cancel {
                                     let _ = reply.send(Err(Error::Disconnected));
                                 }
@@ -387,7 +340,7 @@ impl Registry {
                                 let _ = reply.send(Err(Error::Disconnected));
                                 false
                             }
-                            Subscription::Active(_, _) => true,
+                            Subscription::Active(_) => true,
                         };
                         report.then_some(pubkey)
                     })
@@ -420,11 +373,10 @@ impl Registry {
         let Occupied(mut entry) = socket.accounts.entry(pubkey) else { return };
         match result {
             Ok(Some(remote)) => {
-                let Subscription::Pending { account, reply, .. } = entry.get() else { return };
+                let Subscription::Pending { account, .. } = entry.get() else { return };
                 let account = *account;
-                let background = reply.is_none();
                 let Subscription::Pending { reply, cancel, .. } =
-                    entry.insert(Subscription::Active(remote, background))
+                    entry.insert(Subscription::Active(remote))
                 else {
                     unreachable!()
                 };
@@ -432,31 +384,16 @@ impl Registry {
                     *entry.get_mut() = Subscription::Releasing(cancel);
                     let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
                 } else {
-                    let _ = self
-                        .events
-                        .send(Event::Acknowledged {
-                            sub: account,
-                            at: Instant::now(),
-                            background,
-                        })
-                        .await;
+                    let _ = self.events.send(Event::Acknowledged(account)).await;
                 }
-                if let Some(reply) = reply {
-                    let _ = reply.send(Ok(()));
-                }
+                let _ = reply.send(Ok(()));
             }
             result => {
                 self.routes.remove(&pubkey);
                 self.occupied -= 1;
                 match entry.remove() {
                     Subscription::Pending { reply, cancel, .. } => {
-                        if let Some(reply) = reply {
-                            let _ = reply.send(result.map(|_| ()));
-                        } else if cancel.is_none() {
-                            if let Err(error) = result {
-                                tracing::warn!(%pubkey, %error, "WebSocket subscription rejected");
-                            }
-                        }
+                        let _ = reply.send(result.map(|_| ()));
                         if let Some(cancel) = cancel {
                             let _ = cancel.send(Ok(()));
                         }
@@ -464,7 +401,7 @@ impl Registry {
                     Subscription::Releasing(reply) => {
                         let _ = reply.send(result.map(|_| ()));
                     }
-                    Subscription::Active(_, _) => unreachable!(),
+                    Subscription::Active(_) => unreachable!(),
                 }
             }
         }

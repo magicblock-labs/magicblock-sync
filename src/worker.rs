@@ -4,7 +4,7 @@ mod coverage;
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap},
     hash::{Hash, Hasher},
-    sync::Weak,
+    sync::Arc,
 };
 
 use dlp_api::{args::PostDelegationActions, Decrypt};
@@ -13,24 +13,27 @@ use nucleus::shutdown::{ShutdownHandle, ShutdownReason};
 use solana_account::{AccountBuilder, AccountMode, StateFlags};
 use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc::Receiver, time};
+use tracing::{error, warn};
 
 use self::coverage::{Coverage, Source};
 use crate::{
-    delegation, grpc, program, websocket, AccountProperty, AccountSubscription, ChainSync, Error,
-    SyncAccount, DUPLICATION_DELAY,
+    delegation,
+    grpc::{self, Command},
+    program, websocket, AccountProperty, AccountSubscription, ChainSync, Error, SyncAccount,
+    DUPLICATION_DELAY,
 };
 
 impl ChainSync {
     /// Stable per-key assignment keeps a recently removed remote filter reusable.
-    fn grpc_stream(&self, pubkey: Pubkey) -> usize {
+    fn grpc_client(&self, pubkey: Pubkey) -> &grpc::Client {
         let mut hash = DefaultHasher::new();
         pubkey.hash(&mut hash);
-        hash.finish() as usize % self.grpc.len()
+        &self.grpc[hash.finish() as usize % self.grpc.len()]
     }
 
     /// Serializes source events, account application, and Engine eviction.
     pub(super) async fn run(
-        sync: Weak<Self>,
+        self: Arc<Self>,
         mut websocket: Receiver<websocket::Event>,
         mut grpc: Receiver<grpc::Event>,
         mut shutdown: ShutdownHandle,
@@ -38,70 +41,29 @@ impl ChainSync {
         let mut coverage = Coverage::default();
         let mut tick = time::interval(DUPLICATION_DELAY);
         tick.tick().await;
-        loop {
+        let reason = loop {
             let result = tokio::select! {
-                _ = shutdown.signalled() => {
-                    shutdown.terminate(ShutdownReason::Signalled);
-                    break;
+                biased;
+                _ = shutdown.signalled() => break ShutdownReason::Signalled,
+                Some(event) = websocket.recv() => {
+                    self.on_websocket(event, &mut coverage).await
                 }
-                event = websocket.recv() => {
-                    let Some(event) = event else {
-                        shutdown.terminate(ShutdownReason::Unexpected);
-                        break;
-                    };
-                    let Some(sync) = sync.upgrade() else { break; };
-                    sync.on_websocket(event, &mut coverage).await
-                }
-                event = grpc.recv() => {
-                    let Some(event) = event else {
-                        shutdown.terminate(ShutdownReason::Unexpected);
-                        break;
-                    };
-                    let Some(sync) = sync.upgrade() else { break; };
-                    match event {
-                        grpc::Event::Disconnected { stream, error } => {
-                            tracing::error!(stream, %error, "gRPC stream stopped");
-                            shutdown.terminate(ShutdownReason::Error(Box::new(error)));
-                            break;
-                        }
-                        event => sync.on_grpc(event, &mut coverage).await,
-                    }
+                Some(event) = grpc.recv() => {
+                    self.on_grpc(event, &mut coverage).await
                 }
                 _ = tick.tick() => {
-                    let Some(sync) = sync.upgrade() else { break; };
-                    sync.scan(&mut coverage).await
+                    for client in &self.grpc {
+                        client.command(Command::Rebuild);
+                    }
+                    continue;
                 }
             };
             if let Err(error) = result {
-                if matches!(error, Error::Grpc(_)) {
-                    shutdown.terminate(ShutdownReason::Error(Box::new(error)));
-                    break;
-                }
-                tracing::error!(%error, "subscription worker failed");
+                break ShutdownReason::Error(Box::new(error));
             }
-        }
-        if !shutdown.requested() {
-            shutdown.terminate(ShutdownReason::Unexpected);
-        }
-    }
-
-    /// Delivers changed gRPC filters and attempts missing WebSocket copies.
-    async fn scan(&self, coverage: &Coverage) -> Result<(), Error> {
-        for client in &self.grpc {
-            client.command(grpc::Command::Rebuild).await?;
-        }
-        for sub in coverage.missing_ws() {
-            self.websocket.subscribe_background(sub).await?;
-        }
-        Ok(())
-    }
-
-    /// Ends logical gRPC interest before its next remote filter rebuild.
-    async fn remove_grpc(&self, pubkey: Pubkey) -> Result<(), Error> {
-        self.grpc[self.grpc_stream(pubkey)]
-            .command(grpc::Command::Remove(pubkey))
-            .await?;
-        Ok(())
+        };
+        drop(self);
+        shutdown.terminate(reason);
     }
 
     /// Applies WebSocket coverage changes and filters buffered account updates.
@@ -111,18 +73,13 @@ impl ChainSync {
         coverage: &mut Coverage,
     ) -> Result<(), Error> {
         match event {
-            websocket::Event::Acknowledged { sub, at, background } => {
-                if let Some(generation) = coverage.acknowledged(sub, background) {
-                    self.grpc[self.grpc_stream(sub.pubkey)]
-                        .command(grpc::Command::Track(sub, generation, at))
-                        .await?;
-                } else if background {
-                    self.websocket.cancel_background(sub.pubkey).await?;
-                }
+            websocket::Event::Acknowledged(sub) => {
+                let gen = coverage.acknowledged(sub);
+                self.grpc_client(sub.pubkey).command(Command::Track { sub, gen });
             }
             websocket::Event::Removed(pubkey) => {
                 let target = coverage.removed(pubkey);
-                self.remove_grpc(pubkey).await?;
+                self.grpc_client(pubkey).command(Command::Remove(pubkey));
                 if let Some(target) = target {
                     self.evict(target).await?;
                 }
@@ -130,23 +87,33 @@ impl ChainSync {
             websocket::Event::Update { sub, account } => {
                 if coverage.ws_contains(sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        tracing::error!(source = "WS", %sub.pubkey, %error, "account update failed");
+                        error!(source = "WS", %sub.pubkey, %error, "account update failed");
                     }
                 }
             }
-            websocket::Event::Dropped { connection, pubkeys, error } => {
-                tracing::warn!(?connection, lost = pubkeys.len(), %error, "WebSocket subscriptions lost");
+            websocket::Event::Dropped { pubkeys, error } => {
+                warn!(lost = pubkeys.len(), %error, "WebSocket subscriptions lost");
                 for pubkey in pubkeys {
-                    let (ended, target) = coverage.lost(Source::WebSocket, pubkey);
-                    if ended {
-                        self.remove_grpc(pubkey).await?;
-                        self.websocket.cancel_background(pubkey).await?;
-                    }
-                    if let Some(target) = target {
-                        self.evict(target).await?;
-                    }
+                    self.lost(coverage, Source::WebSocket, pubkey).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Drops a source and ends gRPC interest if no confirmed copy survives.
+    async fn lost(
+        &self,
+        coverage: &mut Coverage,
+        source: Source,
+        pubkey: Pubkey,
+    ) -> Result<(), Error> {
+        let (ended, target) = coverage.lost(source, pubkey);
+        if ended {
+            self.grpc_client(pubkey).command(Command::Remove(pubkey));
+        }
+        if let Some(target) = target {
+            self.evict(target).await?;
         }
         Ok(())
     }
@@ -162,19 +129,12 @@ impl ChainSync {
     /// Applies per-stream coverage, account, and delegation lifecycle events.
     async fn on_grpc(&self, event: grpc::Event, coverage: &mut Coverage) -> Result<(), Error> {
         match event {
-            grpc::Event::Confirmed { stream, pubkey, generation } => {
-                coverage.confirmed(stream, pubkey, generation);
+            grpc::Event::Confirmed { stream, pubkey, gen } => {
+                coverage.confirmed(stream, pubkey, gen);
             }
             grpc::Event::Lost(stream) => {
                 for pubkey in coverage.stream_keys(stream) {
-                    let (ended, target) = coverage.lost(Source::Grpc, pubkey);
-                    if ended {
-                        self.remove_grpc(pubkey).await?;
-                        self.websocket.cancel_background(pubkey).await?;
-                    }
-                    if let Some(target) = target {
-                        self.evict(target).await?;
-                    }
+                    self.lost(coverage, Source::Grpc, pubkey).await?;
                 }
             }
             grpc::Event::Update { stream, pubkey, target, account } => {
@@ -198,7 +158,6 @@ impl ChainSync {
                     }
                 }
             }
-            grpc::Event::Disconnected { error, .. } => return Err(error.into()),
         }
         Ok(())
     }

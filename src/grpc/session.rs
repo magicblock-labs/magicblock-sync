@@ -15,7 +15,10 @@ use dlp_api::state::{
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver},
+    time::Instant,
+};
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcClient, GeyserGrpcClientError, ReconnectConfig, SubscribeRequestSink,
 };
@@ -59,9 +62,9 @@ struct Desired {
     /// Exact key and optional ProgramData target.
     sub: AccountSubscription,
     /// Owner-issued logical subscription generation.
-    generation: u64,
-    /// WS acknowledgement that starts the duplication delay.
-    since: Instant,
+    gen: u64,
+    /// Receipt of the track command that starts the duplication delay.
+    ts: Instant,
 }
 
 impl Session {
@@ -85,23 +88,25 @@ impl Session {
         })
     }
 
-    /// Reports a terminal stream failure after earlier queued events.
-    pub(super) async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+    /// Returns a terminal stream failure after reporting lost coverage.
+    pub(super) async fn run(
+        mut self,
+        mut commands: UnboundedReceiver<Command>,
+    ) -> Result<(), Error> {
         loop {
-            let Err(error) = self.subscribe(&mut commands).await else { return };
+            let Err(error) = self.subscribe(&mut commands).await else { return Ok(()) };
             let _ = self.events.send(Event::Lost(self.id)).await;
             if recoverable(&error) {
                 tracing::warn!(%error, "gRPC unavailable; retrying");
                 tokio::time::sleep(RETRY_DELAY).await;
             } else {
-                let _ = self.events.send(Event::Disconnected { stream: self.id, error }).await;
-                return;
+                return Err(error);
             }
         }
     }
 
     /// Lets Yellowstone reconnect while processing filter changes and updates.
-    async fn subscribe(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<(), Error> {
+    async fn subscribe(&mut self, commands: &mut UnboundedReceiver<Command>) -> Result<(), Error> {
         let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
             .connect_timeout(TIMEOUT)
@@ -119,10 +124,10 @@ impl Session {
             .desired
             .iter()
             .filter_map(|(&pubkey, entry)| {
-                self.accounts.contains(pubkey).then_some((pubkey, entry.generation))
+                self.accounts.contains(pubkey).then_some((pubkey, entry.gen))
             })
             .collect();
-        self.confirm(current).await?;
+        self.confirm(current).await;
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -130,8 +135,8 @@ impl Session {
                     self.command(command, &mut sink).await?;
                 }
                 update = stream.next() => {
-                    let update = update.ok_or(Error::Closed)??;
-                    self.process(update, &mut sink).await?;
+                    let update = update.ok_or(Error::Closed)?;
+                    self.process(update?, &mut sink).await?;
                 }
             }
         }
@@ -155,8 +160,7 @@ impl Session {
 
     /// Sends the complete current physical filter on the live stream.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<(), Error> {
-        sink.send(self.request()).await?;
-        Ok(())
+        sink.send(self.request()).await.map_err(Into::into)
     }
 
     /// Answers a heartbeat, then restores the full subscription request.
@@ -176,7 +180,7 @@ impl Session {
         let pubkeys = transaction::released(&transaction)?;
         if !pubkeys.is_empty() {
             let event = Event::Undelegated { pubkeys, slot: update.slot };
-            self.send(event).await?;
+            self.send(event).await;
         }
         Ok(())
     }
@@ -188,10 +192,11 @@ impl Session {
         sink: &mut SubscribeRequestSink,
     ) -> Result<(), Error> {
         match command {
-            Command::Track(sub, generation, since) => {
-                self.desired.insert(sub.pubkey, Desired { sub, generation, since });
+            Command::Track { sub, gen } => {
+                let entry = Desired { sub, gen, ts: Instant::now() };
+                self.desired.insert(sub.pubkey, entry);
                 if self.accounts.contains(sub.pubkey) {
-                    self.confirm([(sub.pubkey, generation)]).await?;
+                    self.confirm([(sub.pubkey, gen)]).await;
                 }
             }
             Command::Remove(pubkey) => {
@@ -201,7 +206,7 @@ impl Session {
                 let added = self.sync_filter()?;
                 if let Some(added) = added {
                     self.refresh(sink).await?;
-                    self.confirm(added).await?;
+                    self.confirm(added).await;
                 }
             }
         }
@@ -221,28 +226,19 @@ impl Session {
         }
         let mut added = Vec::new();
         for (&pubkey, entry) in &self.desired {
-            if !self.accounts.contains(pubkey) && entry.since.elapsed() >= DUPLICATION_DELAY {
+            if !self.accounts.contains(pubkey) && entry.ts.elapsed() >= DUPLICATION_DELAY {
                 self.accounts.insert(pubkey)?;
-                added.push((pubkey, entry.generation));
+                added.push((pubkey, entry.gen));
             }
         }
         Ok((!remove.is_empty() || !added.is_empty()).then_some(added))
     }
 
     /// Reports account filter delivery to the single coverage owner.
-    async fn confirm(
-        &self,
-        confirmations: impl IntoIterator<Item = (Pubkey, u64)>,
-    ) -> Result<(), Error> {
-        for (pubkey, generation) in confirmations {
-            self.send(Event::Confirmed {
-                stream: self.id,
-                pubkey,
-                generation,
-            })
-            .await?;
+    async fn confirm(&self, confirmations: impl IntoIterator<Item = (Pubkey, u64)>) {
+        for (pubkey, gen) in confirmations {
+            self.send(Event::Confirmed { stream: self.id, pubkey, gen }).await;
         }
-        Ok(())
     }
 
     /// Sends the exact retained-account filter alongside DLP delegation discovery and
@@ -309,36 +305,33 @@ impl Session {
                 target: desired.sub.target,
                 account: image,
             };
-            self.send(event).await?;
+            self.send(event).await;
         }
         if !candidate {
             return Ok(());
         }
         if let Some(record) = crate::delegation::record(&account.data) {
             if let Some(delegation) = self.delegations.record(key, &account, record)? {
-                self.delegated(delegation).await?;
+                self.delegated(delegation).await;
             }
         }
         // Application data can resemble a record. Only a matching record PDA
         // establishes its role, so the update may be considered both ways.
         if let Some(delegation) = self.delegations.account(key, account) {
-            self.delegated(delegation).await?;
+            self.delegated(delegation).await;
         }
         Ok(())
     }
 
     /// Raises the shared watermark for a resolved delegation before delivery.
-    async fn delegated(&self, delegation: Delegation) -> Result<(), Error> {
+    async fn delegated(&self, delegation: Delegation) {
         self.watermark.fetch_max(delegation.account.read().slot(), Relaxed);
-        self.send(Event::Delegated(delegation)).await
+        self.send(Event::Delegated(delegation)).await;
     }
 
-    /// Bounds consumer backpressure so a stalled receiver terminates the stream.
-    async fn send(&self, event: Event) -> Result<(), Error> {
-        tokio::time::timeout(EVENT_DELIVERY_TIMEOUT, self.events.send(event))
-            .await
-            .map_err(|_| Error::EventDeliveryTimeout)?
-            .map_err(|_| Error::Closed)
+    /// Sends an event to the coverage owner.
+    async fn send(&self, event: Event) {
+        let _ = self.events.send(event).await;
     }
 }
 
@@ -368,8 +361,6 @@ fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
 
 /// Yellowstone transport request and connection budget.
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// Bounds local event-consumer backpressure independently of transport timeouts.
-const EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before reconnecting after a recoverable transport failure.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 

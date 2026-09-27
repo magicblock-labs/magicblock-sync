@@ -85,13 +85,8 @@ pub(super) struct Connection {
 
 /// Account and connection events, ordered within each connection only.
 pub(super) enum Event {
-    /// Server acknowledged a user subscription at `at`.
-    Acknowledged {
-        sub: AccountSubscription,
-        at: tokio::time::Instant,
-        /// Background acknowledgements cannot start a new logical subscription.
-        background: bool,
-    },
+    /// Server acknowledged a user subscription.
+    Acknowledged(AccountSubscription),
     /// Caller requested intentional removal, before server acknowledgement.
     Removed(Pubkey),
     /// Confirmed update builder in `Uninit` mode for caller classification.
@@ -103,8 +98,6 @@ pub(super) enum Event {
     },
     /// Lost subscriptions; earlier queued updates precede this event.
     Dropped {
-        /// Failed attempt identity; its replacement has a new generation.
-        connection: Connection,
         /// Lost user subscriptions, excluding internal `Clock` and cancelled operations.
         pubkeys: Vec<Pubkey>,
         /// Cause of loss, including event-delivery failure.

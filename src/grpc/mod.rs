@@ -23,8 +23,6 @@ use yellowstone_grpc_proto::{
 pub enum Error {
     #[error("gRPC client closed")]
     Closed,
-    #[error("gRPC event delivery timed out")]
-    EventDeliveryTimeout,
     #[error("gRPC protocol: {0}")]
     Protocol(&'static str),
     #[error(transparent)]
@@ -86,22 +84,14 @@ pub(super) enum Event {
         /// Exact retained account key.
         pubkey: Pubkey,
         /// Owner-issued identity of the current logical subscription.
-        generation: u64,
+        gen: u64,
     },
     /// The outer stream attempt ended; Yellowstone's internal reconnect does not emit this.
     Lost(usize),
-    /// Terminal stream failure; queued events precede it.
-    Disconnected {
-        /// Stream that cannot recover.
-        stream: usize,
-        /// Terminal transport or protocol cause.
-        error: Error,
-    },
 }
 
 pub(super) use client::Client;
 pub(super) use client::Command;
-pub(super) use client::EVENT_CAPACITY;
 pub(super) use delegation::Delegation;
 
 /// Validates a provider public key at the stream boundary.

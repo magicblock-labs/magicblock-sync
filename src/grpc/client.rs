@@ -1,7 +1,8 @@
 use std::sync::{atomic::AtomicU64, Arc};
 
+use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
 use solana_pubkey::Pubkey;
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use tokio::sync::mpsc;
 
 use super::{session::Session, Error, Event, StreamConfig};
 use crate::AccountSubscription;
@@ -9,27 +10,15 @@ use crate::AccountSubscription;
 /// One serialized change to a stream's logical account interest.
 pub(crate) enum Command {
     /// Tracks an acknowledged WS account until its filter becomes eligible.
-    Track(AccountSubscription, u64, Instant),
+    Track { sub: AccountSubscription, gen: u64 },
     /// Ends logical interest immediately; remote removal waits for a rebuild.
     Remove(Pubkey),
     /// Sends the full filter only when aged additions or removals changed it.
     Rebuild,
 }
 
-/// Control handle and lifetime owner for one Yellowstone stream.
-pub(crate) struct Client {
-    /// Aborted when the synchronizer drops this handle.
-    handle: JoinHandle<()>,
-    /// Ordered stream commands.
-    commands: mpsc::Sender<Command>,
-}
-
-impl Drop for Client {
-    /// Stops stream I/O when its control handle is released.
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
+/// Control handle for one shutdown-managed Yellowstone stream.
+pub(crate) struct Client(mpsc::UnboundedSender<Command>);
 
 impl Client {
     /// Starts one stream while sharing ordered events and the HTTP freshness watermark.
@@ -39,25 +28,27 @@ impl Client {
         authority: Pubkey,
         slot: Arc<AtomicU64>,
         events: mpsc::Sender<Event>,
+        manager: &mut ShutdownManager,
     ) -> Result<Self, Error> {
-        let (commands, requests) = mpsc::channel(COMMAND_CAPACITY);
+        let (commands, requests) = mpsc::unbounded_channel();
         let session = Session::new(id, config, authority, slot, events.clone())?;
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = events.closed() => {},
-                _ = session.run(requests) => {},
-            }
+        let mut shutdown = manager.handle(Service::ChainSyncGrpc(id));
+        tokio::spawn(async move {
+            let reason = tokio::select! {
+                biased;
+                _ = shutdown.signalled() => ShutdownReason::Signalled,
+                result = session.run(requests) => match result {
+                    Ok(()) => ShutdownReason::Unexpected,
+                    Err(error) => ShutdownReason::Error(Box::new(error)),
+                },
+            };
+            shutdown.terminate(reason);
         });
-        Ok(Self { commands, handle })
+        Ok(Self(commands))
     }
 
     /// Queues a logical change without waiting for remote filter delivery.
-    pub(crate) async fn command(&self, command: Command) -> Result<(), Error> {
-        self.commands.send(command).await.map_err(|_| Error::Closed)
+    pub(crate) fn command(&self, command: Command) {
+        let _ = self.0.send(command);
     }
 }
-
-/// Maximum queued logical changes per Yellowstone stream.
-const COMMAND_CAPACITY: usize = 8192;
-/// Maximum queued account and lifecycle events from all streams.
-pub(crate) const EVENT_CAPACITY: usize = 8192;

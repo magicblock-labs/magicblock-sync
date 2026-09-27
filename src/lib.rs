@@ -3,7 +3,8 @@
 //! [`ChainSync`] subscribes before fetching missing read-only accounts and payers.
 //! Writable accounts are fetched with their delegation records but not subscribed over
 //! WebSocket. Acknowledged WebSocket subscriptions gain one load-balanced gRPC copy
-//! after 30 minutes. A gRPC-only account keeps trying to restore WebSocket coverage.
+//! after 30 minutes of gRPC tracking. An account can remain covered by gRPC alone
+//! if its WebSocket subscription is lost.
 //! Ordinary accounts enter Engine in `Uninit` mode; executable programs enter as
 //! read-only ELF accounts. A background worker applies WebSocket and gRPC events.
 //! A later base-chain update can recreate an undelegated account.
@@ -36,7 +37,7 @@ use url::Url;
 use crate::http::Fetcher;
 use crate::websocket::Pool;
 
-/// WS acknowledgement age and cadence for gRPC filter and WS restoration scans.
+/// gRPC duplication delay and filter scan cadence.
 const DUPLICATION_DELAY: Duration = Duration::from_secs(30 * 60);
 
 pub use grpc::{Config as GrpcConfig, Error as GrpcError, StreamConfig as GrpcStreamConfig};
@@ -118,7 +119,7 @@ pub enum Error {
 
 impl ChainSync {
     /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
-    /// The worker is registered with Engine's coordinated shutdown manager.
+    /// The worker and transports join Engine's coordinated shutdown.
     pub fn new(
         engine: Engine,
         config: ChainSyncConfig,
@@ -127,10 +128,10 @@ impl ChainSync {
         if config.grpc.streams.is_empty() {
             return Err(Error::NoGrpcStreams);
         }
-        let (websocket, websocket_rx) = Pool::new(config.websocket);
+        let (websocket, websocket_rx) = Pool::new(config.websocket, shutdown);
         let slot = websocket.slot();
         let fetcher = Fetcher::new(config.http, Arc::clone(&slot))?;
-        let (events, grpc_rx) = mpsc::channel(grpc::EVENT_CAPACITY);
+        let (events, grpc_rx) = mpsc::channel(8192);
         let authority = config.grpc.authority;
         let grpc = config
             .grpc
@@ -138,13 +139,20 @@ impl ChainSync {
             .into_iter()
             .enumerate()
             .map(|(id, stream)| {
-                grpc::Client::new(id, stream, authority, Arc::clone(&slot), events.clone())
+                grpc::Client::new(
+                    id,
+                    stream,
+                    authority,
+                    Arc::clone(&slot),
+                    events.clone(),
+                    shutdown,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let sync = Arc::new(Self { engine, fetcher, websocket, grpc });
-        let shutdown = shutdown.handle(Service::ChainSync);
+        let shutdown = shutdown.handle(Service::ChainSyncWorker);
         tokio::spawn(Self::run(
-            Arc::downgrade(&sync),
+            Arc::clone(&sync),
             websocket_rx,
             grpc_rx,
             shutdown,
@@ -159,8 +167,8 @@ impl ChainSync {
     /// Programs include ProgramData; writable accounts and payers include their
     /// derived delegation record. Records are fetched only. A payer's WebSocket
     /// subscription is removed when its initial snapshot resolves as delegated here.
-    /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes.
-    /// A gRPC-only subscription periodically retries WebSocket restoration.
+    /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes of tracking.
+    /// A gRPC-only subscription remains covered without a WebSocket copy.
     ///
     /// An account is resolved as delegated only when its primary and delegation-record
     /// snapshots are DLP-owned and the record names this Engine. Other snapshots retain
