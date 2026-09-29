@@ -127,7 +127,7 @@ impl Delegations {
                 return Some(account.resolve(record, self.slot));
             }
             // An irrelevant record blocks activation for this slot; otherwise keep
-            // the newest unmatched update for a later counterpart.
+            // the newest unmatched update for a later counterpart in that same slot.
             (Ignored, _) | (_, Ignored) => Ignored,
             (_, pending) => pending,
         };

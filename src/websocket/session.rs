@@ -357,6 +357,7 @@ impl Session {
             Command::Subscribe(account) => {
                 let remote =
                     result.as_u64().ok_or(Error::Protocol("invalid remote subscription ID"))?;
+                // Route notifications before waking the pool's subscribe waiter.
                 if self.active.insert(remote, account).is_some() {
                     return Err(Error::Protocol("duplicate remote subscription ID"));
                 }

@@ -41,6 +41,8 @@ impl ChainSync {
         let mut coverage = Coverage::default();
         let mut tick = time::interval(DUPLICATION_DELAY);
         tick.tick().await;
+        // Coverage changes and account application share this loop so buffered updates
+        // cannot overtake a source removal or revive an evicted target.
         let reason = loop {
             let result = tokio::select! {
                 biased;
@@ -155,9 +157,19 @@ impl ChainSync {
 
     /// Loads dependencies for delegated actions before materializing the delegated account.
     pub(super) async fn delegated(&self, delegation: grpc::Delegation) -> Result<()> {
+        let (prepared, dependencies) = self.prepare_delegation(delegation)?;
+        self.sync(dependencies).await?;
+        self.materialize_delegation(prepared).await
+    }
+
+    /// Decodes action dependencies without acquiring the delegated account's lease.
+    pub(super) fn prepare_delegation(
+        &self,
+        delegation: grpc::Delegation,
+    ) -> Result<(PreparedDelegation, Vec<SyncAccount>)> {
         let grpc::Delegation { pubkey, account, record } = delegation;
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
-        let actions = if !appended.is_empty() {
+        let (actions, dependencies) = if !appended.is_empty() {
             let compact: PostDelegationActions = borsh::from_slice(appended)?;
             let actions = compact.decrypt_with_keypair(self.engine.signer())?;
             let mut dependencies = BTreeMap::new();
@@ -171,19 +183,29 @@ impl ChainSync {
                     }
                 }
             }
-            // The target is acquired after its other action dependencies.
+            // The target must not hold its lease while these dependencies are acquired.
             dependencies.remove(&pubkey);
             let dependencies = dependencies
                 .into_iter()
                 .map(|(pubkey, property)| SyncAccount { pubkey, property });
-            self.sync(dependencies).await?;
             let source_program = account.read().owner();
-            Some(PostFinalize { source_program, actions })
+            (
+                Some(PostFinalize { source_program, actions }),
+                dependencies.collect(),
+            )
         } else {
-            None
+            (None, Vec::new())
         };
-        let accessor = self.engine.account(pubkey).await?;
-        accessor.materialize(account, actions).await?;
+        Ok((
+            PreparedDelegation { pubkey, account, actions },
+            dependencies,
+        ))
+    }
+
+    /// Acquires only the target after its action dependencies have resolved.
+    pub(super) async fn materialize_delegation(&self, prepared: PreparedDelegation) -> Result<()> {
+        let PreparedDelegation { pubkey, account, actions } = prepared;
+        self.engine.account(pubkey).await?.materialize(account, actions).await?;
         Ok(())
     }
 
@@ -220,4 +242,11 @@ impl ChainSync {
         accessor.materialize(account, None).await?;
         Ok(())
     }
+}
+
+/// Delegated image and trusted actions ready to apply after dependency acquisition.
+pub(super) struct PreparedDelegation {
+    pubkey: Pubkey,
+    account: AccountBuilder,
+    actions: Option<PostFinalize>,
 }

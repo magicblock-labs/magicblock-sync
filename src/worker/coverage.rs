@@ -69,6 +69,7 @@ impl Coverage {
             }
             Source::Grpc => entry.grpc = None,
         }
+        // Losing WebSocket alone does not evict an account with a confirmed gRPC copy.
         if entry.ws || entry.grpc.is_some() {
             return (false, None);
         }

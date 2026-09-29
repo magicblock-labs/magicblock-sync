@@ -94,6 +94,8 @@ impl Fetcher {
     /// Transient failures retry within a ten-second budget. Malformed responses
     /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
+        // Fix the floor for all provider attempts in this fetch; a failover must not
+        // retry against a snapshot older than the one this call required.
         let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
         let deadline = Instant::now() + OVERALL;
         let params = BatchParams(
@@ -118,6 +120,7 @@ impl Fetcher {
             if !retry {
                 return Err(error);
             }
+            // Cooldown is provider-wide, so concurrent batches avoid the same failing endpoint.
             let until = (self.epoch.elapsed() + COOLDOWN).as_millis() as u64;
             provider.until.fetch_max(until, Relaxed);
             last = Some(Box::new(error));

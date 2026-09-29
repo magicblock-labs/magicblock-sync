@@ -52,8 +52,15 @@ enum Subscription {
         /// Unsubscribe waiter if removal overtook the subscribe acknowledgement.
         cancel: Option<Reply>,
     },
-    /// Acknowledged subscription with its provider ID.
-    Active(u64),
+    /// Acknowledged subscription shared by identical acquisition requests.
+    Active {
+        /// Provider subscription ID used for final release.
+        remote: u64,
+        /// Exact subscription identity; a different target cannot share it.
+        account: AccountSubscription,
+        /// Callers that still own this subscription across a lease handoff.
+        owners: usize,
+    },
     /// Release following an acknowledged or cancelled subscription.
     Releasing(Reply),
 }
@@ -148,7 +155,7 @@ impl Pool {
     }
 
     /// Subscribes until server acknowledgement, not an initial snapshot.
-    /// `ChainSync` owns admission and supplies distinct non-Clock keys.
+    /// `ChainSync` owns admission; identical active requests share one provider ID.
     /// The target is retained in queued updates, including those buffered before
     /// an unsubscribe completes.
     ///
@@ -158,7 +165,7 @@ impl Pool {
         self.request(SubscriptionRequest::Subscribe, account).await
     }
 
-    /// Releases a subscription, including an in-flight attempt.
+    /// Releases one owner, removing the provider subscription after the last owner.
     /// Do not overlap ordinary subscribe and unsubscribe operations for the same key.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
@@ -216,16 +223,30 @@ impl Registry {
                     let Some(request) = request else { return };
                     match request {
                         SubscriptionRequest::Subscribe(account, reply) => {
-                            if self.routes.contains_key(&account.pubkey) {
-                                // The old request must release its provider ID before this key can be reused.
-                                let _ = reply.send(Err(Error::Unavailable));
+                            if let Some(&index) = self.routes.get(&account.pubkey) {
+                                // Two acquisition waves can share one acknowledged subscription
+                                // while an incomplete primary is re-leased for its companion.
+                                match self.sockets[index].accounts.get_mut(&account.pubkey) {
+                                    Some(Subscription::Active { account: current, owners, .. })
+                                        if *current == account =>
+                                    {
+                                        *owners += 1;
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    _ => {
+                                        let _ = reply.send(Err(Error::Unavailable));
+                                    }
+                                }
                             } else {
                                 self.subscribe(account, reply);
                             }
                         }
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
-                            // Logical removal precedes remote acknowledgement and buffered updates.
-                            let _ = self.events.send(Event::Removed(pubkey)).await;
+                            if self.last_owner(pubkey) {
+                                // Queue logical removal before remote release so later
+                                // buffered updates fail the worker's coverage check.
+                                let _ = self.events.send(Event::Removed(pubkey)).await;
+                            }
                             self.unsubscribe(pubkey, reply);
                         }
                     }
@@ -233,6 +254,15 @@ impl Registry {
                 Some(notice) = notices.recv() => self.notice(notice).await,
             }
         }
+    }
+
+    /// Only the final active owner ends logical coverage.
+    fn last_owner(&self, pubkey: Pubkey) -> bool {
+        let Some(&index) = self.routes.get(&pubkey) else { return false };
+        matches!(
+            self.sockets[index].accounts.get(&pubkey),
+            Some(Subscription::Active { owners: 1, .. })
+        )
     }
 
     /// Reserves capacity before waiting for remote acknowledgement.
@@ -273,7 +303,11 @@ impl Registry {
         let socket = &mut self.sockets[index];
         let Some(state) = socket.accounts.get_mut(&pubkey) else { return };
         match state {
-            Subscription::Active(remote) => {
+            Subscription::Active { owners, .. } if *owners > 1 => {
+                *owners -= 1;
+                let _ = reply.send(Ok(()));
+            }
+            Subscription::Active { remote, .. } => {
                 let remote = *remote;
                 *state = Subscription::Releasing(reply);
                 // If I/O has just stopped, its queued loss notice completes this waiter.
@@ -340,7 +374,7 @@ impl Registry {
                                 let _ = reply.send(Err(Error::Disconnected));
                                 false
                             }
-                            Subscription::Active(_) => true,
+                            Subscription::Active { .. } => true,
                         };
                         report.then_some(pubkey)
                     })
@@ -376,11 +410,12 @@ impl Registry {
                 let Subscription::Pending { account, .. } = entry.get() else { return };
                 let account = *account;
                 let Subscription::Pending { reply, cancel, .. } =
-                    entry.insert(Subscription::Active(remote))
+                    entry.insert(Subscription::Active { remote, account, owners: 1 })
                 else {
                     unreachable!()
                 };
                 if let Some(cancel) = cancel {
+                    // A release raced the subscribe acknowledgement; never publish coverage.
                     *entry.get_mut() = Subscription::Releasing(cancel);
                     let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
                 } else {
@@ -401,7 +436,7 @@ impl Registry {
                     Subscription::Releasing(reply) => {
                         let _ = reply.send(result.map(|_| ()));
                     }
-                    Subscription::Active(_) => unreachable!(),
+                    Subscription::Active { .. } => unreachable!(),
                 }
             }
         }

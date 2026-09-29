@@ -53,6 +53,7 @@ pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[
     };
     let dlp = dlp_api::id();
     let outer = message.instructions.iter().map(Instruction::from);
+    // Inner instructions use the same static key table as top-level instructions.
     let inner = meta
         .inner_instructions
         .iter()

@@ -17,6 +17,7 @@ pub(super) fn normalize_batch(
     for &(index, data_index) in programs {
         let Some(program) = accounts[index].take() else { continue };
         let program_data = accounts[data_index].take();
+        // A V3 companion supplies the executable image; neither raw image is materialized.
         accounts[index].replace(normalize(program, program_data, rent)?);
     }
     Ok(())

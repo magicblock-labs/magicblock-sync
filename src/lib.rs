@@ -170,6 +170,9 @@ impl ChainSync {
     /// Programs include ProgramData; writable accounts and payers include their
     /// derived delegation record. Records are fetched only. A payer's WebSocket
     /// subscription is removed when its initial snapshot resolves as delegated here.
+    /// Read-only DLP-owned accounts and executable Loader V3 programs are refetched
+    /// with their derived companions before materialization; a read-only subscription
+    /// is also removed when its account resolves as delegated here.
     /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes of tracking.
     /// A gRPC-only subscription remains covered without a WebSocket copy.
     ///
@@ -185,28 +188,8 @@ impl ChainSync {
         I: IntoIterator,
         I::Item: Borrow<SyncAccount>,
     {
-        let mut accounts: Vec<_> = requests.into_iter().map(|account| *account.borrow()).collect();
-        accounts.sort_unstable_by_key(|account| account.pubkey);
-        accounts.dedup_by_key(|account| account.pubkey);
-
-        // Bound each acquisition wave so its primary keys and companions fit one RPC batch.
-        let mut start = 0;
-        while start < accounts.len() {
-            let mut end = start;
-            let mut size = 0;
-            while let Some(account) = accounts.get(end) {
-                let added = 1 + usize::from(account.property != AccountProperty::Readonly);
-                if size + added > 100 {
-                    break;
-                }
-                size += added;
-                end += 1;
-            }
-            let batch = &accounts[start..end];
-            start = end;
-            self.sync_batch(batch).await?;
-        }
-        Ok(())
+        let accounts = requests.into_iter().map(|account| *account.borrow()).collect();
+        self.sync_waves(accounts).await
     }
 }
 

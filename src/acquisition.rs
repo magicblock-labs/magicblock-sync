@@ -1,5 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use dlp_api::pda::delegation_record_pda_from_delegated_account;
 use futures::future;
+use solana_account::StateFlags;
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
@@ -10,28 +13,139 @@ use crate::{
 };
 
 impl ChainSync {
-    /// Acquires missing accounts and applies the fetched snapshot and any delegation actions.
-    pub(super) async fn sync_batch(&self, batch: &[SyncAccount]) -> Result<()> {
+    /// Resolves each acquisition wave before applying actions that depend on later waves.
+    pub(super) async fn sync_waves(&self, mut accounts: Vec<SyncAccount>) -> Result<()> {
+        let mut carried = BTreeSet::new();
+        let mut floor = None;
+        let mut deferred = Vec::new();
+        while !accounts.is_empty() {
+            accounts.sort_unstable_by_key(|account| account.pubkey);
+            accounts.dedup_by_key(|account| account.pubkey);
+            let mut promotions = Vec::new();
+            let mut next_floor = None;
+            let mut actions = Vec::new();
+            let mut start = 0;
+            while start < accounts.len() {
+                // Companions consume RPC positions even though Engine leases only primaries.
+                let mut end = start;
+                let mut size = 0;
+                while let Some(account) = accounts.get(end) {
+                    let added = 1 + usize::from(account.property != AccountProperty::Readonly);
+                    if size + added > 100 {
+                        break;
+                    }
+                    size += added;
+                    end += 1;
+                }
+                let batch = &accounts[start..end];
+                let outcome = match self.sync_batch(batch, &carried, floor).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.unsubscribe(carried.into_iter().chain(
+                            promotions.into_iter().map(|account: SyncAccount| account.pubkey),
+                        ))
+                        .await;
+                        return Err(error);
+                    }
+                };
+                next_floor = next_floor.max(outcome.slot);
+                promotions.extend(outcome.promotions);
+                actions.extend(outcome.actions);
+                for request in batch {
+                    carried.remove(&request.pubkey);
+                }
+                start = end;
+            }
+
+            let mut next = BTreeMap::new();
+            floor = next_floor;
+            // Every batch lease is gone before dependencies can acquire overlapping keys.
+            for account in promotions {
+                let SyncAccount { pubkey, property } = account;
+                next.insert(pubkey, property);
+                carried.insert(pubkey);
+            }
+            let mut ready = Vec::new();
+            for PendingDelegation { delegation, unsubscribe } in actions {
+                let pubkey = delegation.pubkey;
+                let (prepared, dependencies) = match self.prepare_delegation(delegation) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.unsubscribe(carried).await;
+                        return Err(error);
+                    }
+                };
+                for SyncAccount { pubkey, property } in dependencies {
+                    // Keep the stronger companion request when actions name the same key.
+                    let current = next.entry(pubkey).or_insert(property);
+                    if property == AccountProperty::Program
+                        || (*current == AccountProperty::Readonly
+                            && property == AccountProperty::Writable)
+                    {
+                        *current = property;
+                    }
+                }
+                ready.push((prepared, pubkey, unsubscribe));
+            }
+            // The final reverse traverses dependency waves first, but keeps peers in order.
+            deferred.extend(ready.into_iter().rev());
+            if next.is_empty() {
+                break;
+            }
+            accounts = next
+                .into_iter()
+                .map(|(pubkey, property)| SyncAccount { pubkey, property })
+                .collect();
+        }
+        // A dependency's own actions must finish before the action that requested it.
+        for (prepared, pubkey, unsubscribe) in deferred.into_iter().rev() {
+            self.materialize_delegation(prepared).await?;
+            if unsubscribe {
+                self.unsubscribe([pubkey]).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Acquires missing accounts and reports follow-up work after releasing their leases.
+    async fn sync_batch(
+        &self,
+        batch: &[SyncAccount],
+        carried: &BTreeSet<Pubkey>,
+        min_slot: Option<u64>,
+    ) -> Result<BatchOutcome> {
         // Engine rechecks presence under ordered leases, preventing overlapping syncs from
         // fetching the same missing accounts.
         let keys: Vec<_> = batch.iter().map(|account| account.pubkey).collect();
         let accessors = self.engine.missing_accounts(&keys).await?;
+        // A competing wave may have materialized a promoted key while its lease was released.
+        let skipped: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| {
+                carried.contains(key) && !accessors.iter().any(|accessor| accessor.pubkey() == *key)
+            })
+            .collect();
         if accessors.is_empty() {
-            return Ok(());
+            self.unsubscribe(skipped).await;
+            return Ok(BatchOutcome::default());
         }
-        let plan = FetchPlan::new(batch, accessors);
-        let (mut snapshot, prune) = self.fetch_batch(&plan).await?;
-        let actions = self.materialize_batch(plan, &mut snapshot).await?;
-        self.apply_delegations(actions).await?;
-        self.unsubscribe(prune).await;
-        Ok(())
+        let plan = FetchPlan::new(batch, accessors, carried);
+        let (mut snapshot, prune) = self.fetch_batch(&plan, min_slot).await?;
+        let outcome = self.materialize_batch(plan, &mut snapshot, carried).await?;
+        self.unsubscribe(prune.into_iter().chain(skipped)).await;
+        Ok(outcome)
     }
 
     /// Subscribes, fetches, and normalizes planned accounts, cleaning up subscriptions on failure.
-    async fn fetch_batch(&self, plan: &FetchPlan<'_>) -> Result<(Snapshot, Vec<Pubkey>)> {
+    async fn fetch_batch(
+        &self,
+        plan: &FetchPlan<'_>,
+        min_slot: Option<u64>,
+    ) -> Result<(Snapshot, Vec<Pubkey>)> {
         self.subscribe(&plan.subscriptions).await?;
         let result = async {
-            let mut snapshot = self.fetcher.fetch(&plan.keys, None).await?;
+            let mut snapshot = self.fetcher.fetch(&plan.keys, min_slot).await?;
             let prune = plan.pruned_subscriptions(&snapshot);
             program::normalize_batch(&plan.programs, &mut snapshot.accounts, self.engine.rent())?;
             Ok((snapshot, prune))
@@ -44,16 +158,38 @@ impl ChainSync {
         result
     }
 
-    /// Materializes snapshot accounts and returns delegated accounts with deferred actions.
+    /// Materializes complete snapshots and defers readonly discoveries and action targets.
     async fn materialize_batch(
         &self,
         plan: FetchPlan<'_>,
         snapshot: &mut Snapshot,
-    ) -> Result<Vec<PendingDelegation>> {
-        let mut actions = Vec::new();
+        carried: &BTreeSet<Pubkey>,
+    ) -> Result<BatchOutcome> {
+        let mut outcome = BatchOutcome::default();
         for pending in plan.accounts {
             let pubkey = pending.accessor.pubkey();
             let account = snapshot.accounts[pending.index].take().unwrap_or_default();
+            if pending.property == AccountProperty::Readonly {
+                let image = account.read();
+                // These roles request a companion on the next wave without changing
+                // the original readonly subscription's ownership.
+                let property = if image.owner() == dlp_api::id() {
+                    Some(AccountProperty::Writable)
+                } else if image.owner() == bpf_loader_upgradeable::ID
+                    && image.flags().contains(StateFlags::EXECUTABLE)
+                {
+                    Some(AccountProperty::Program)
+                } else {
+                    None
+                };
+                if let Some(property) = property {
+                    // Do not install an incomplete image: the next wave refetches the primary
+                    // beside its newly discovered companion under a fresh Engine lease.
+                    outcome.promotions.push(SyncAccount { pubkey, property });
+                    outcome.slot = outcome.slot.max(Some(image.slot()));
+                    continue;
+                }
+            }
             let delegation = pending.record_index.and_then(|index| {
                 delegation::snapshot_record(
                     &account,
@@ -67,35 +203,23 @@ impl ChainSync {
             };
             let account = delegation::account(account, metadata.owner, metadata.delegation_slot);
             if delegation::appended(record).is_some_and(|actions| !actions.is_empty()) {
-                actions.push(PendingDelegation {
+                outcome.actions.push(PendingDelegation {
                     delegation: grpc::Delegation {
                         pubkey,
                         account,
                         record: record.to_vec(),
                     },
-                    payer: pending.property == AccountProperty::Payer,
+                    unsubscribe: pending.property == AccountProperty::Payer
+                        || carried.contains(&pubkey),
                 });
             } else {
                 pending.accessor.materialize(account, None).await?;
-                if pending.property == AccountProperty::Payer {
+                if pending.property == AccountProperty::Payer || carried.contains(&pubkey) {
                     self.unsubscribe([pubkey]).await;
                 }
             }
         }
-        Ok(actions)
-    }
-
-    /// Applies deferred delegations after the batch's account leases have been released.
-    async fn apply_delegations(&self, actions: Vec<PendingDelegation>) -> Result<()> {
-        for PendingDelegation { delegation, payer } in actions {
-            let pubkey = delegation.pubkey;
-            // Action dependencies may include another key from this batch.
-            Box::pin(self.delegated(delegation)).await?;
-            if payer {
-                self.unsubscribe([pubkey]).await;
-            }
-        }
-        Ok(())
+        Ok(outcome)
     }
 
     /// Waits for every subscription request and removes successful subscriptions if any fail.
@@ -143,8 +267,18 @@ struct PendingAccount<'engine> {
 struct PendingDelegation {
     /// Resolved account and its full delegation record.
     delegation: grpc::Delegation,
-    /// Whether successful materialization should remove the payer subscription.
-    payer: bool,
+    /// Whether successful materialization should remove the primary subscription.
+    unsubscribe: bool,
+}
+
+/// Work discovered from one batch after its account leases have been released.
+#[derive(Default)]
+struct BatchOutcome {
+    /// Incomplete readonly primaries needing companions.
+    promotions: Vec<SyncAccount>,
+    /// Highest first-wave slot among promoted primaries.
+    slot: Option<u64>,
+    actions: Vec<PendingDelegation>,
 }
 
 /// Ordered fetch inputs and subscriptions derived from a batch of missing accounts.
@@ -161,7 +295,11 @@ struct FetchPlan<'engine> {
 
 impl<'e> FetchPlan<'e> {
     /// Pairs ordered missing-account leases with requests and derives fetch inputs.
-    fn new(batch: &[SyncAccount], accessors: Vec<engine::AccountAccessor<'e>>) -> Self {
+    fn new(
+        batch: &[SyncAccount],
+        accessors: Vec<engine::AccountAccessor<'e>>,
+        carried: &BTreeSet<Pubkey>,
+    ) -> Self {
         // Engine returns missing accessors in pubkey order, matching the sorted request batch.
         let mut accessors = accessors.into_iter().peekable();
         let mut plan = Self {
@@ -178,7 +316,8 @@ impl<'e> FetchPlan<'e> {
             let pubkey = request.pubkey;
             let index = plan.keys.len();
             plan.keys.push(pubkey);
-            if request.property != AccountProperty::Writable {
+            // A promoted key already has coverage from the discovery fetch.
+            if request.property != AccountProperty::Writable && !carried.contains(&pubkey) {
                 plan.subscriptions.push(AccountSubscription { pubkey, target: None });
             }
             let record_index = match request.property {

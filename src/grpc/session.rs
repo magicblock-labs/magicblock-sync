@@ -119,6 +119,7 @@ impl Session {
         self.sync_filter()?;
         let request = self.request();
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
+        // Reconnect keeps local filter membership; confirm only keys included in this request.
         for (&pubkey, entry) in &self.desired {
             if self.accounts.contains(pubkey) {
                 self.confirm([(pubkey, entry.gen)]).await;
@@ -197,6 +198,7 @@ impl Session {
             Command::Rebuild => {
                 let added = self.sync_filter()?;
                 if let Some(added) = added {
+                    // Publish the new filter before claiming its added keys as covered.
                     self.refresh(sink).await?;
                     self.confirm(added).await;
                 }
@@ -283,6 +285,7 @@ impl Session {
         let candidate = account.owner == dlp_api::id().as_ref();
         if let Some(desired) = self.desired.get(&key).filter(|_| self.accounts.contains(key)) {
             let owner = super::pubkey(&account.owner)?;
+            // Delegation matching still needs the DLP bytes after the retained update is sent.
             let data = if candidate { account.data.clone() } else { mem::take(&mut account.data) };
             let image = AccountBuilder::default()
                 .owner(owner)
