@@ -11,6 +11,8 @@
 
 /// Missing-account fetch planning and initial materialization.
 mod acquisition;
+/// Canonical ATA detection and eATA-backed account projection.
+mod ata;
 /// Delegation record parsing and account conversion.
 mod delegation;
 /// Yellowstone subscriptions and lifecycle events.
@@ -173,6 +175,9 @@ impl ChainSync {
     /// Read-only DLP-owned accounts and executable Loader V3 programs are refetched
     /// with their derived companions before materialization; a read-only subscription
     /// is also removed when its account resolves as delegated here.
+    /// Canonical token ATAs are resolved with their eATA and delegation record in
+    /// a second HTTP fetch after the ATA layout reveals its owner and mint. A local
+    /// eATA delegation projects onto the ATA; raw eATAs are not materialized.
     /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes of tracking.
     /// A gRPC-only subscription remains covered without a WebSocket copy.
     ///

@@ -17,7 +17,7 @@ use tracing::{error, warn};
 
 use self::coverage::{Coverage, Source};
 use crate::{
-    delegation,
+    ata, delegation,
     grpc::{self, Command},
     program, websocket, AccountProperty, AccountSubscription, ChainSync, Error, Result,
     SyncAccount, DUPLICATION_DELAY,
@@ -157,9 +157,63 @@ impl ChainSync {
 
     /// Loads dependencies for delegated actions before materializing the delegated account.
     pub(super) async fn delegated(&self, delegation: grpc::Delegation) -> Result<()> {
+        if ata::is_eata(&delegation.account) {
+            return self.project_eata(delegation).await;
+        }
         let (prepared, dependencies) = self.prepare_delegation(delegation)?;
         self.sync(dependencies).await?;
         self.materialize_delegation(prepared).await
+    }
+
+    /// Routes a globally observed eATA delegation to a resident canonical ATA.
+    async fn project_eata(&self, delegation: grpc::Delegation) -> Result<()> {
+        let Some(candidates) = ata::candidates(delegation.pubkey, &delegation.account) else {
+            return Ok(());
+        };
+        for ata in candidates {
+            let accessor = self.engine.account(ata).await?;
+            if !accessor.exists() {
+                continue;
+            }
+            let base = self.resident_account(ata)?;
+            let Some(base) = base else {
+                continue;
+            };
+            let Some(account) = ata::project(
+                ata,
+                base,
+                delegation.pubkey,
+                &delegation.account,
+                &delegation.record,
+                self.engine.authority(),
+            ) else {
+                continue;
+            };
+            if accessor.observed().is_some_and(|(_, slot)| account.read().slot() < slot) {
+                continue;
+            }
+            drop(accessor);
+            let (prepared, dependencies) = self.prepare_delegation(grpc::Delegation {
+                pubkey: ata,
+                account,
+                record: delegation.record,
+            })?;
+            self.sync(dependencies).await?;
+            self.materialize_delegation(prepared).await?;
+            self.unsubscribe([ata]).await;
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Reads the current Engine image after acquiring any required account lease.
+    fn resident_account(&self, pubkey: Pubkey) -> Result<Option<AccountBuilder>> {
+        let accounts = self.engine.accounts();
+        let loader = accounts.loader();
+        let account = loader
+            .read(&pubkey, |account| AccountBuilder::from(account.clone()))
+            .map_err(|error| engine::EngineError::State(error.into()))?;
+        Ok(account)
     }
 
     /// Decodes action dependencies without acquiring the delegated account's lease.
@@ -213,6 +267,35 @@ impl ChainSync {
     /// removal.
     async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<()> {
         let accessor = self.engine.account(pubkey).await?;
+        if accessor.exists() {
+            return Self::undelegate_target(accessor, slot).await;
+        }
+        drop(accessor);
+        let snapshot = self.fetcher.fetch(&[pubkey], Some(slot)).await?;
+        let Some(account) = snapshot.accounts.into_iter().next().flatten() else {
+            return Ok(());
+        };
+        let Some(candidates) = ata::candidates(pubkey, &account) else {
+            return Ok(());
+        };
+        for ata in candidates {
+            let accessor = self.engine.account(ata).await?;
+            if !accessor.exists() {
+                continue;
+            }
+            let Some(account) = self.resident_account(ata)? else {
+                continue;
+            };
+            if ata::projected_for(ata, pubkey, &account) {
+                Self::undelegate_target(accessor, slot).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the existing undelegation lifecycle rule to one Engine target.
+    async fn undelegate_target(accessor: engine::AccountAccessor<'_>, slot: u64) -> Result<()> {
+        let pubkey = accessor.pubkey();
         let Some((mode, observed)) = accessor.observed() else {
             return Ok(());
         };
@@ -231,6 +314,10 @@ impl ChainSync {
         account: AccountBuilder,
     ) -> Result<()> {
         let AccountSubscription { pubkey, target } = subscription;
+        if target.is_none() && ata::is_raw_eata(pubkey, &account) {
+            self.unsubscribe([pubkey]).await;
+            return Ok(());
+        }
         let accessor = self.engine.account(target.unwrap_or(pubkey)).await?;
         let account = match target {
             Some(_) => program::normalize_data(account, self.engine.rent())?,

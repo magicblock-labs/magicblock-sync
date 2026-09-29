@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dlp_api::pda::delegation_record_pda_from_delegated_account;
 use futures::future;
-use solana_account::StateFlags;
+use solana_account::{AccountBuilder, StateFlags};
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
 
 use crate::{
-    delegation, grpc, http::Snapshot, program, AccountProperty, AccountSubscription, ChainSync,
-    Result, SyncAccount,
+    ata, delegation, grpc, http::Snapshot, program, AccountProperty, AccountSubscription,
+    ChainSync, Result, SyncAccount,
 };
 
 impl ChainSync {
@@ -132,9 +132,72 @@ impl ChainSync {
         }
         let plan = FetchPlan::new(batch, accessors, carried);
         let (mut snapshot, prune) = self.fetch_batch(&plan, min_slot).await?;
-        let outcome = self.materialize_batch(plan, &mut snapshot, carried).await?;
+        let projected = match self.fetch_ata_companions(&plan, &snapshot).await {
+            Ok(projected) => projected,
+            Err(error) => {
+                self.unsubscribe(plan.subscriptions.iter().map(|sub| sub.pubkey)).await;
+                return Err(error);
+            }
+        };
+        let outcome = self.materialize_batch(plan, &mut snapshot, projected, carried).await?;
         self.unsubscribe(prune.into_iter().chain(skipped)).await;
         Ok(outcome)
+    }
+
+    /// Fetches eATA and record pairs after the first image reveals an ATA's seeds.
+    /// No companion is subscribed or materialized under its raw address.
+    async fn fetch_ata_companions(
+        &self,
+        plan: &FetchPlan<'_>,
+        snapshot: &Snapshot,
+    ) -> Result<Vec<Option<(AccountBuilder, Vec<u8>)>>> {
+        let atas: Vec<_> = plan
+            .accounts
+            .iter()
+            .filter_map(|pending| {
+                let pubkey = pending.accessor.pubkey();
+                let base = snapshot.accounts[pending.index].as_ref()?;
+                Some((pubkey, ata::companion(pubkey, base)?, pending.index))
+            })
+            .collect();
+        let mut projected = vec![None; snapshot.accounts.len()];
+        for chunk in atas.chunks(50) {
+            let keys: Vec<_> = chunk
+                .iter()
+                .flat_map(|&(_, eata, _)| {
+                    [eata, delegation_record_pda_from_delegated_account(&eata)]
+                })
+                .collect();
+            let companions = self.fetcher.fetch(&keys, Some(snapshot.slot)).await?;
+            for (&(pubkey, eata, base_index), pair) in
+                chunk.iter().zip(companions.accounts.chunks_exact(2))
+            {
+                let Some(delegated) = pair[0].as_ref() else {
+                    continue;
+                };
+                let Some((_, record)) = delegation::snapshot_record(
+                    delegated,
+                    pair[1].as_ref(),
+                    self.engine.authority(),
+                ) else {
+                    continue;
+                };
+                let Some(base) = snapshot.accounts[base_index].as_ref() else {
+                    continue;
+                };
+                if let Some(account) = ata::project(
+                    pubkey,
+                    base.clone(),
+                    eata,
+                    delegated,
+                    record,
+                    self.engine.authority(),
+                ) {
+                    projected[base_index] = Some((account, record.to_vec()));
+                }
+            }
+        }
+        Ok(projected)
     }
 
     /// Subscribes, fetches, and normalizes planned accounts, cleaning up subscriptions on failure.
@@ -163,13 +226,25 @@ impl ChainSync {
         &self,
         plan: FetchPlan<'_>,
         snapshot: &mut Snapshot,
+        mut projected: Vec<Option<(AccountBuilder, Vec<u8>)>>,
         carried: &BTreeSet<Pubkey>,
     ) -> Result<BatchOutcome> {
         let mut outcome = BatchOutcome::default();
         for pending in plan.accounts {
             let pubkey = pending.accessor.pubkey();
-            let account = snapshot.accounts[pending.index].take().unwrap_or_default();
-            if pending.property == AccountProperty::Readonly {
+            let mut account = snapshot.accounts[pending.index].take().unwrap_or_default();
+            if ata::is_raw_eata(pubkey, &account) {
+                if pending.property != AccountProperty::Writable {
+                    self.unsubscribe([pubkey]).await;
+                }
+                continue;
+            }
+            let mut projected_record = None;
+            if let Some((image, record)) = projected[pending.index].take() {
+                account = image;
+                projected_record = Some(record);
+            }
+            if projected_record.is_none() && pending.property == AccountProperty::Readonly {
                 let image = account.read();
                 // These roles request a companion on the next wave without changing
                 // the original readonly subscription's ownership.
@@ -190,18 +265,30 @@ impl ChainSync {
                     continue;
                 }
             }
-            let delegation = pending.record_index.and_then(|index| {
-                delegation::snapshot_record(
-                    &account,
-                    snapshot.accounts[index].as_ref(),
-                    self.engine.authority(),
-                )
-            });
-            let Some((metadata, record)) = delegation else {
+            let delegation =
+                pending.record_index.filter(|_| projected_record.is_none()).and_then(|index| {
+                    delegation::snapshot_record(
+                        &account,
+                        snapshot.accounts[index].as_ref(),
+                        self.engine.authority(),
+                    )
+                });
+            let record = match (projected_record.as_deref(), delegation) {
+                (Some(record), _) => Some(record),
+                (None, Some((metadata, record))) => {
+                    account =
+                        delegation::account(account, metadata.owner, metadata.delegation_slot);
+                    Some(record)
+                }
+                (None, None) => None,
+            };
+            let Some(record) = record else {
                 pending.accessor.materialize(account, None).await?;
                 continue;
             };
-            let account = delegation::account(account, metadata.owner, metadata.delegation_slot);
+            let unsubscribe = projected_record.is_some()
+                || pending.property == AccountProperty::Payer
+                || carried.contains(&pubkey);
             if delegation::appended(record).is_some_and(|actions| !actions.is_empty()) {
                 outcome.actions.push(PendingDelegation {
                     delegation: grpc::Delegation {
@@ -209,12 +296,11 @@ impl ChainSync {
                         account,
                         record: record.to_vec(),
                     },
-                    unsubscribe: pending.property == AccountProperty::Payer
-                        || carried.contains(&pubkey),
+                    unsubscribe,
                 });
             } else {
                 pending.accessor.materialize(account, None).await?;
-                if pending.property == AccountProperty::Payer || carried.contains(&pubkey) {
+                if unsubscribe {
                     self.unsubscribe([pubkey]).await;
                 }
             }
@@ -244,7 +330,7 @@ impl ChainSync {
     }
 
     /// Releases subscriptions; failed releases mean their socket or pool entry is already gone.
-    async fn unsubscribe(&self, keys: impl IntoIterator<Item = Pubkey>) {
+    pub(super) async fn unsubscribe(&self, keys: impl IntoIterator<Item = Pubkey>) {
         let pending = keys.into_iter().map(|key| self.websocket.unsubscribe(key));
         // A failed request means the socket or pool owner already removed it.
         let _ = future::join_all(pending).await;

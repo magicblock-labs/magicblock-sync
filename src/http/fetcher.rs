@@ -25,6 +25,8 @@ use super::{Error, Result};
 pub struct Snapshot {
     /// `None` only for an explicit RPC null; invalid accounts fail the batch.
     pub accounts: Vec<Option<AccountBuilder>>,
+    /// Confirmed context slot shared by every account in this response.
+    pub slot: u64,
 }
 
 /// Fetches confirmed account batches with same-chain provider failover.
@@ -186,7 +188,7 @@ impl Fetcher {
             .into_iter()
             .map(|account| account.map(|account| account.decode(slot)).transpose())
             .collect::<DecodeResult<_, _>>()?;
-        Ok(Snapshot { accounts })
+        Ok(Snapshot { accounts, slot })
     }
 }
 
