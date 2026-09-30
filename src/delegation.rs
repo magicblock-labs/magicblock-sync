@@ -1,5 +1,12 @@
 use dlp_api::state::DelegationRecord;
+use magicblock_magic_program_api::{
+    args::{CommitAndUndelegateArgs, CommitTypeArgs, MagicIntentBundleArgs, UndelegateTypeArgs},
+    id,
+    instruction::MagicBlockInstruction,
+    MAGIC_CONTEXT_PUBKEY,
+};
 use solana_account::{AccountBuilder, AccountMode};
+use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 /// Decodes the shared on-chain delegation-record representation.
@@ -38,4 +45,26 @@ pub(crate) fn snapshot_record<'a>(
 /// Configures the Engine representation after a caller validates the record.
 pub(crate) fn account(account: AccountBuilder, owner: Pubkey, slot: u64) -> AccountBuilder {
     account.owner(owner).slot(slot).mode(AccountMode::Delegated)
+}
+
+/// Schedules commit and undelegation after a failed trusted activation.
+/// MagicRoot vouches for the readonly authority signer during PostFinalize.
+pub(crate) fn rescue_action(authority: Pubkey, pubkey: Pubkey) -> Instruction {
+    // Authority and Magic Context occupy action indices 0 and 1.
+    let commit_type = CommitTypeArgs::Standalone(vec![2]);
+    let undelegate = CommitAndUndelegateArgs {
+        commit_type,
+        undelegate_type: UndelegateTypeArgs::Standalone,
+    };
+    let args = MagicIntentBundleArgs {
+        commit_and_undelegate: Some(undelegate),
+        ..Default::default()
+    };
+    let instruction = MagicBlockInstruction::ScheduleIntentBundle(args);
+    let accounts = vec![
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new(MAGIC_CONTEXT_PUBKEY, false),
+        AccountMeta::new(pubkey, false),
+    ];
+    Instruction::new_with_wincode(id(), &instruction, accounts)
 }

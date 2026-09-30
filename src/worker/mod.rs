@@ -11,6 +11,7 @@ use dlp_api::{args::PostDelegationActions, Decrypt};
 use engine::PostFinalize;
 use nucleus::shutdown::{ShutdownHandle, ShutdownReason};
 use solana_account::{AccountBuilder, AccountMode, StateFlags};
+use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use tokio::{sync::mpsc::Receiver, time};
 use tracing::{error, warn};
@@ -193,11 +194,13 @@ impl ChainSync {
                 continue;
             }
             drop(accessor);
-            let (prepared, dependencies) = self.prepare_delegation(grpc::Delegation {
+            let projected = grpc::Delegation {
                 pubkey: ata,
                 account,
                 record: delegation.record,
-            })?;
+                source_program: delegation.source_program,
+            };
+            let (prepared, dependencies) = self.prepare_delegation(projected)?;
             self.sync(dependencies).await?;
             self.materialize_delegation(prepared).await?;
             self.unsubscribe([ata]).await;
@@ -221,7 +224,12 @@ impl ChainSync {
         &self,
         delegation: grpc::Delegation,
     ) -> Result<(PreparedDelegation, Vec<SyncAccount>)> {
-        let grpc::Delegation { pubkey, account, record } = delegation;
+        let grpc::Delegation {
+            pubkey,
+            account,
+            record,
+            source_program,
+        } = delegation;
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
         let (actions, dependencies) = if !appended.is_empty() {
             let compact: PostDelegationActions = borsh::from_slice(appended)?;
@@ -242,25 +250,64 @@ impl ChainSync {
             let dependencies = dependencies
                 .into_iter()
                 .map(|(pubkey, property)| SyncAccount { pubkey, property });
-            let source_program = account.read().owner();
-            (
-                Some(PostFinalize { source_program, actions }),
-                dependencies.collect(),
-            )
+            (Some(actions), dependencies.collect())
         } else {
             (None, Vec::new())
         };
-        Ok((
-            PreparedDelegation { pubkey, account, actions },
-            dependencies,
-        ))
+        let prepared = PreparedDelegation {
+            pubkey,
+            account,
+            actions,
+            source_program,
+        };
+        Ok((prepared, dependencies))
     }
 
     /// Acquires only the target after its action dependencies have resolved.
     pub(super) async fn materialize_delegation(&self, prepared: PreparedDelegation) -> Result<()> {
-        let PreparedDelegation { pubkey, account, actions } = prepared;
-        self.engine.account(pubkey).await?.materialize(account, actions).await?;
+        let PreparedDelegation {
+            pubkey,
+            account,
+            actions,
+            source_program,
+        } = prepared;
+        let actions = actions.map(|actions| PostFinalize { source_program, actions });
+        let accessor = self.engine.account(pubkey).await?;
+        let error = match accessor.materialize(account.clone(), actions).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if let Err(rescue_error) = self.rescue_delegation(pubkey, account, source_program).await {
+            warn!(%pubkey, %error, %rescue_error, "delegation rescue failed");
+            return Err(error.into());
+        }
         Ok(())
+    }
+
+    /// Reacquires the target after failed materialization before scheduling rescue.
+    async fn rescue_delegation(
+        &self,
+        pubkey: Pubkey,
+        account: AccountBuilder,
+        source_program: Pubkey,
+    ) -> engine::Result<()> {
+        let slot = account.read().slot();
+        let accessor = self.engine.account(pubkey).await?;
+        // A concurrent activation or later lifecycle transition owns this key now.
+        let superseded = match accessor.observed() {
+            Some((AccountMode::Magic, _)) => true,
+            Some((AccountMode::Transient, observed)) if observed == slot => true,
+            _ => accessor.skipped(AccountMode::Delegated, slot).is_some(),
+        };
+        if superseded {
+            return Ok(());
+        }
+        let action = delegation::rescue_action(self.engine.authority(), pubkey);
+        let rescue = PostFinalize {
+            source_program,
+            actions: vec![action],
+        };
+        accessor.materialize(account, Some(rescue)).await
     }
 
     /// Deletes the account only when the event is current and the observed mode permits
@@ -335,5 +382,7 @@ impl ChainSync {
 pub(super) struct PreparedDelegation {
     pubkey: Pubkey,
     account: AccountBuilder,
-    actions: Option<PostFinalize>,
+    actions: Option<Vec<Instruction>>,
+    /// Logical owner from the validated delegation record, including eATA projection.
+    source_program: Pubkey,
 }

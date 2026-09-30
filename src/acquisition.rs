@@ -150,24 +150,22 @@ impl ChainSync {
         &self,
         plan: &FetchPlan<'_>,
         snapshot: &Snapshot,
-    ) -> Result<Vec<Option<(AccountBuilder, Vec<u8>)>>> {
-        let atas: Vec<_> = plan
-            .accounts
-            .iter()
-            .filter_map(|pending| {
-                let pubkey = pending.accessor.pubkey();
-                let base = snapshot.accounts[pending.index].as_ref()?;
-                Some((pubkey, ata::companion(pubkey, base)?, pending.index))
-            })
-            .collect();
+    ) -> Result<Vec<Option<(AccountBuilder, Pubkey, Vec<u8>)>>> {
+        let mut atas = Vec::new();
+        for pending in &plan.accounts {
+            let Some(base) = snapshot.accounts[pending.index].as_ref() else { continue };
+            let pubkey = pending.accessor.pubkey();
+            let Some(eata) = ata::companion(pubkey, base) else { continue };
+            atas.push((pubkey, eata, pending.index));
+        }
         let mut projected = vec![None; snapshot.accounts.len()];
+        let authority = self.engine.authority();
         for chunk in atas.chunks(50) {
-            let keys: Vec<_> = chunk
-                .iter()
-                .flat_map(|&(_, eata, _)| {
-                    [eata, delegation_record_pda_from_delegated_account(&eata)]
-                })
-                .collect();
+            let mut keys = Vec::with_capacity(chunk.len() * 2);
+            for &(_, eata, _) in chunk {
+                keys.push(eata);
+                keys.push(delegation_record_pda_from_delegated_account(&eata));
+            }
             let companions = self.fetcher.fetch(&keys, Some(snapshot.slot)).await?;
             for (&(pubkey, eata, base_index), pair) in
                 chunk.iter().zip(companions.accounts.chunks_exact(2))
@@ -175,26 +173,20 @@ impl ChainSync {
                 let Some(delegated) = pair[0].as_ref() else {
                     continue;
                 };
-                let Some((_, record)) = delegation::snapshot_record(
-                    delegated,
-                    pair[1].as_ref(),
-                    self.engine.authority(),
-                ) else {
+                let Some((metadata, record)) =
+                    delegation::snapshot_record(delegated, pair[1].as_ref(), authority)
+                else {
                     continue;
                 };
                 let Some(base) = snapshot.accounts[base_index].as_ref() else {
                     continue;
                 };
-                if let Some(account) = ata::project(
-                    pubkey,
-                    base.clone(),
-                    eata,
-                    delegated,
-                    record,
-                    self.engine.authority(),
-                ) {
-                    projected[base_index] = Some((account, record.to_vec()));
-                }
+                let projection =
+                    ata::project(pubkey, base.clone(), eata, delegated, record, authority);
+                let Some(account) = projection else {
+                    continue;
+                };
+                projected[base_index] = Some((account, metadata.owner, record.to_vec()));
             }
         }
         Ok(projected)
@@ -226,7 +218,7 @@ impl ChainSync {
         &self,
         plan: FetchPlan<'_>,
         snapshot: &mut Snapshot,
-        mut projected: Vec<Option<(AccountBuilder, Vec<u8>)>>,
+        mut projected: Vec<Option<(AccountBuilder, Pubkey, Vec<u8>)>>,
         carried: &BTreeSet<Pubkey>,
     ) -> Result<BatchOutcome> {
         let mut outcome = BatchOutcome::default();
@@ -240,9 +232,9 @@ impl ChainSync {
                 continue;
             }
             let mut projected_record = None;
-            if let Some((image, record)) = projected[pending.index].take() {
+            if let Some((image, source_program, record)) = projected[pending.index].take() {
                 account = image;
-                projected_record = Some(record);
+                projected_record = Some((source_program, record));
             }
             if projected_record.is_none() && pending.property == AccountProperty::Readonly {
                 let image = account.read();
@@ -265,24 +257,24 @@ impl ChainSync {
                     continue;
                 }
             }
-            let delegation =
-                pending.record_index.filter(|_| projected_record.is_none()).and_then(|index| {
-                    delegation::snapshot_record(
-                        &account,
-                        snapshot.accounts[index].as_ref(),
-                        self.engine.authority(),
-                    )
-                });
-            let record = match (projected_record.as_deref(), delegation) {
-                (Some(record), _) => Some(record),
+            let delegation = match pending.record_index {
+                Some(index) if projected_record.is_none() => delegation::snapshot_record(
+                    &account,
+                    snapshot.accounts[index].as_ref(),
+                    self.engine.authority(),
+                ),
+                _ => None,
+            };
+            let record = match (projected_record.as_ref(), delegation) {
+                (Some((source_program, record)), _) => Some((*source_program, record.as_slice())),
                 (None, Some((metadata, record))) => {
                     account =
                         delegation::account(account, metadata.owner, metadata.delegation_slot);
-                    Some(record)
+                    Some((metadata.owner, record))
                 }
                 (None, None) => None,
             };
-            let Some(record) = record else {
+            let Some((source_program, record)) = record else {
                 pending.accessor.materialize(account, None).await?;
                 continue;
             };
@@ -290,14 +282,13 @@ impl ChainSync {
                 || pending.property == AccountProperty::Payer
                 || carried.contains(&pubkey);
             if delegation::appended(record).is_some_and(|actions| !actions.is_empty()) {
-                outcome.actions.push(PendingDelegation {
-                    delegation: grpc::Delegation {
-                        pubkey,
-                        account,
-                        record: record.to_vec(),
-                    },
-                    unsubscribe,
-                });
+                let delegation = grpc::Delegation {
+                    pubkey,
+                    account,
+                    record: record.to_vec(),
+                    source_program,
+                };
+                outcome.actions.push(PendingDelegation { delegation, unsubscribe });
             } else {
                 pending.accessor.materialize(account, None).await?;
                 if unsubscribe {
@@ -437,17 +428,16 @@ impl<'e> FetchPlan<'e> {
 
     /// Selects the program or ProgramData subscription to release after normalization.
     fn pruned_subscriptions(&self, snapshot: &Snapshot) -> Vec<Pubkey> {
-        self.programs
-            .iter()
-            .filter_map(|&(program_index, data_index)| {
-                let program = snapshot.accounts[program_index].as_ref()?.read();
-                let index = if program.owner() == bpf_loader_upgradeable::ID {
-                    program_index
-                } else {
-                    data_index
-                };
-                Some(self.keys[index])
-            })
-            .collect()
+        let mut prune = Vec::new();
+        for &(program_index, data_index) in &self.programs {
+            let Some(program) = snapshot.accounts[program_index].as_ref() else { continue };
+            let index = if program.read().owner() == bpf_loader_upgradeable::ID {
+                program_index
+            } else {
+                data_index
+            };
+            prune.push(self.keys[index]);
+        }
+        prune
     }
 }

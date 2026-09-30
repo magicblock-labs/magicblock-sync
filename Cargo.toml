@@ -21,11 +21,13 @@ json = { version = "0.5.8", package = "sonic-rs" }
 engine = { package = "magicblock-engine", path = "../engine/engine" }
 nucleus = { package = "magicblock-engine-nucleus", path = "../engine/nucleus" }
 magicblock-delegation-program-api = { git = "https://github.com/magicblock-labs/delegation-program.git", rev = "fb6668c7b5ffd6a89bedee1d13b16402fd0e65de", default-features = false, features = ["encryption", "instruction"] }
+magicblock-magic-program-api = { path = "../mbv/magic-program-api" }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
 smallvec = "1"
 solana-account = { path = "../engine/solana/account" }
+solana-instruction = { version = "3", features = ["wincode"] }
 solana-loader-v3-interface = { version = "7.0.0", features = ["serde"] }
 solana-loader-v4-interface = "3.1.0"
 solana-pubkey = "=4.2.0"

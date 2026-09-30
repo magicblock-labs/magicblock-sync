@@ -1,5 +1,4 @@
 use std::{
-    result::Result as DecodeResult,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::*},
         Arc,
@@ -183,11 +182,13 @@ impl Fetcher {
             return Err(Error::Protocol("account result count differs from request"));
         }
         let slot = result.context.slot;
-        let accounts = result
-            .value
-            .into_iter()
-            .map(|account| account.map(|account| account.decode(slot)).transpose())
-            .collect::<DecodeResult<_, _>>()?;
+        let mut accounts = Vec::with_capacity(expected);
+        for account in result.value {
+            accounts.push(match account {
+                Some(account) => Some(account.decode(slot)?),
+                None => None,
+            });
+        }
         Ok(Snapshot { accounts, slot })
     }
 }

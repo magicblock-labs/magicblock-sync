@@ -355,30 +355,29 @@ impl Registry {
                 let clock = socket.clock;
                 let delay =
                     (socket.backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
-                let pubkeys = socket
-                    .accounts
-                    .drain()
-                    .filter_map(|(pubkey, entry)| {
-                        self.routes.remove(&pubkey);
-                        let report = match entry {
-                            Subscription::Pending { reply, cancel, .. } => {
-                                // Cancelled subscriptions do not report a source loss.
-                                let report = cancel.is_none();
+                let mut pubkeys = Vec::new();
+                for (pubkey, entry) in socket.accounts.drain() {
+                    self.routes.remove(&pubkey);
+                    let report = match entry {
+                        Subscription::Pending { reply, cancel, .. } => {
+                            // Cancelled subscriptions do not report a source loss.
+                            let report = cancel.is_none();
+                            let _ = reply.send(Err(Error::Disconnected));
+                            if let Some(reply) = cancel {
                                 let _ = reply.send(Err(Error::Disconnected));
-                                if let Some(reply) = cancel {
-                                    let _ = reply.send(Err(Error::Disconnected));
-                                }
-                                report
                             }
-                            Subscription::Releasing(reply) => {
-                                let _ = reply.send(Err(Error::Disconnected));
-                                false
-                            }
-                            Subscription::Active { .. } => true,
-                        };
-                        report.then_some(pubkey)
-                    })
-                    .collect();
+                            report
+                        }
+                        Subscription::Releasing(reply) => {
+                            let _ = reply.send(Err(Error::Disconnected));
+                            false
+                        }
+                        Subscription::Active { .. } => true,
+                    };
+                    if report {
+                        pubkeys.push(pubkey);
+                    }
+                }
                 // The failed task has finished publishing updates. Publish loss before replacing
                 // it or accepting new user subscriptions, preserving this connection's event order.
                 let _ = self.events.send(Event::Dropped { pubkeys, error }).await;
@@ -426,17 +425,14 @@ impl Registry {
             result => {
                 self.routes.remove(&pubkey);
                 self.occupied -= 1;
-                match entry.remove() {
-                    Subscription::Pending { reply, cancel, .. } => {
-                        let _ = reply.send(result.map(|_| ()));
-                        if let Some(cancel) = cancel {
-                            let _ = cancel.send(Ok(()));
-                        }
-                    }
-                    Subscription::Releasing(reply) => {
-                        let _ = reply.send(result.map(|_| ()));
-                    }
+                let (reply, cancel) = match entry.remove() {
+                    Subscription::Pending { reply, cancel, .. } => (reply, cancel),
+                    Subscription::Releasing(reply) => (reply, None),
                     Subscription::Active { .. } => unreachable!(),
+                };
+                let _ = reply.send(result.map(|_| ()));
+                if let Some(cancel) = cancel {
+                    let _ = cancel.send(Ok(()));
                 }
             }
         }

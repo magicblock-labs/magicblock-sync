@@ -21,6 +21,7 @@ use futures::{
 };
 use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
+use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::sysvar::clock;
 use tokio::{
@@ -311,8 +312,10 @@ impl Session {
         let account: ContextValue<Option<WireAccount<'_>>> =
             json::from_str(notification.result.as_raw_str())?;
         let slot = account.context.slot;
-        let account =
-            account.value.map(|value| value.decode(slot)).transpose()?.unwrap_or_default();
+        let account = match account.value {
+            Some(value) => value.decode(slot)?,
+            None => AccountBuilder::default(),
+        };
         // Every valid confirmed update contributes, including explicit absence.
         self.slot.fetch_max(slot, Relaxed);
         if sub.pubkey == clock::ID {

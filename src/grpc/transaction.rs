@@ -39,10 +39,11 @@ impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
 /// Finds distinct undelegated accounts in a successful transaction and its CPIs.
 pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[Pubkey; 1]>> {
     let meta = tx.meta.as_ref().ok_or(Error::Protocol("missing transaction metadata"))?;
-    let message = tx
-        .transaction
+    let transaction =
+        tx.transaction.as_ref().ok_or(Error::Protocol("missing transaction message"))?;
+    let message = transaction
+        .message
         .as_ref()
-        .and_then(|tx| tx.message.as_ref())
         .ok_or(Error::Protocol("missing transaction message"))?;
     let key = |index: usize| {
         let bytes = message
@@ -66,11 +67,11 @@ pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[
         }
         // The successful DLP invocation has validated the instruction; its dispatcher
         // uses the first discriminator byte and ignores the remaining bytes.
-        let discriminator =
-            instruction.data.first().and_then(|tag| DlpDiscriminator::try_from(*tag).ok());
+        let Some(&tag) = instruction.data.first() else { continue };
+        let Ok(discriminator) = DlpDiscriminator::try_from(tag) else { continue };
         let position = match discriminator {
-            Some(DlpDiscriminator::Undelegate) => 1,
-            Some(DlpDiscriminator::UndelegateWithRollbackAfterTimeout) => 0,
+            DlpDiscriminator::Undelegate => 1,
+            DlpDiscriminator::UndelegateWithRollbackAfterTimeout => 0,
             _ => continue,
         };
         let index = *instruction

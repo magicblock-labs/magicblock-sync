@@ -13,6 +13,8 @@ pub struct Delegation {
     pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
+    /// Logical owner validated by the matched delegation record.
+    pub source_program: Pubkey,
 }
 
 /// Matches application accounts with their delegation record PDA updates in one slot.
@@ -41,6 +43,7 @@ impl PendingAccount {
             pubkey: self.pubkey,
             account: crate::delegation::account(account, record.owner, slot),
             record: record.data,
+            source_program: record.owner,
         }
     }
 }
