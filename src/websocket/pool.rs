@@ -1,8 +1,4 @@
-use std::{
-    collections::hash_map::Entry::Occupied,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
+use std::{collections::hash_map::Entry::Occupied, time::Duration};
 
 use ahash::AHashMap;
 use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
@@ -26,8 +22,6 @@ use solana_pubkey::Pubkey;
 pub(crate) struct Pool {
     /// Bounded queue for caller subscription operations.
     commands: Sender<SubscriptionRequest>,
-    /// Confirmed context-slot watermark retained across reconnects.
-    slot: Arc<AtomicU64>,
 }
 
 /// Completion channel for one caller operation.
@@ -112,7 +106,6 @@ impl Pool {
         let (commands, requests) = mpsc::channel(COMMAND_CAP);
         let (events, receiver) = mpsc::channel(EVENT_CAP);
         let (notices, incoming) = mpsc::unbounded_channel();
-        let slot = Arc::new(AtomicU64::new(0));
         let mut registry = Registry {
             config,
             sockets: Vec::new(),
@@ -122,7 +115,6 @@ impl Pool {
             occupied: 0,
             capacity: 0,
             cursor: 0,
-            slot: Arc::clone(&slot),
         };
         let mut shutdown = manager.handle(Service::ChainSyncWebSocket);
         tokio::spawn(async move {
@@ -147,13 +139,7 @@ impl Pool {
             };
             shutdown.terminate(reason);
         });
-        (Self { commands, slot }, receiver)
-    }
-
-    /// Shared confirmed-update watermark, initially zero. It is not the chain
-    /// head; callers must not lower or otherwise modify it.
-    pub fn slot(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.slot)
+        (Self { commands }, receiver)
     }
 
     /// Subscribes until server acknowledgement, not an initial snapshot.
@@ -215,8 +201,6 @@ struct Registry {
     capacity: usize,
     /// Next socket considered for admission.
     cursor: usize,
-    /// Shared minimum confirmed slot for HTTP snapshots.
-    slot: Arc<AtomicU64>,
 }
 
 impl Registry {
@@ -478,7 +462,6 @@ impl Registry {
             self.events.clone(),
             self.notices.clone(),
             backoff,
-            Arc::clone(&self.slot),
         ));
         Socket {
             id,

@@ -1,11 +1,9 @@
 use std::{
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering::*},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering::*},
     time::Duration,
 };
 
+use engine::Engine;
 use hyper::{body::Bytes, header::CONTENT_TYPE};
 use json::LazyValue;
 use reqwest::{redirect::Policy, retry, Client};
@@ -35,8 +33,8 @@ pub struct Fetcher {
     client: reqwest::Client,
     /// Stable endpoint order used for error reporting.
     providers: Vec<Provider>,
-    /// Confirmed WebSocket watermark sampled at fetch entry.
-    slot: Arc<AtomicU64>,
+    /// Engine confirmed-observation watermark sampled at fetch entry.
+    engine: Engine,
     /// Rotating first candidate for provider selection.
     cursor: AtomicUsize,
     /// Monotonic origin for cooldown timestamps.
@@ -70,7 +68,7 @@ struct SelectedProvider<'a> {
 
 impl Fetcher {
     /// Rejects an empty provider list and shares provider cooldowns across fetches.
-    pub fn new(providers: Vec<Url>, slot: Arc<AtomicU64>) -> Result<Self> {
+    pub fn new(providers: Vec<Url>, engine: Engine) -> Result<Self> {
         if providers.is_empty() {
             return Err(Error::NoProviders);
         }
@@ -82,7 +80,7 @@ impl Fetcher {
         Ok(Self {
             client,
             providers,
-            slot,
+            engine,
             cursor: AtomicUsize::new(0),
             epoch: Instant::now(),
         })
@@ -97,7 +95,7 @@ impl Fetcher {
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
         // Fix the floor for all provider attempts in this fetch; a failover must not
         // retry against a snapshot older than the one this call required.
-        let minimum = min_slot.unwrap_or(0).max(self.slot.load(Relaxed));
+        let minimum = min_slot.unwrap_or(0).max(self.engine.accounts().chain_slot());
         let deadline = Instant::now() + OVERALL;
         let params = BatchParams(
             keys.iter().map(ToString::to_string).collect::<Vec<_>>(),

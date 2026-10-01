@@ -8,6 +8,9 @@
 //! Ordinary accounts enter Engine in `Uninit` mode; executable programs enter as
 //! read-only ELF accounts. A background worker applies WebSocket and gRPC events.
 //! A later base-chain update can recreate an undelegated account.
+//! Engine's persisted chain slot tracks confirmed gRPC observations, not
+//! completed materializations. New gRPC sessions replay from two slots behind it;
+//! Yellowstone owns recovery within a session.
 
 /// Missing-account fetch planning and initial materialization.
 mod acquisition;
@@ -146,8 +149,7 @@ impl ChainSync {
         }
         let aml = config.aml.map(aml::Client::new).transpose()?;
         let (websocket, websocket_rx) = Pool::new(config.websocket, shutdown);
-        let slot = websocket.slot();
-        let fetcher = Fetcher::new(config.http, Arc::clone(&slot))?;
+        let fetcher = Fetcher::new(config.http, engine.clone())?;
         let (events, grpc_rx) = mpsc::channel(8192);
         let authority = config.grpc.authority;
         let grpc = config
@@ -160,7 +162,7 @@ impl ChainSync {
                     id,
                     stream,
                     authority,
-                    Arc::clone(&slot),
+                    engine.clone(),
                     events.clone(),
                     shutdown,
                 )

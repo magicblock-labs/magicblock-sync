@@ -1,5 +1,4 @@
-use std::sync::{atomic::AtomicU64, Arc};
-
+use engine::Engine;
 use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
 use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
@@ -26,12 +25,12 @@ impl Client {
         id: usize,
         config: StreamConfig,
         authority: Pubkey,
-        slot: Arc<AtomicU64>,
+        engine: Engine,
         events: mpsc::Sender<Event>,
         manager: &mut ShutdownManager,
     ) -> Result<Self> {
         let (commands, requests) = mpsc::unbounded_channel();
-        let session = Session::new(id, config, authority, slot, events.clone())?;
+        let session = Session::new(id, config, authority, engine, events)?;
         let mut shutdown = manager.handle(Service::ChainSyncGrpc(id));
         tokio::spawn(async move {
             let reason = tokio::select! {

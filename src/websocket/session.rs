@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
-        Arc,
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use super::{
     transport::{self, Reader, Writer, MAX_MESSAGE},
@@ -107,8 +101,6 @@ pub(super) struct Session {
     output: Vec<u8>,
     /// Bounded public update delivery.
     events: Sender<Event>,
-    /// Shared confirmed-update floor retained across attempts.
-    slot: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -120,7 +112,6 @@ impl Session {
         events: Sender<Event>,
         notices: UnboundedSender<Notice>,
         delay: Duration,
-        slot: Arc<AtomicU64>,
     ) {
         let result = async {
             time::sleep_until(Instant::now() + delay).await;
@@ -136,8 +127,7 @@ impl Session {
                 timers: FuturesUnordered::new(),
                 active: AHashMap::new(),
                 output: Vec::new(),
-                events: events.clone(),
-                slot,
+                events,
             };
             session.notify(Notice::Connected(id))?;
             session.run(reader, &mut commands).await
@@ -316,8 +306,6 @@ impl Session {
             Some(value) => value.decode(slot)?,
             None => AccountBuilder::default(),
         };
-        // Every valid confirmed update contributes, including explicit absence.
-        self.slot.fetch_max(slot, Relaxed);
         if sub.pubkey == clock::ID {
             return Ok(());
         }

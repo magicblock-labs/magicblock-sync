@@ -1,9 +1,5 @@
 use std::{
     mem::{self, offset_of},
-    sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
-        Arc,
-    },
     time::Duration,
 };
 
@@ -12,6 +8,7 @@ use dlp_api::state::{
     discriminator::{AccountDiscriminator, AccountWithDiscriminator},
     DelegationRecord,
 };
+use engine::Engine;
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
@@ -51,8 +48,8 @@ pub(super) struct Session {
     retained_filter: CompressedAccountFilterSet,
     /// Logical interest, including WS copies still within the duplication delay.
     desired: AHashMap<Pubkey, TrackedAccount>,
-    /// Shared confirmed-update floor, not a replay checkpoint.
-    watermark: Arc<AtomicU64>,
+    /// Engine owns the confirmed-observation watermark.
+    engine: Engine,
     /// Ordered account and lifecycle event delivery.
     events: mpsc::Sender<Event>,
     /// Same-slot application and record matching.
@@ -75,7 +72,7 @@ impl Session {
         id: usize,
         config: StreamConfig,
         authority: Pubkey,
-        watermark: Arc<AtomicU64>,
+        engine: Engine,
         events: mpsc::Sender<Event>,
     ) -> Result<Self> {
         Ok(Self {
@@ -85,7 +82,7 @@ impl Session {
             delegations: Delegations::new(authority),
             config,
             authority,
-            watermark,
+            engine,
             events,
         })
     }
@@ -120,7 +117,9 @@ impl Session {
         }
         let mut client = builder.connect().await?;
         self.sync_filter()?;
-        let request = self.request();
+        let mut request = self.request();
+        // Seed only new sessions; filter refreshes leave replay to Yellowstone.
+        request.from_slot = Some(self.engine.accounts().chain_slot().saturating_sub(2));
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
         // Reconnect keeps local filter membership; confirm only keys included in this request.
         for (&pubkey, entry) in &self.desired {
@@ -310,7 +309,7 @@ impl Session {
                 .executable(account.executable)
                 .slot(slot)
                 .data(data);
-            self.watermark.fetch_max(slot, Relaxed);
+            self.engine.accounts().advance_chain_slot(slot);
             let event = Event::Update {
                 stream: self.id,
                 pubkey: key,
@@ -337,7 +336,7 @@ impl Session {
 
     /// Raises the shared watermark for a resolved delegation before delivery.
     async fn delegated(&self, delegation: Delegation) {
-        self.watermark.fetch_max(delegation.account.read().slot(), Relaxed);
+        self.engine.accounts().advance_chain_slot(delegation.account.read().slot());
         self.send(Event::Delegated(delegation)).await;
     }
 
