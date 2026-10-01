@@ -1,15 +1,16 @@
-use super::Result;
 use ahash::AHashMap;
 use dlp_api::{pda::delegation_record_pda_from_delegated_account, state::DelegationRecord};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
+use crate::delegation;
+
 /// Delegation matched to an application account's delegation record PDA.
 pub struct Delegation {
     /// Application account's public key.
     pub pubkey: Pubkey,
-    /// Account with original owner, `Delegated` mode, and matched delegation slot.
+    /// Account with original owner, `Delegated` or confined `Magic` mode, and delegation slot.
     pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
@@ -19,7 +20,7 @@ pub struct Delegation {
 
 /// Matches application accounts with their delegation record PDA updates in one slot.
 pub(super) struct Delegations {
-    /// Only delegations for this validator may activate.
+    /// Delegations for this validator and authority-free confinement may activate.
     authority: Pubkey,
     /// Slot shared by pending observations; replay may move backward.
     slot: u64,
@@ -37,22 +38,22 @@ struct PendingAccount {
 
 impl PendingAccount {
     /// Builds Engine account state from the application update and its matching record.
-    fn resolve(self, record: PendingRecord, slot: u64) -> Delegation {
+    fn resolve(self, record: PendingRecord) -> Delegation {
         let account =
             AccountBuilder::default().lamports(self.update.lamports).data(self.update.data);
         Delegation {
             pubkey: self.pubkey,
-            account: crate::delegation::account(account, record.owner, slot),
+            account: delegation::account(account, &record.metadata),
             record: record.data,
-            source_program: record.owner,
+            source_program: record.metadata.owner,
         }
     }
 }
 
 /// Validated delegation record update awaiting its application account.
 struct PendingRecord {
-    /// Original program owner from the delegation record.
-    owner: Pubkey,
+    /// Validated ownership, authority, and delegation slot.
+    metadata: DelegationRecord,
     /// Full record, including appended actions.
     data: Vec<u8>,
 }
@@ -85,25 +86,25 @@ impl Delegations {
         }
     }
 
-    /// Only a record for this authority and slot can activate an application
+    /// Only a local or confined record for this slot can activate an application
     /// update. Other records leave an ignored marker for the rest of the slot.
     pub(super) fn record(
         &mut self,
         key: Pubkey,
         account: &SubscribeUpdateAccountInfo,
         metadata: &DelegationRecord,
-    ) -> Result<Option<Delegation>> {
+    ) -> Option<Delegation> {
         // Keep an ignored marker so a later application update cannot form a match.
-        if !crate::delegation::belongs_to(metadata, self.authority)
+        if !delegation::belongs_to(metadata, self.authority)
             || metadata.delegation_slot != self.slot
         {
-            return Ok(self.observe(key, PendingDelegation::Ignored));
+            return self.observe(key, PendingDelegation::Ignored);
         }
         let record = PendingRecord {
-            owner: metadata.owner,
+            metadata: *metadata,
             data: account.data.clone(),
         };
-        Ok(self.observe(key, PendingDelegation::Record(record)))
+        self.observe(key, PendingDelegation::Record(record))
     }
 
     /// Adds an application account update to the pending same-slot delegation match.
@@ -128,7 +129,7 @@ impl Delegations {
         };
         let pending = match (current, incoming) {
             (Account(account), Record(record)) | (Record(record), Account(account)) => {
-                return Some(account.resolve(record, self.slot));
+                return Some(account.resolve(record));
             }
             // An irrelevant record blocks activation for this slot; otherwise keep
             // the newest unmatched update for a later counterpart in that same slot.

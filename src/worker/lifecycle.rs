@@ -15,6 +15,15 @@ impl ChainSync {
         if ata::is_eata(&delegation.account) {
             return self.materialize_eata_delegation(delegation).await;
         }
+        // Confined accounts have no commit authority: no actions, dependencies, or rescue.
+        if delegation.account.read().is(AccountMode::Magic) {
+            self.engine
+                .account(delegation.pubkey)
+                .await?
+                .materialize(delegation.account, None)
+                .await?;
+            return Ok(());
+        }
         let (prepared, dependencies) = self.prepare_delegation(delegation)?;
         self.sync(dependencies).await?;
         self.materialize_delegation(prepared).await

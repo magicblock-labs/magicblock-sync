@@ -266,15 +266,21 @@ impl Session {
         let authority_offset =
             AccountDiscriminator::SPACE + offset_of!(DelegationRecord, authority);
         let discriminator = DelegationRecord::discriminator().to_bytes().to_vec();
-        let authority = self.authority.to_bytes().to_vec();
-        let filters = vec![memcmp(0, discriminator), memcmp(authority_offset as u64, authority)];
-        let records = SubscribeRequestFilterAccounts {
-            owner,
-            nonempty_txn_signature: Some(true),
-            filters,
-            ..Default::default()
-        };
-        request.accounts.insert(RECORDS_FILTER.into(), records);
+        for (label, authority) in
+            [(RECORDS_FILTER, self.authority), (CONFINED_FILTER, Pubkey::default())]
+        {
+            let filters = vec![
+                memcmp(0, discriminator.clone()),
+                memcmp(authority_offset as u64, authority.to_bytes().to_vec()),
+            ];
+            let records = SubscribeRequestFilterAccounts {
+                owner: owner.clone(),
+                nonempty_txn_signature: Some(true),
+                filters,
+                ..Default::default()
+            };
+            request.accounts.insert(label.into(), records);
+        }
 
         let releases = SubscribeRequestFilterTransactions {
             vote: Some(false),
@@ -317,7 +323,7 @@ impl Session {
             return Ok(());
         }
         if let Some(record) = crate::delegation::record(&account.data) {
-            if let Some(delegation) = self.delegations.record(key, &account, record)? {
+            if let Some(delegation) = self.delegations.record(key, &account, record) {
                 self.delegated(delegation).await;
             }
         }
@@ -347,6 +353,8 @@ const RETAINED_FILTER: &str = "retained";
 const CANDIDATES_FILTER: &str = "candidates";
 /// Label for delegation record candidates.
 const RECORDS_FILTER: &str = "records";
+/// Label for authority-free confinement records.
+const CONFINED_FILTER: &str = "confined";
 /// Label for successful ownership-return transactions.
 const RELEASES_FILTER: &str = "releases";
 /// Opaque heartbeat identity echoed to Yellowstone.

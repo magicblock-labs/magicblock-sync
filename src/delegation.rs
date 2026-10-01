@@ -14,9 +14,9 @@ pub(crate) fn record(data: &[u8]) -> Option<&DelegationRecord> {
     DelegationRecord::try_from_bytes_with_discriminator(data).ok()
 }
 
-/// Whether a decoded delegation record activates for this authority.
+/// Whether a record activates locally, including authority-free confinement.
 pub(crate) fn belongs_to(record: &DelegationRecord, authority: Pubkey) -> bool {
-    record.authority == authority
+    record.authority == authority || record.authority == Pubkey::default()
 }
 
 /// Returns the optional post-delegation payload following the record metadata.
@@ -43,8 +43,14 @@ pub(crate) fn snapshot_record<'a>(
 }
 
 /// Configures the Engine representation after a caller validates the record.
-pub(crate) fn account(account: AccountBuilder, owner: Pubkey, slot: u64) -> AccountBuilder {
-    account.owner(owner).slot(slot).mode(AccountMode::Delegated)
+pub(crate) fn account(account: AccountBuilder, record: &DelegationRecord) -> AccountBuilder {
+    let account = account.owner(record.owner).slot(record.delegation_slot);
+    // No authority can commit a confined account back to the base chain.
+    if record.authority == Pubkey::default() {
+        account.lamports(0).mode(AccountMode::Magic)
+    } else {
+        account.mode(AccountMode::Delegated)
+    }
 }
 
 /// Schedules commit and undelegation after a failed trusted activation.

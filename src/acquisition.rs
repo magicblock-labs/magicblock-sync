@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dlp_api::pda::delegation_record_pda_from_delegated_account;
 use futures::future;
-use solana_account::{AccountBuilder, StateFlags};
+use solana_account::{AccountBuilder, AccountMode, StateFlags};
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
 
@@ -271,8 +271,7 @@ impl ChainSync {
             let record = match (projected_record.as_ref(), delegation) {
                 (Some((source_program, record)), _) => Some((*source_program, record.as_slice())),
                 (None, Some((metadata, record))) => {
-                    account =
-                        delegation::account(account, metadata.owner, metadata.delegation_slot);
+                    account = delegation::account(account, metadata);
                     Some((metadata.owner, record))
                 }
                 (None, None) => None,
@@ -284,7 +283,9 @@ impl ChainSync {
             let unsubscribe = projected_record.is_some()
                 || pending.property == AccountProperty::Payer
                 || carried_subscriptions.contains(&pubkey);
-            if delegation::appended(record).is_some_and(|actions| !actions.is_empty()) {
+            if account.read().is(AccountMode::Delegated)
+                && delegation::appended(record).is_some_and(|actions| !actions.is_empty())
+            {
                 let delegation = grpc::Delegation {
                     pubkey,
                     account,
