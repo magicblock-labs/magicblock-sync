@@ -7,7 +7,7 @@ use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use tracing::warn;
 
-use crate::{ata, delegation, grpc, AccountProperty, ChainSync, Error, Result, SyncAccount};
+use crate::{aml, ata, delegation, grpc, AccountProperty, ChainSync, Error, Result, SyncAccount};
 
 impl ChainSync {
     /// Loads dependencies for delegated actions before materializing the delegated account.
@@ -129,7 +129,7 @@ impl ChainSync {
         Ok((prepared, dependencies))
     }
 
-    /// Acquires only the target after its action dependencies have resolved.
+    /// Assesses action signers before acquiring the target after dependency resolution.
     pub(crate) async fn materialize_delegation(&self, prepared: PreparedDelegation) -> Result<()> {
         let PreparedDelegation {
             pubkey,
@@ -139,9 +139,16 @@ impl ChainSync {
         } = prepared;
         let result = match actions {
             Ok(actions) => {
-                let actions = actions.map(|actions| PostFinalize { source_program, actions });
-                let accessor = self.engine.account(pubkey).await?;
-                accessor.materialize(account.clone(), actions).await.map_err(Error::from)
+                // Service failures return before the lease; only rejection enters rescue.
+                let rejected =
+                    aml::check(self.aml.as_ref(), actions.as_deref().unwrap_or_default()).await?;
+                if rejected.is_empty() {
+                    let actions = actions.map(|actions| PostFinalize { source_program, actions });
+                    let accessor = self.engine.account(pubkey).await?;
+                    accessor.materialize(account.clone(), actions).await.map_err(Error::from)
+                } else {
+                    Err(aml::Error::Rejected(rejected).into())
+                }
             }
             Err(error) => Err(error),
         };

@@ -11,6 +11,8 @@
 
 /// Missing-account fetch planning and initial materialization.
 mod acquisition;
+/// Post-delegation signer assessment, independent of activation authority.
+mod aml;
 /// Canonical ATA detection and eATA-backed account projection.
 mod ata;
 /// Delegation record parsing and account conversion.
@@ -43,6 +45,7 @@ use crate::websocket::Pool;
 /// gRPC duplication delay and filter scan cadence.
 const DUPLICATION_DELAY: Duration = Duration::from_secs(30 * 60);
 
+pub use aml::{Config as AmlConfig, Error as AmlError};
 pub use grpc::{Config as GrpcConfig, Error as GrpcError, StreamConfig as GrpcStreamConfig};
 pub use http::Error as HttpError;
 pub use rpc::{DecodeError, Error as RpcError};
@@ -52,6 +55,8 @@ pub use websocket::{
 
 /// Provider configuration for HTTP snapshots and live WebSocket/gRPC updates.
 pub struct ChainSyncConfig {
+    /// Checks every post-delegation action signer; `None` disables assessment.
+    pub aml: Option<AmlConfig>,
     /// HTTP snapshot providers.
     pub http: Vec<Url>,
     /// WebSocket subscription providers.
@@ -85,6 +90,8 @@ pub struct SyncAccount {
 
 /// Acquires missing base-chain accounts for Engine and applies live provider updates.
 pub struct ChainSync {
+    /// Assesses action signers without granting delegation or mutation authority.
+    aml: Option<aml::Client>,
     /// Acquires missing-account leases and materializes their snapshots.
     engine: Engine,
     /// Supplies confirmed snapshots for missing accounts.
@@ -118,6 +125,8 @@ pub enum Error {
     Actions(#[from] borsh::io::Error),
     #[error("delegation action decryption failed: {0}")]
     Decrypt(#[from] dlp_api::decrypt::DecryptError),
+    #[error("delegation signer assessment failed: {0}")]
+    Aml(#[from] AmlError),
 }
 
 /// Result of a synchronization operation.
@@ -135,6 +144,7 @@ impl ChainSync {
         if config.grpc.streams.is_empty() {
             return Err(Error::NoGrpcStreams);
         }
+        let aml = config.aml.map(aml::Client::new).transpose()?;
         let (websocket, websocket_rx) = Pool::new(config.websocket, shutdown);
         let slot = websocket.slot();
         let fetcher = Fetcher::new(config.http, Arc::clone(&slot))?;
@@ -156,7 +166,13 @@ impl ChainSync {
                 )
             })
             .collect::<grpc::Result<Vec<_>>>()?;
-        let sync = Arc::new(Self { engine, fetcher, websocket, grpc });
+        let sync = Arc::new(Self {
+            aml,
+            engine,
+            fetcher,
+            websocket,
+            grpc,
+        });
         let evictions = sync.engine.accounts().subscribe_evictions().map_err(EngineError::from)?;
         let shutdown = shutdown.handle(Service::ChainSyncWorker);
         tokio::spawn(Self::run(
