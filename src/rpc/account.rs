@@ -23,7 +23,7 @@ pub enum DecodeError {
 pub(crate) struct WireAccount<'a> {
     /// Compressed bytes and their declared encoding.
     #[serde(borrow)]
-    data: Data<'a>,
+    data: EncodedData<'a>,
     /// Base58 owner pending public-key validation.
     owner: &'a str,
     /// Balance at the response context slot.
@@ -56,7 +56,7 @@ pub(super) const ENCODING: &str = "base64+zstd";
 
 /// Encoded payload and its encoding label.
 #[derive(Deserialize)]
-struct Data<'a>(
+struct EncodedData<'a>(
     /// Base64-encoded compressed account bytes.
     &'a str,
     /// Encoding declared by the provider.

@@ -17,7 +17,7 @@ use tokio::{
 
 use super::{
     session::{Command, Notice, Session, COMMAND_CAP},
-    Config, Connection, Error, Event, Result,
+    Config, ConnectionId, Error, Event, Result,
 };
 use crate::AccountSubscription;
 use solana_pubkey::Pubkey;
@@ -68,7 +68,7 @@ enum Subscription {
 /// Pool entry whose capacity remains allocated across reconnects.
 struct Socket {
     /// Current attempt identity; reconnect advances its generation.
-    id: Connection,
+    id: ConnectionId,
     /// Commands for the current socket task.
     commands: UnboundedSender<Command>,
     /// Aborted when this entry is replaced or dropped.
@@ -242,7 +242,7 @@ impl Registry {
                             }
                         }
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
-                            if self.last_owner(pubkey) {
+                            if self.is_last_owner(pubkey) {
                                 // Queue logical removal before remote release so later
                                 // buffered updates fail the worker's coverage check.
                                 let _ = self.events.send(Event::Removed(pubkey)).await;
@@ -257,7 +257,7 @@ impl Registry {
     }
 
     /// Only the final active owner ends logical coverage.
-    fn last_owner(&self, pubkey: Pubkey) -> bool {
+    fn is_last_owner(&self, pubkey: Pubkey) -> bool {
         let Some(&index) = self.routes.get(&pubkey) else { return false };
         matches!(
             self.sockets[index].accounts.get(&pubkey),
@@ -381,7 +381,7 @@ impl Registry {
                 // The failed task has finished publishing updates. Publish loss before replacing
                 // it or accepting new user subscriptions, preserving this connection's event order.
                 let _ = self.events.send(Event::Dropped { pubkeys, error }).await;
-                let id = Connection {
+                let id = ConnectionId {
                     generation: connection.generation + 1,
                     ..connection
                 };
@@ -398,7 +398,7 @@ impl Registry {
     /// Commits the server outcome before completing the caller's operation.
     async fn acknowledge(
         &mut self,
-        connection: Connection,
+        connection: ConnectionId,
         pubkey: Pubkey,
         result: Result<Option<u64>>,
     ) {
@@ -439,7 +439,7 @@ impl Registry {
     }
 
     /// Starts an attempt with internal `Clock` ahead of user commands.
-    fn spawn(&self, id: Connection, backoff: Duration, clock: bool) -> Socket {
+    fn spawn(&self, id: ConnectionId, backoff: Duration, clock: bool) -> Socket {
         let (commands, receiver) = mpsc::unbounded_channel();
         if clock {
             let _ = commands.send(Command::Subscribe(AccountSubscription {
@@ -505,7 +505,7 @@ impl Registry {
 
     /// Allocates a pool entry and starts its first connection attempt.
     fn open(&mut self, provider: usize, clock: bool) {
-        let id = Connection {
+        let id = ConnectionId {
             provider,
             index: self.sockets.len(),
             generation: 0,

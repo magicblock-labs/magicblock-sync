@@ -8,7 +8,7 @@ use std::{
 
 use super::{
     transport::{self, Reader, Writer, MAX_MESSAGE},
-    Connection, Error, Event, Result,
+    ConnectionId, Error, Event, Result,
 };
 use crate::rpc::{AccountConfig, ContextValue, Error as RpcError, Request, WireAccount};
 use crate::AccountSubscription;
@@ -53,11 +53,11 @@ pub(super) enum Command {
 /// Socket outcomes consumed by the pool registry.
 pub(super) enum Notice {
     /// Connection is accepting commands.
-    Connected(Connection),
+    Connected(ConnectionId),
     /// Remote outcome for a caller operation.
     Acknowledged {
         /// Connection responsible for the operation.
-        connection: Connection,
+        connection: ConnectionId,
         /// Account whose operation completed.
         pubkey: Pubkey,
         /// Provider subscription ID on subscribe, none on unsubscribe.
@@ -66,7 +66,7 @@ pub(super) enum Notice {
     /// All subscriptions on this attempt were lost.
     Dropped {
         /// Failed attempt identity.
-        connection: Connection,
+        connection: ConnectionId,
         /// Cause retained for public loss reporting.
         error: Error,
     },
@@ -100,7 +100,7 @@ pub(super) struct Session {
     /// Provider subscription IDs routed to account keys and update targets.
     active: AHashMap<u64, AccountSubscription>,
     /// Attempt identity carried by lifecycle outcomes.
-    id: Connection,
+    id: ConnectionId,
     /// Registry-only lifecycle channel.
     notices: UnboundedSender<Notice>,
     /// Reused across serialization and transport masking.
@@ -114,7 +114,7 @@ pub(super) struct Session {
 impl Session {
     /// Runs one attempt and reports loss only after its I/O is closed.
     pub(super) async fn start(
-        id: Connection,
+        id: ConnectionId,
         url: Url,
         mut commands: UnboundedReceiver<Command>,
         events: Sender<Event>,

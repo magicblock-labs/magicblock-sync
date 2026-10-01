@@ -1,16 +1,24 @@
 use solana_account::{AccountBuilder, AccountMode};
+use solana_program_option::COption;
+use solana_program_pack::Pack;
 use solana_pubkey::{pubkey, Pubkey};
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+use spl_token_2022_interface::{extension::StateWithExtensions, state::Account as TokenAccount};
 
 use crate::delegation;
 
-const TOKEN: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-const ASSOCIATED_TOKEN: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-const EATA: Pubkey = pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
-const NATIVE_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+const EATA_PROGRAM_ID: Pubkey = pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
 
+/// Fields needed from eATA's custom wire state.
+struct Eata {
+    owner: Pubkey,
+    mint: Pubkey,
+    amount: u64,
+}
+
+/// Whether the current account owner is the eATA program.
 pub(crate) fn is_eata(account: &AccountBuilder) -> bool {
-    account.read().owner() == EATA
+    account.read().owner() == EATA_PROGRAM_ID
 }
 
 /// A raw eATA image, whether restored or temporarily owned by the DLP.
@@ -20,32 +28,21 @@ pub(crate) fn is_raw_eata(pubkey: Pubkey, account: &AccountBuilder) -> bool {
 
 /// The canonical eATA derived from a token account's owner and mint.
 pub(crate) fn companion(pubkey: Pubkey, account: &AccountBuilder) -> Option<Pubkey> {
-    let image = account.read();
-    let program = image.owner();
-    if program != TOKEN && program != TOKEN_2022 {
-        return None;
-    }
-    let data = image.data();
-    if data.len() < 165 || !matches!(data[108], 1 | 2) {
-        return None;
-    }
-    let mint = Pubkey::new_from_array(data[0..32].try_into().ok()?);
-    let owner = Pubkey::new_from_array(data[32..64].try_into().ok()?);
-    if derive_ata(owner, mint, program)? != pubkey {
-        return None;
-    }
-    derive_eata(owner, mint).map(|v| v.0)
+    let token = token_account(pubkey, account)?;
+    derive_eata(token.owner, token.mint).map(|(pubkey, _)| pubkey)
 }
 
 /// Projected ATAs carry an uncloseable marker and delegated lifecycle mode.
-pub(crate) fn projected_for(ata: Pubkey, eata: Pubkey, account: &AccountBuilder) -> bool {
-    let image = account.read();
-    matches!(
-        image.mode(),
+pub(crate) fn is_projection_of(ata: Pubkey, eata: Pubkey, account: &AccountBuilder) -> bool {
+    if !matches!(
+        account.read().mode(),
         AccountMode::Delegated | AccountMode::Transient
-    ) && companion(ata, account) == Some(eata)
-        && image.data()[129..133] == 1u32.to_le_bytes()
-        && image.data()[133..165] == [0; 32]
+    ) {
+        return false;
+    }
+    let Some(token) = token_account(ata, account) else { return false };
+    token.close_authority == COption::Some(Pubkey::default())
+        && derive_eata(token.owner, token.mint).is_some_and(|(pubkey, _)| pubkey == eata)
 }
 
 /// ATA candidates for a restored eATA. The token program is not stored in eATA.
@@ -53,12 +50,16 @@ pub(crate) fn candidates(pubkey: Pubkey, account: &AccountBuilder) -> Option<[Pu
     if !is_eata(account) {
         return None;
     }
-    let (owner, mint, _) = eata_data(pubkey, account)?;
-    Some([derive_ata(owner, mint, TOKEN_2022)?, derive_ata(owner, mint, TOKEN)?])
+    let eata = eata_data(pubkey, account)?;
+    Some(
+        [spl_token_2022_interface::id(), spl_token_interface::id()].map(|program| {
+            get_associated_token_address_with_program_id(&eata.owner, &eata.mint, &program)
+        }),
+    )
 }
 
-/// A valid local delegation projects only its balance and generation onto the ATA.
-/// The base image retains its token program, layout, extensions, and rent fields.
+/// Projects an eATA's balance and delegation slot onto a canonical ATA.
+/// The token program, layout, extensions, and rent fields come from the base image.
 pub(crate) fn project(
     ata: Pubkey,
     base: AccountBuilder,
@@ -68,66 +69,76 @@ pub(crate) fn project(
     authority: Pubkey,
 ) -> Option<AccountBuilder> {
     let metadata = delegation::record(record)?;
-    if metadata.owner != EATA || metadata.authority != authority {
+    if metadata.owner != EATA_PROGRAM_ID || metadata.authority != authority {
         return None;
     }
-    let (_, mint, amount) = eata_data(eata, delegated)?;
-    if companion(ata, &base)? != eata {
+    let eata_state = eata_data(eata, delegated)?;
+    let mut token = token_account(ata, &base)?;
+    if token.owner != eata_state.owner || token.mint != eata_state.mint {
         return None;
     }
+
+    // The projected ATA is virtual: it cannot be closed locally, and native-token
+    // lamports cannot be spent as part of the eATA balance.
+    token.amount = eata_state.amount;
+    token.close_authority = COption::Some(Pubkey::default());
+    let reserve = token.is_native;
+    token.is_native = COption::None;
     let mut data = base.read().data().to_vec();
-    data[64..72].copy_from_slice(&amount.to_le_bytes());
-    // SPL Token and Token-2022 share the 165-byte base account layout.
-    // A projected ATA is virtual: local close is forbidden, and native-token
-    // lamports cannot be spent as the eATA balance.
-    data[129..133].copy_from_slice(&1u32.to_le_bytes());
-    data[133..165].fill(0);
-    let reserve = if mint == NATIVE_MINT && data[109..113] == 1u32.to_le_bytes() {
-        data[109..113].fill(0);
-        Some(u64::from_le_bytes(data[113..121].try_into().ok()?))
-    } else {
-        None
-    };
+    // Both token programs share this base layout; preserve any extension bytes.
+    token.pack_into_slice(&mut data[..TokenAccount::LEN]);
     let projected = base.data(data).slot(metadata.delegation_slot).mode(AccountMode::Delegated);
     Some(match reserve {
-        Some(lamports) => projected.lamports(lamports),
-        None => projected,
+        COption::Some(lamports) => projected.lamports(lamports),
+        COption::None => projected,
     })
 }
 
-/// Parses only eATA data whose address and current or delegated owner agree.
-fn eata_data(pubkey: Pubkey, account: &AccountBuilder) -> Option<(Pubkey, Pubkey, u64)> {
+/// Recognizes an initialized token account at its canonical ATA address.
+fn token_account(pubkey: Pubkey, account: &AccountBuilder) -> Option<TokenAccount> {
     let image = account.read();
-    if image.owner() != EATA && image.owner() != dlp_api::id() {
+    let program = image.owner();
+    let token = if program == spl_token_interface::id() {
+        TokenAccount::unpack(image.data()).ok()?
+    } else if program == spl_token_2022_interface::id() {
+        StateWithExtensions::<TokenAccount>::unpack(image.data()).ok()?.base
+    } else {
         return None;
-    }
-    let (owner, mint, amount, bump) = parse_eata(image.data())?;
-    (derive_eata(owner, mint)? == (pubkey, bump)).then_some((owner, mint, amount))
+    };
+    let canonical =
+        get_associated_token_address_with_program_id(&token.owner, &token.mint, &program);
+    (canonical == pubkey).then_some(token)
 }
 
-/// Validates both eATA layouts, including the PDA bump in the current layout.
-fn parse_eata(data: &[u8]) -> Option<(Pubkey, Pubkey, u64, u8)> {
-    if data.len() != 72 && data.len() != 80 {
+/// An eATA is trusted only when its owner and derived address agree with its data.
+fn eata_data(pubkey: Pubkey, account: &AccountBuilder) -> Option<Eata> {
+    const KEY_LEN: usize = size_of::<Pubkey>();
+    const MINT_END: usize = KEY_LEN * 2;
+    const BASE_LEN: usize = MINT_END + size_of::<u64>();
+    const CURRENT_LEN: usize = BASE_LEN + 8;
+
+    let image = account.read();
+    if image.owner() != EATA_PROGRAM_ID && image.owner() != dlp_api::id() {
         return None;
     }
-    let owner = Pubkey::new_from_array(data[0..32].try_into().ok()?);
-    let mint = Pubkey::new_from_array(data[32..64].try_into().ok()?);
+    let data = image.data();
+    if data.len() != BASE_LEN && data.len() != CURRENT_LEN {
+        return None;
+    }
+    let owner = Pubkey::new_from_array(data[..KEY_LEN].try_into().ok()?);
+    let mint = Pubkey::new_from_array(data[KEY_LEN..MINT_END].try_into().ok()?);
     if mint == Pubkey::default() {
         return None;
     }
-    let amount = u64::from_le_bytes(data[64..72].try_into().ok()?);
-    let bump = if data.len() == 80 { data[72] } else { derive_eata(owner, mint)?.1 };
-    Some((owner, mint, amount, bump))
+    let (address, bump) = derive_eata(owner, mint)?;
+    if address != pubkey || (data.len() == CURRENT_LEN && data[BASE_LEN] != bump) {
+        return None;
+    }
+    let amount = u64::from_le_bytes(data[MINT_END..BASE_LEN].try_into().ok()?);
+    Some(Eata { owner, mint, amount })
 }
 
-fn derive_ata(owner: Pubkey, mint: Pubkey, program: Pubkey) -> Option<Pubkey> {
-    Pubkey::try_find_program_address(
-        &[owner.as_ref(), program.as_ref(), mint.as_ref()],
-        &ASSOCIATED_TOKEN,
-    )
-    .map(|v| v.0)
-}
-
+/// Derives the eATA address and bump shared by both supported eATA layouts.
 fn derive_eata(owner: Pubkey, mint: Pubkey) -> Option<(Pubkey, u8)> {
-    Pubkey::try_find_program_address(&[owner.as_ref(), mint.as_ref()], &EATA)
+    Pubkey::try_find_program_address(&[owner.as_ref(), mint.as_ref()], &EATA_PROGRAM_ID)
 }

@@ -32,13 +32,14 @@ struct PendingAccount {
     /// Application account, not the record PDA.
     pubkey: Pubkey,
     /// Raw streamed account state awaiting restoration of its original owner.
-    acc: SubscribeUpdateAccountInfo,
+    update: SubscribeUpdateAccountInfo,
 }
 
 impl PendingAccount {
     /// Builds Engine account state from the application update and its matching record.
     fn resolve(self, record: PendingRecord, slot: u64) -> Delegation {
-        let account = AccountBuilder::default().lamports(self.acc.lamports).data(self.acc.data);
+        let account =
+            AccountBuilder::default().lamports(self.update.lamports).data(self.update.data);
         Delegation {
             pubkey: self.pubkey,
             account: crate::delegation::account(account, record.owner, slot),
@@ -109,11 +110,11 @@ impl Delegations {
     pub(super) fn account(
         &mut self,
         pubkey: Pubkey,
-        acc: SubscribeUpdateAccountInfo,
+        update: SubscribeUpdateAccountInfo,
     ) -> Option<Delegation> {
         // Record updates are keyed by this account's derived delegation-record PDA.
         let record = delegation_record_pda_from_delegated_account(&pubkey);
-        let pending = PendingAccount { pubkey, acc };
+        let pending = PendingAccount { pubkey, update };
         self.observe(record, PendingDelegation::Account(pending))
     }
 

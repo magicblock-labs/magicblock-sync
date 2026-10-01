@@ -17,7 +17,7 @@ use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver},
-    time::Instant,
+    time::{self, Instant},
 };
 use tracing::warn;
 use yellowstone_grpc_client::{
@@ -47,10 +47,10 @@ pub(super) struct Session {
     config: StreamConfig,
     /// Authority observed for delegation lifecycle events.
     authority: Pubkey,
-    /// Last full filter sent on this live stream.
-    accounts: CompressedAccountFilterSet,
+    /// Physical account filter; a rebuild sends changes before confirming coverage.
+    retained_filter: CompressedAccountFilterSet,
     /// Logical interest, including WS copies still within the duplication delay.
-    desired: AHashMap<Pubkey, Desired>,
+    desired: AHashMap<Pubkey, TrackedAccount>,
     /// Shared confirmed-update floor, not a replay checkpoint.
     watermark: Arc<AtomicU64>,
     /// Ordered account and lifecycle event delivery.
@@ -60,13 +60,13 @@ pub(super) struct Session {
 }
 
 /// One WS-confirmed account awaiting or retaining a gRPC filter entry.
-struct Desired {
+struct TrackedAccount {
     /// Exact key and optional ProgramData target.
     sub: AccountSubscription,
     /// Owner-issued logical subscription generation.
     gen: u64,
-    /// Receipt of the track command that starts the duplication delay.
-    ts: Instant,
+    /// Time the track command arrived, which starts the duplication delay.
+    tracked_at: Instant,
 }
 
 impl Session {
@@ -80,7 +80,7 @@ impl Session {
     ) -> Result<Self> {
         Ok(Self {
             id,
-            accounts: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 4)?,
+            retained_filter: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 8)?,
             desired: AHashMap::new(),
             delegations: Delegations::new(authority),
             config,
@@ -90,14 +90,17 @@ impl Session {
         })
     }
 
-    /// Returns a terminal stream failure after reporting lost coverage.
+    /// Reports lost coverage before retrying recoverable stream failures.
+    /// Yellowstone's reconnect backoff begins only after a subscription succeeds;
+    /// initial connection and subscription failures need an outer retry delay.
     pub(super) async fn run(mut self, mut commands: UnboundedReceiver<Command>) -> Result<()> {
         loop {
             let Err(error) = self.subscribe(&mut commands).await else { return Ok(()) };
             let _ = self.events.send(Event::Lost(self.id)).await;
             if recoverable(&error) {
                 warn!(%error, "gRPC unavailable; retrying");
-                tokio::time::sleep(RETRY_DELAY).await;
+                #[allow(clippy::disallowed_methods)]
+                time::sleep(RETRY_DELAY).await;
             } else {
                 return Err(error);
             }
@@ -121,7 +124,7 @@ impl Session {
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
         // Reconnect keeps local filter membership; confirm only keys included in this request.
         for (&pubkey, entry) in &self.desired {
-            if self.accounts.contains(pubkey) {
+            if self.retained_filter.contains(pubkey) {
                 self.confirm([(pubkey, entry.gen)]).await;
             }
         }
@@ -174,7 +177,7 @@ impl Session {
     async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<()> {
         self.delegations.set_slot(update.slot);
         let transaction = update.transaction.ok_or(Error::Protocol("missing transaction"))?;
-        let pubkeys = transaction::released(&transaction)?;
+        let pubkeys = transaction::undelegated_accounts(&transaction)?;
         if !pubkeys.is_empty() {
             let event = Event::Undelegated { pubkeys, slot: update.slot };
             self.send(event).await;
@@ -186,9 +189,13 @@ impl Session {
     async fn command(&mut self, command: Command, sink: &mut SubscribeRequestSink) -> Result<()> {
         match command {
             Command::Track { sub, gen } => {
-                let entry = Desired { sub, gen, ts: Instant::now() };
+                let entry = TrackedAccount {
+                    sub,
+                    gen,
+                    tracked_at: Instant::now(),
+                };
                 self.desired.insert(sub.pubkey, entry);
-                if self.accounts.contains(sub.pubkey) {
+                if self.retained_filter.contains(sub.pubkey) {
                     self.confirm([(sub.pubkey, gen)]).await;
                 }
             }
@@ -210,18 +217,20 @@ impl Session {
     /// Prunes removed keys and adds aged keys without reallocating an unchanged filter.
     fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>> {
         let remove: Vec<_> = self
-            .accounts
+            .retained_filter
             .iter()
             .map(|bytes| Pubkey::new_from_array(*bytes))
             .filter(|pubkey| !self.desired.contains_key(pubkey))
             .collect();
         for pubkey in &remove {
-            self.accounts.remove(*pubkey);
+            self.retained_filter.remove(*pubkey);
         }
         let mut added = Vec::new();
         for (&pubkey, entry) in &self.desired {
-            if !self.accounts.contains(pubkey) && entry.ts.elapsed() >= DUPLICATION_DELAY {
-                self.accounts.insert(pubkey)?;
+            if !self.retained_filter.contains(pubkey)
+                && entry.tracked_at.elapsed() >= DUPLICATION_DELAY
+            {
+                self.retained_filter.insert(pubkey)?;
                 added.push((pubkey, entry.gen));
             }
         }
@@ -242,8 +251,9 @@ impl Session {
             commitment: Some(CommitmentLevel::Confirmed as i32),
             ..Default::default()
         };
-        if !self.accounts.is_empty() {
-            self.accounts.insert_into_subscribe_request(&mut request, RETAINED_FILTER);
+        if !self.retained_filter.is_empty() {
+            self.retained_filter
+                .insert_into_subscribe_request(&mut request, RETAINED_FILTER);
         }
         let owner = vec![dlp_api::id().to_string()];
         let candidates = SubscribeRequestFilterAccounts {
@@ -283,7 +293,8 @@ impl Session {
         let mut account = update.account.ok_or(Error::Protocol("missing account image"))?;
         let key = super::pubkey(&account.pubkey)?;
         let candidate = account.owner == dlp_api::id().as_ref();
-        if let Some(desired) = self.desired.get(&key).filter(|_| self.accounts.contains(key)) {
+        if let Some(desired) = self.desired.get(&key).filter(|_| self.retained_filter.contains(key))
+        {
             let owner = super::pubkey(&account.owner)?;
             // Delegation matching still needs the DLP bytes after the retained update is sent.
             let data = if candidate { account.data.clone() } else { mem::take(&mut account.data) };

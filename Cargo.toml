@@ -30,9 +30,14 @@ solana-account = { path = "../engine/solana/account" }
 solana-instruction = { version = "3", features = ["wincode"] }
 solana-loader-v3-interface = { version = "7.0.0", features = ["serde"] }
 solana-loader-v4-interface = "3.1.0"
+solana-program-option = "3.0"
+solana-program-pack = "3.0"
 solana-pubkey = "=4.2.0"
 solana-rent = "4.3.0"
 solana-sdk-ids = "3.1.0"
+spl-associated-token-account-interface = "2.0"
+spl-token-interface = "2.0"
+spl-token-2022-interface = "2.1"
 thiserror = "2"
 tokio = { version = "1.0", features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

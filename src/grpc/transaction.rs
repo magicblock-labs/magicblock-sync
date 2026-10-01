@@ -7,7 +7,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 /// Borrowed instruction shape shared by top-level and CPI decoding.
-struct Instruction<'a> {
+struct InstructionView<'a> {
     /// Index into static transaction account keys.
     program: u32,
     /// Account indices into the same key list.
@@ -16,7 +16,7 @@ struct Instruction<'a> {
     data: &'a [u8],
 }
 
-impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
+impl<'a> From<&'a CompiledInstruction> for InstructionView<'a> {
     fn from(instruction: &'a CompiledInstruction) -> Self {
         Self {
             program: instruction.program_id_index,
@@ -26,7 +26,7 @@ impl<'a> From<&'a CompiledInstruction> for Instruction<'a> {
     }
 }
 
-impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
+impl<'a> From<&'a InnerInstruction> for InstructionView<'a> {
     fn from(instruction: &'a InnerInstruction) -> Self {
         Self {
             program: instruction.program_id_index,
@@ -37,7 +37,9 @@ impl<'a> From<&'a InnerInstruction> for Instruction<'a> {
 }
 
 /// Finds distinct undelegated accounts in a successful transaction and its CPIs.
-pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[Pubkey; 1]>> {
+pub(super) fn undelegated_accounts(
+    tx: &SubscribeUpdateTransactionInfo,
+) -> Result<SmallVec<[Pubkey; 1]>> {
     let meta = tx.meta.as_ref().ok_or(Error::Protocol("missing transaction metadata"))?;
     let transaction =
         tx.transaction.as_ref().ok_or(Error::Protocol("missing transaction message"))?;
@@ -53,14 +55,14 @@ pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[
         super::pubkey(bytes)
     };
     let dlp = dlp_api::id();
-    let outer = message.instructions.iter().map(Instruction::from);
+    let outer = message.instructions.iter().map(InstructionView::from);
     // Inner instructions use the same static key table as top-level instructions.
     let inner = meta
         .inner_instructions
         .iter()
         .flat_map(|group| &group.instructions)
-        .map(Instruction::from);
-    let mut released = SmallVec::new();
+        .map(InstructionView::from);
+    let mut undelegated = SmallVec::new();
     for instruction in outer.chain(inner) {
         if key(instruction.program as usize)? != dlp {
             continue;
@@ -78,9 +80,9 @@ pub(super) fn released(tx: &SubscribeUpdateTransactionInfo) -> Result<SmallVec<[
             .accounts
             .get(position)
             .ok_or(Error::Protocol("missing undelegated account"))?;
-        released.push(key(index as usize)?);
+        undelegated.push(key(index as usize)?);
     }
-    released.sort_unstable();
-    released.dedup();
-    Ok(released)
+    undelegated.sort_unstable();
+    undelegated.dedup();
+    Ok(undelegated)
 }

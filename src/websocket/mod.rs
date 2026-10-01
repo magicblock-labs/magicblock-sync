@@ -76,7 +76,7 @@ pub struct Config {
 
 /// Identity of one connection attempt; reconnects receive a new generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct Connection {
+pub(super) struct ConnectionId {
     /// Index in [`Config::providers`].
     provider: usize,
     /// Stable pool entry reused by replacement attempts.

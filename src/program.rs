@@ -37,7 +37,7 @@ pub(super) fn normalize(
         id if id == bpf_loader_upgradeable::ID => {
             let program_data =
                 program_data.ok_or(Error::Program("Loader V3 ProgramData is missing"))?;
-            normalize_data(program_data, rent)
+            normalize_program_data(program_data, rent)
         }
         id if id == loader_v4::ID => {
             let elf = v4_elf(account.read().data())?.to_vec();
@@ -48,7 +48,10 @@ pub(super) fn normalize(
 }
 
 /// Converts Loader V3 ProgramData into Engine's ELF representation.
-pub(super) fn normalize_data(account: AccountBuilder, rent: &Rent) -> Result<AccountBuilder> {
+pub(super) fn normalize_program_data(
+    account: AccountBuilder,
+    rent: &Rent,
+) -> Result<AccountBuilder> {
     let elf = v3_elf(account.read().data())?.to_vec();
     Ok(elf_account(account.data(elf), loader_v4::ID, rent))
 }
