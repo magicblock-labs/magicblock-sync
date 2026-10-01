@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use dlp_api::pda::delegation_record_pda_from_delegated_account;
 use futures::future;
 use solana_account::{AccountBuilder, StateFlags};
-use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
 
@@ -411,13 +410,10 @@ impl<'e> FetchPlan<'e> {
                     Some(index)
                 }
                 AccountProperty::Program => {
-                    let data = get_program_data_address(&pubkey);
+                    let data = AccountSubscription::program_data(pubkey);
                     let data_index = plan.keys.len();
-                    plan.keys.push(data);
-                    plan.subscriptions.push(AccountSubscription {
-                        pubkey: data,
-                        target: Some(pubkey),
-                    });
+                    plan.keys.push(data.pubkey);
+                    plan.subscriptions.push(data);
                     plan.programs.push((index, data_index));
                     None
                 }

@@ -30,8 +30,9 @@ mod worker;
 
 use std::{borrow::Borrow, sync::Arc, time::Duration};
 
-use engine::Engine;
+use engine::{Engine, EngineError};
 use nucleus::shutdown::{Service, ShutdownManager};
+use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use tokio::sync::mpsc;
 use url::Url;
@@ -124,6 +125,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl ChainSync {
     /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
+    /// Owns Engine's sole eviction receiver to unsubscribe evicted cached mirrors.
     /// The worker and transports join Engine's coordinated shutdown.
     pub fn new(
         engine: Engine,
@@ -155,11 +157,13 @@ impl ChainSync {
             })
             .collect::<grpc::Result<Vec<_>>>()?;
         let sync = Arc::new(Self { engine, fetcher, websocket, grpc });
+        let evictions = sync.engine.accounts().subscribe_evictions().map_err(EngineError::from)?;
         let shutdown = shutdown.handle(Service::ChainSyncWorker);
         tokio::spawn(Self::run(
             Arc::clone(&sync),
             websocket_rx,
             grpc_rx,
+            evictions,
             shutdown,
         ));
         Ok(sync)
@@ -205,4 +209,19 @@ struct AccountSubscription {
     pubkey: Pubkey,
     /// Program to update when `pubkey` is its Loader V3 ProgramData account.
     target: Option<Pubkey>,
+}
+
+impl AccountSubscription {
+    /// Canonical ProgramData subscription that updates the owning program.
+    fn program_data(pubkey: Pubkey) -> Self {
+        Self {
+            pubkey: get_program_data_address(&pubkey),
+            target: Some(pubkey),
+        }
+    }
+
+    /// Direct and canonical ProgramData identities that can materialize this target.
+    fn for_target(pubkey: Pubkey) -> [Self; 2] {
+        [Self { pubkey, target: None }, Self::program_data(pubkey)]
+    }
 }

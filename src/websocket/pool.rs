@@ -37,8 +37,10 @@ type Reply = oneshot::Sender<Result<()>>;
 enum SubscriptionRequest {
     /// Subscribes once and reports the server acknowledgement.
     Subscribe(AccountSubscription, Reply),
-    /// Releases a subscription and reports the server outcome.
+    /// Unsubscribes and reports the server outcome.
     Unsubscribe(Pubkey, Reply),
+    /// Unsubscribes all accounts that materialize one cached Engine target.
+    Evict(Pubkey),
 }
 
 /// Per-account state that occupies socket capacity.
@@ -54,15 +56,15 @@ enum Subscription {
     },
     /// Acknowledged subscription shared by identical acquisition requests.
     Active {
-        /// Provider subscription ID used for final release.
+        /// Provider subscription ID used to unsubscribe.
         remote: u64,
         /// Exact subscription identity; a different target cannot share it.
         account: AccountSubscription,
         /// Callers that still own this subscription across a lease handoff.
         owners: usize,
     },
-    /// Release following an acknowledged or cancelled subscription.
-    Releasing(Reply),
+    /// Unsubscribe awaiting acknowledgement or socket loss.
+    Unsubscribing(Reply),
 }
 
 /// Pool entry whose capacity remains allocated across reconnects.
@@ -165,7 +167,7 @@ impl Pool {
         self.request(SubscriptionRequest::Subscribe, account).await
     }
 
-    /// Releases one owner, removing the provider subscription after the last owner.
+    /// Removes one owner, unsubscribing from the provider after the last owner.
     /// Do not overlap ordinary subscribe and unsubscribe operations for the same key.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
@@ -173,6 +175,14 @@ impl Pool {
     /// [`Event::Dropped`].
     pub(crate) async fn unsubscribe(&self, pubkey: Pubkey) -> Result<()> {
         self.request(SubscriptionRequest::Unsubscribe, pubkey).await
+    }
+
+    /// Orders cache cleanup before subsequent acquisition without waiting for I/O.
+    pub(crate) async fn evict(&self, target: Pubkey) -> Result<()> {
+        self.commands
+            .send(SubscriptionRequest::Evict(target))
+            .await
+            .map_err(|_| Error::Closed)
     }
 
     /// Waits for registry admission and the server's operation outcome.
@@ -242,13 +252,9 @@ impl Registry {
                             }
                         }
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
-                            if self.is_last_owner(pubkey) {
-                                // Queue logical removal before remote release so later
-                                // buffered updates fail the worker's coverage check.
-                                let _ = self.events.send(Event::Removed(pubkey)).await;
-                            }
-                            self.unsubscribe(pubkey, reply);
+                            self.unsubscribe(pubkey, reply).await;
                         }
+                        SubscriptionRequest::Evict(target) => self.evict(target).await,
                     }
                 }
                 Some(notice) = notices.recv() => self.notice(notice).await,
@@ -256,13 +262,23 @@ impl Registry {
         }
     }
 
-    /// Only the final active owner ends logical coverage.
-    fn is_last_owner(&self, pubkey: Pubkey) -> bool {
-        let Some(&index) = self.routes.get(&pubkey) else { return false };
-        matches!(
-            self.sockets[index].accounts.get(&pubkey),
-            Some(Subscription::Active { owners: 1, .. })
-        )
+    /// Cache residency ends every owner of the target's exact subscriptions.
+    async fn evict(&mut self, target: Pubkey) {
+        for sub in AccountSubscription::for_target(target) {
+            let pubkey = sub.pubkey;
+            let Some(&index) = self.routes.get(&pubkey) else { continue };
+            let Some(Subscription::Active { account, owners, .. }) =
+                self.sockets[index].accounts.get_mut(&pubkey)
+            else {
+                continue;
+            };
+            if *account != sub {
+                continue;
+            }
+            *owners = 1;
+            let (reply, _) = oneshot::channel();
+            self.unsubscribe(pubkey, reply).await;
+        }
     }
 
     /// Reserves capacity before waiting for remote acknowledgement.
@@ -294,12 +310,20 @@ impl Registry {
     }
 
     /// Keeps capacity occupied until acknowledgement or socket loss.
-    fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
+    async fn unsubscribe(&mut self, pubkey: Pubkey, reply: Reply) {
         let Some(&index) = self.routes.get(&pubkey) else {
             // Connection loss can remove the subscription before the caller unsubscribes.
             let _ = reply.send(Ok(()));
             return;
         };
+        if matches!(
+            self.sockets[index].accounts.get(&pubkey),
+            Some(Subscription::Active { owners: 1, .. })
+        ) {
+            // Queue logical removal before provider unsubscribe so buffered updates
+            // fail the worker's coverage check. Shared owners retain coverage.
+            let _ = self.events.send(Event::Removed(pubkey)).await;
+        }
         let socket = &mut self.sockets[index];
         let Some(state) = socket.accounts.get_mut(&pubkey) else { return };
         match state {
@@ -309,12 +333,12 @@ impl Registry {
             }
             Subscription::Active { remote, .. } => {
                 let remote = *remote;
-                *state = Subscription::Releasing(reply);
+                *state = Subscription::Unsubscribing(reply);
                 // If I/O has just stopped, its queued loss notice completes this waiter.
                 let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
             }
             Subscription::Pending { cancel, .. } => *cancel = Some(reply),
-            Subscription::Releasing(_) => {
+            Subscription::Unsubscribing(_) => {
                 let _ = reply.send(Ok(()));
             }
         }
@@ -368,7 +392,7 @@ impl Registry {
                             }
                             report
                         }
-                        Subscription::Releasing(reply) => {
+                        Subscription::Unsubscribing(reply) => {
                             let _ = reply.send(Err(Error::Disconnected));
                             false
                         }
@@ -414,8 +438,8 @@ impl Registry {
                     unreachable!()
                 };
                 if let Some(cancel) = cancel {
-                    // A release raced the subscribe acknowledgement; never publish coverage.
-                    *entry.get_mut() = Subscription::Releasing(cancel);
+                    // Unsubscribe raced the subscribe acknowledgement; never publish coverage.
+                    *entry.get_mut() = Subscription::Unsubscribing(cancel);
                     let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
                 } else {
                     let _ = self.events.send(Event::Acknowledged(account)).await;
@@ -427,7 +451,7 @@ impl Registry {
                 self.occupied -= 1;
                 let (reply, cancel) = match entry.remove() {
                     Subscription::Pending { reply, cancel, .. } => (reply, cancel),
-                    Subscription::Releasing(reply) => (reply, None),
+                    Subscription::Unsubscribing(reply) => (reply, None),
                     Subscription::Active { .. } => unreachable!(),
                 };
                 let _ = reply.send(result.map(|_| ()));

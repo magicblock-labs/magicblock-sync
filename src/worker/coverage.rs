@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry::Occupied;
+
 use ahash::AHashMap;
 use solana_pubkey::Pubkey;
 
@@ -103,6 +105,14 @@ impl Coverage {
             .iter()
             .filter_map(|(&pubkey, entry)| (entry.grpc == Some(stream)).then_some(pubkey))
             .collect()
+    }
+
+    /// Ends the target's coverage without requesting another Engine eviction.
+    pub(super) fn evicted(&mut self, target: Pubkey) -> impl Iterator<Item = Pubkey> + '_ {
+        AccountSubscription::for_target(target).into_iter().filter_map(|sub| {
+            let Occupied(entry) = self.entries.entry(sub.pubkey) else { return None };
+            (entry.get().sub == sub).then(|| entry.remove().sub.pubkey)
+        })
     }
 
     /// An Engine target survives while any other logical subscription names it.

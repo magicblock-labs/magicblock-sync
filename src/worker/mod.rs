@@ -12,7 +12,10 @@ use std::{
 use nucleus::shutdown::{ShutdownHandle, ShutdownReason};
 use solana_account::{AccountBuilder, StateFlags};
 use solana_pubkey::Pubkey;
-use tokio::{sync::mpsc::Receiver, time};
+use tokio::{
+    sync::mpsc::{Receiver, UnboundedReceiver},
+    time,
+};
 use tracing::{error, warn};
 
 use self::coverage::{Coverage, Source};
@@ -33,38 +36,68 @@ impl ChainSync {
     /// Serializes source events, account application, and Engine eviction.
     pub(super) async fn run(
         self: Arc<Self>,
-        mut websocket: Receiver<websocket::Event>,
-        mut grpc: Receiver<grpc::Event>,
+        websocket: Receiver<websocket::Event>,
+        grpc: Receiver<grpc::Event>,
+        evictions: UnboundedReceiver<Pubkey>,
         mut shutdown: ShutdownHandle,
     ) {
+        let reason = tokio::select! {
+            biased;
+            _ = shutdown.signalled() => ShutdownReason::Signalled,
+            result = self.run_updates(websocket, grpc, evictions) => match result {
+                Ok(()) => ShutdownReason::Unexpected,
+                Err(error) => ShutdownReason::Error(Box::new(error)),
+            },
+        };
+        drop(self);
+        shutdown.terminate(reason);
+    }
+
+    async fn run_updates(
+        &self,
+        mut websocket: Receiver<websocket::Event>,
+        mut grpc: Receiver<grpc::Event>,
+        mut evictions: UnboundedReceiver<Pubkey>,
+    ) -> Result<()> {
         let mut coverage = Coverage::default();
         let mut tick = time::interval(DUPLICATION_DELAY);
         tick.tick().await;
         // Coverage changes and account application share this loop so buffered updates
         // cannot overtake a source removal or revive an evicted target.
-        let reason = loop {
-            let result = tokio::select! {
+        loop {
+            tokio::select! {
                 biased;
-                _ = shutdown.signalled() => break ShutdownReason::Signalled,
                 Some(event) = websocket.recv() => {
-                    self.on_websocket(event, &mut coverage).await
+                    self.on_websocket(event, &mut coverage).await?;
                 }
                 Some(event) = grpc.recv() => {
-                    self.on_grpc(event, &mut coverage).await
+                    self.on_grpc(event, &mut coverage).await?;
+                }
+                pubkey = evictions.recv() => {
+                    let Some(pubkey) = pubkey else { return Ok(()) };
+                    self.evict_cached(pubkey, &mut coverage).await?;
                 }
                 _ = tick.tick() => {
                     for client in &self.grpc {
                         client.command(Command::Rebuild);
                     }
-                    continue;
                 }
-            };
-            if let Err(error) = result {
-                break ShutdownReason::Error(Box::new(error));
             }
+        }
+    }
+
+    /// Claims only an eviction that still applies, excluding concurrent acquisition.
+    async fn evict_cached(&self, pubkey: Pubkey, coverage: &mut Coverage) -> Result<()> {
+        let Some(accessor) = self.engine.account(pubkey).await?.into_cached_eviction() else {
+            return Ok(());
         };
-        drop(self);
-        shutdown.terminate(reason);
+        for key in coverage.evicted(pubkey) {
+            self.grpc_client(key).command(Command::Remove(key));
+        }
+        // Queue cleanup under the lease so reacquisition cannot subscribe ahead of it.
+        self.websocket.evict(pubkey).await?;
+        accessor.delete().await?;
+        Ok(())
     }
 
     /// Applies WebSocket coverage changes and filters buffered account updates.

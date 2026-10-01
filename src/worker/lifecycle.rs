@@ -85,29 +85,32 @@ impl ChainSync {
             source_program,
         } = delegation;
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
-        let (actions, dependencies) = if !appended.is_empty() {
-            let compact: PostDelegationActions = borsh::from_slice(appended)?;
-            let actions = compact.decrypt_with_keypair(self.engine.signer())?;
-            let mut dependencies = BTreeMap::new();
-            for action in &actions {
-                dependencies.insert(action.program_id, AccountProperty::Program);
-                for meta in &action.accounts {
-                    let property =
-                        dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
-                    if meta.is_writable {
-                        *property = AccountProperty::Writable;
+        // Keep invalid actions with the trusted image so every acquisition path
+        // can schedule rescue without trying to load their dependencies.
+        let mut dependencies = BTreeMap::new();
+        let actions: Result<_> = (!appended.is_empty())
+            .then(|| {
+                let compact: PostDelegationActions = borsh::from_slice(appended)?;
+                let actions = compact.decrypt_with_keypair(self.engine.signer())?;
+                for action in &actions {
+                    dependencies.insert(action.program_id, AccountProperty::Program);
+                    for meta in &action.accounts {
+                        let property =
+                            dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
+                        if meta.is_writable {
+                            *property = AccountProperty::Writable;
+                        }
                     }
                 }
-            }
-            // The target must not hold its lease while these dependencies are acquired.
-            dependencies.remove(&pubkey);
-            let dependencies = dependencies
-                .into_iter()
-                .map(|(pubkey, property)| SyncAccount { pubkey, property });
-            (Some(actions), dependencies.collect())
-        } else {
-            (None, Vec::new())
-        };
+                Ok(actions)
+            })
+            .transpose();
+        // The target must not hold its lease while these dependencies are acquired.
+        dependencies.remove(&pubkey);
+        let dependencies = dependencies
+            .into_iter()
+            .map(|(pubkey, property)| SyncAccount { pubkey, property })
+            .collect();
         let prepared = PreparedDelegation {
             pubkey,
             account,
@@ -125,15 +128,19 @@ impl ChainSync {
             actions,
             source_program,
         } = prepared;
-        let actions = actions.map(|actions| PostFinalize { source_program, actions });
-        let accessor = self.engine.account(pubkey).await?;
-        let error = match accessor.materialize(account.clone(), actions).await {
-            Ok(()) => return Ok(()),
-            Err(error) => error,
+        let result = match actions {
+            Ok(actions) => {
+                let actions = actions.map(|actions| PostFinalize { source_program, actions });
+                let accessor = self.engine.account(pubkey).await?;
+                accessor.materialize(account.clone(), actions).await.map_err(Error::from)
+            }
+            Err(error) => Err(error),
         };
+        let Err(error) = result else { return Ok(()) };
+        warn!(%pubkey, %error, "delegation activation failed; scheduling undelegation");
         if let Err(rescue_error) = self.rescue_delegation(pubkey, account, source_program).await {
             warn!(%pubkey, %error, %rescue_error, "delegation rescue failed");
-            return Err(error.into());
+            return Err(error);
         }
         Ok(())
     }
@@ -215,8 +222,8 @@ pub(crate) struct PreparedDelegation {
     pubkey: Pubkey,
     /// Delegated image to materialize under that lease.
     account: AccountBuilder,
-    /// Trusted post-delegation actions, if the record carries any.
-    actions: Option<Vec<Instruction>>,
+    /// Decoded actions, or a payload error that requires rescue undelegation.
+    actions: Result<Option<Vec<Instruction>>>,
     /// Logical owner from the validated delegation record, including eATA projection.
     source_program: Pubkey,
 }
