@@ -1,4 +1,4 @@
-use std::{collections::hash_map::Entry::Occupied, time::Duration};
+use std::time::Duration;
 
 use ahash::AHashMap;
 use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
@@ -217,23 +217,7 @@ impl Registry {
                     let Some(request) = request else { return };
                     match request {
                         SubscriptionRequest::Subscribe(account, reply) => {
-                            if let Some(&index) = self.routes.get(&account.pubkey) {
-                                // Two acquisition waves can share one acknowledged subscription
-                                // while an incomplete primary is re-leased for its companion.
-                                match self.sockets[index].accounts.get_mut(&account.pubkey) {
-                                    Some(Subscription::Active { account: current, owners, .. })
-                                        if *current == account =>
-                                    {
-                                        *owners += 1;
-                                        let _ = reply.send(Ok(()));
-                                    }
-                                    _ => {
-                                        let _ = reply.send(Err(Error::Unavailable));
-                                    }
-                                }
-                            } else {
-                                self.subscribe(account, reply);
-                            }
+                            self.subscribe(account, reply);
                         }
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
                             self.unsubscribe(pubkey, reply).await;
@@ -268,6 +252,20 @@ impl Registry {
     /// Reserves capacity before waiting for remote acknowledgement.
     fn subscribe(&mut self, account: AccountSubscription, reply: Reply) {
         let pubkey = account.pubkey;
+        if let Some(&index) = self.routes.get(&pubkey) {
+            // Overlapping acquisition waves share an acknowledged subscription.
+            let result = match self.sockets[index].accounts.get_mut(&pubkey) {
+                Some(Subscription::Active { account: current, owners, .. })
+                    if *current == account =>
+                {
+                    *owners += 1;
+                    Ok(())
+                }
+                _ => Err(Error::Unavailable),
+            };
+            let _ = reply.send(result);
+            return;
+        }
         let index = match self.admit() {
             Ok(index) => index,
             Err(error) => {
@@ -331,17 +329,20 @@ impl Registry {
     /// Finds ready capacity without queuing behind connection attempts.
     fn admit(&mut self) -> Result<usize> {
         let len = self.sockets.len();
-        if let Some(index) = (self.cursor..len).chain(0..self.cursor).find(|&i| {
-            let socket = &self.sockets[i];
-            socket.healthy()
-                && socket.occupied() < self.config.providers[socket.id.provider].subs_per_connection
-        }) {
-            return Ok(index);
+        for index in (self.cursor..len).chain(0..self.cursor) {
+            let socket = &self.sockets[index];
+            if !socket.healthy() {
+                continue;
+            }
+            let limit = self.config.providers[socket.id.provider].subs_per_connection;
+            if socket.occupied() < limit {
+                return Ok(index);
+            }
         }
         self.grow();
-        let full = self.occupied == self.capacity
-            && self.sockets.len()
-                == self.config.providers.iter().map(|p| p.max_connections).sum::<usize>();
+        let limit: usize =
+            self.config.providers.iter().map(|provider| provider.max_connections).sum();
+        let full = self.occupied == self.capacity && self.sockets.len() == limit;
         Err(if full { Error::Capacity } else { Error::Unavailable })
     }
 
@@ -411,38 +412,36 @@ impl Registry {
         result: Result<Option<u64>>,
     ) {
         let socket = &mut self.sockets[connection.index];
-        let Occupied(mut entry) = socket.accounts.entry(pubkey) else { return };
-        match result {
-            Ok(Some(remote)) => {
-                let Subscription::Pending { account, .. } = entry.get() else { return };
-                let account = *account;
-                let Subscription::Pending { reply, cancel, .. } =
-                    entry.insert(Subscription::Active { remote, account, owners: 1 })
-                else {
-                    unreachable!()
-                };
+        let Some(state) = socket.accounts.remove(&pubkey) else { return };
+        let (reply, cancel, result) = match (state, result) {
+            (Subscription::Pending { reply, account, cancel }, Ok(Some(remote))) => {
                 if let Some(cancel) = cancel {
                     // Unsubscribe raced the subscribe acknowledgement; never publish coverage.
-                    *entry.get_mut() = Subscription::Unsubscribing(cancel);
+                    socket.accounts.insert(pubkey, Subscription::Unsubscribing(cancel));
                     let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
                 } else {
+                    socket
+                        .accounts
+                        .insert(pubkey, Subscription::Active { remote, account, owners: 1 });
                     let _ = self.events.send(Event::Acknowledged(account)).await;
                 }
                 let _ = reply.send(Ok(()));
+                return;
             }
-            result => {
-                self.routes.remove(&pubkey);
-                self.occupied -= 1;
-                let (reply, cancel) = match entry.remove() {
-                    Subscription::Pending { reply, cancel, .. } => (reply, cancel),
-                    Subscription::Unsubscribing(reply) => (reply, None),
-                    Subscription::Active { .. } => unreachable!(),
-                };
-                let _ = reply.send(result.map(|_| ()));
-                if let Some(cancel) = cancel {
-                    let _ = cancel.send(Ok(()));
-                }
+            (Subscription::Pending { reply, cancel, .. }, result) => (reply, cancel, result),
+            (Subscription::Unsubscribing(reply), result @ (Ok(None) | Err(_))) => {
+                (reply, None, result)
             }
+            (state, _) => {
+                socket.accounts.insert(pubkey, state);
+                return;
+            }
+        };
+        self.routes.remove(&pubkey);
+        self.occupied -= 1;
+        let _ = reply.send(result.map(|_| ()));
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(Ok(()));
         }
     }
 

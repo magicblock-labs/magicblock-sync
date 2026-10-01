@@ -1,6 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use dlp_api::pda::delegation_record_pda_from_delegated_account;
+use engine::AccountAccessor;
 use futures::future;
 use solana_account::{AccountBuilder, AccountMode, StateFlags};
 use solana_pubkey::Pubkey;
@@ -14,13 +18,13 @@ use crate::{
 impl ChainSync {
     /// Resolves each acquisition wave before applying actions that depend on later waves.
     pub(super) async fn sync_waves(&self, mut accounts: Vec<SyncAccount>) -> Result<()> {
+        accounts.sort_unstable_by_key(|account| account.pubkey);
+        accounts.dedup_by_key(|account| account.pubkey);
         // Promoted accounts keep their first-wave WS subscriptions until their refetch resolves.
         let mut carried_subscriptions = BTreeSet::new();
         let mut floor = None;
         let mut deferred = Vec::new();
         while !accounts.is_empty() {
-            accounts.sort_unstable_by_key(|account| account.pubkey);
-            accounts.dedup_by_key(|account| account.pubkey);
             let mut promotions = Vec::new();
             let mut next_floor = None;
             let mut delegations = Vec::new();
@@ -87,8 +91,7 @@ impl ChainSync {
                 }
                 ready.push((prepared, pubkey, unsubscribe));
             }
-            // The final reverse traverses dependency waves first, but keeps peers in order.
-            deferred.extend(ready.into_iter().rev());
+            deferred.push(ready);
             if next.is_empty() {
                 break;
             }
@@ -98,7 +101,7 @@ impl ChainSync {
                 .collect();
         }
         // A dependency's own actions must finish before the action that requested it.
-        for (prepared, pubkey, unsubscribe) in deferred.into_iter().rev() {
+        for (prepared, pubkey, unsubscribe) in deferred.into_iter().rev().flatten() {
             self.materialize_delegation(prepared).await?;
             if unsubscribe {
                 self.unsubscribe([pubkey]).await;
@@ -118,32 +121,36 @@ impl ChainSync {
         // fetching the same missing accounts.
         let keys: Vec<_> = batch.iter().map(|account| account.pubkey).collect();
         let accessors = self.engine.missing_accounts(&keys).await?;
-        // A competing wave may have materialized a promoted key while its lease was released.
-        let skipped: Vec<_> = keys
-            .iter()
-            .copied()
-            .filter(|key| {
-                carried_subscriptions.contains(key)
-                    && !accessors.iter().any(|accessor| accessor.pubkey() == *key)
-            })
-            .collect();
-        if accessors.is_empty() {
-            self.unsubscribe(skipped).await;
+        let plan = FetchPlan::new(batch, accessors, carried_subscriptions);
+        if plan.accounts.is_empty() {
+            self.unsubscribe(plan.skipped).await;
             return Ok(BatchOutcome::default());
         }
-        let plan = FetchPlan::new(batch, accessors, carried_subscriptions);
-        let (mut snapshot, prune) = self.fetch_batch(&plan, min_slot).await?;
-        let projected = match self.fetch_ata_companions(&plan, &snapshot).await {
-            Ok(projected) => projected,
+        self.subscribe(&plan.subscriptions).await?;
+        let fetched = async {
+            let mut snapshot = self.fetcher.fetch(&plan.keys, min_slot).await?;
+            let prune = plan.subscriptions_to_remove(&snapshot);
+            program::normalize_batch(&plan.programs, &mut snapshot.accounts, self.engine.rent())?;
+            let projected = self.fetch_ata_companions(&plan, &snapshot).await?;
+            Ok((snapshot, prune, projected))
+        }
+        .await;
+        let (mut snapshot, prune, projected) = match fetched {
+            Ok(fetched) => fetched,
             Err(error) => {
                 self.unsubscribe(plan.subscriptions.iter().map(|sub| sub.pubkey)).await;
                 return Err(error);
             }
         };
         let outcome = self
-            .materialize_batch(plan, &mut snapshot, projected, carried_subscriptions)
+            .materialize_batch(
+                plan.accounts,
+                &mut snapshot,
+                projected,
+                carried_subscriptions,
+            )
             .await?;
-        self.unsubscribe(prune.into_iter().chain(skipped)).await;
+        self.unsubscribe(prune.into_iter().chain(plan.skipped)).await;
         Ok(outcome)
     }
 
@@ -195,37 +202,16 @@ impl ChainSync {
         Ok(projected)
     }
 
-    /// Subscribes, fetches, and normalizes planned accounts, cleaning up subscriptions on failure.
-    async fn fetch_batch(
-        &self,
-        plan: &FetchPlan<'_>,
-        min_slot: Option<u64>,
-    ) -> Result<(Snapshot, Vec<Pubkey>)> {
-        self.subscribe(&plan.subscriptions).await?;
-        let result = async {
-            let mut snapshot = self.fetcher.fetch(&plan.keys, min_slot).await?;
-            let prune = plan.subscriptions_to_remove(&snapshot);
-            program::normalize_batch(&plan.programs, &mut snapshot.accounts, self.engine.rent())?;
-            Ok((snapshot, prune))
-        }
-        .await;
-        if result.is_err() {
-            let pubkeys = plan.subscriptions.iter().map(|sub| sub.pubkey);
-            self.unsubscribe(pubkeys).await;
-        }
-        result
-    }
-
     /// Materializes complete snapshots and defers readonly discoveries and action targets.
     async fn materialize_batch(
         &self,
-        plan: FetchPlan<'_>,
+        accounts: Vec<PendingAccount<'_>>,
         snapshot: &mut Snapshot,
         mut projected: Vec<Option<(AccountBuilder, Pubkey, Vec<u8>)>>,
         carried_subscriptions: &BTreeSet<Pubkey>,
     ) -> Result<BatchOutcome> {
         let mut outcome = BatchOutcome::default();
-        for pending in plan.accounts {
+        for pending in accounts {
             let pubkey = pending.accessor.pubkey();
             let mut account = snapshot.accounts[pending.index].take().unwrap_or_default();
             if ata::is_raw_eata(pubkey, &account) {
@@ -268,36 +254,39 @@ impl ChainSync {
                 ),
                 _ => None,
             };
-            let record = match (projected_record.as_ref(), delegation) {
-                (Some((source_program, record)), _) => Some((*source_program, record.as_slice())),
+            let projected = projected_record.is_some();
+            let record = match (projected_record, delegation) {
+                (Some((source_program, record)), _) => Some((source_program, Cow::Owned(record))),
                 (None, Some((metadata, record))) => {
                     account = delegation::account(account, metadata);
-                    Some((metadata.owner, record))
+                    Some((metadata.owner, Cow::Borrowed(record)))
                 }
                 (None, None) => None,
             };
-            let Some((source_program, record)) = record else {
-                pending.accessor.materialize(account, None).await?;
-                continue;
+            let unsubscribe = record.is_some()
+                && (projected
+                    || pending.property == AccountProperty::Payer
+                    || carried_subscriptions.contains(&pubkey));
+            let has_actions = match &record {
+                Some((_, record)) => {
+                    delegation::appended(record).is_some_and(|actions| !actions.is_empty())
+                }
+                None => false,
             };
-            let unsubscribe = projected_record.is_some()
-                || pending.property == AccountProperty::Payer
-                || carried_subscriptions.contains(&pubkey);
-            if account.read().is(AccountMode::Delegated)
-                && delegation::appended(record).is_some_and(|actions| !actions.is_empty())
-            {
+            let defer = account.read().is(AccountMode::Delegated) && has_actions;
+            if let Some((source_program, record)) = record.filter(|_| defer) {
                 let delegation = grpc::Delegation {
                     pubkey,
                     account,
-                    record: record.to_vec(),
+                    record: record.into_owned(),
                     source_program,
                 };
                 outcome.delegations.push(PendingDelegation { delegation, unsubscribe });
-            } else {
-                pending.accessor.materialize(account, None).await?;
-                if unsubscribe {
-                    self.unsubscribe([pubkey]).await;
-                }
+                continue;
+            }
+            pending.accessor.materialize(account, None).await?;
+            if unsubscribe {
+                self.unsubscribe([pubkey]).await;
             }
         }
         Ok(outcome)
@@ -335,7 +324,7 @@ impl ChainSync {
 /// One leased account and its positions in the ordered HTTP fetch batch.
 struct PendingAccount<'engine> {
     /// Lease held through snapshot processing unless the account is deferred for actions.
-    accessor: engine::AccountAccessor<'engine>,
+    accessor: AccountAccessor<'engine>,
     /// Selects companion-account and payer cleanup behavior.
     property: AccountProperty,
     /// Position of the primary account in `FetchPlan::keys`.
@@ -373,26 +362,33 @@ struct FetchPlan<'engine> {
     subscriptions: Vec<AccountSubscription>,
     /// Program and ProgramData positions used during normalization.
     programs: Vec<(usize, usize)>,
+    /// Promoted keys materialized by another wave before their leases were reacquired.
+    skipped: Vec<Pubkey>,
 }
 
 impl<'e> FetchPlan<'e> {
     /// Pairs ordered missing-account leases with requests and derives fetch inputs.
     fn new(
         batch: &[SyncAccount],
-        accessors: Vec<engine::AccountAccessor<'e>>,
+        accessors: Vec<AccountAccessor<'e>>,
         carried_subscriptions: &BTreeSet<Pubkey>,
     ) -> Self {
         // Engine returns missing accessors in pubkey order, matching the sorted request batch.
         let mut accessors = accessors.into_iter().peekable();
+        let len = accessors.len();
         let mut plan = Self {
-            accounts: Vec::with_capacity(accessors.len()),
-            keys: Vec::with_capacity(batch.len() * 2),
-            subscriptions: Vec::with_capacity(batch.len() * 2),
+            accounts: Vec::with_capacity(len),
+            keys: Vec::with_capacity(len * 2),
+            subscriptions: Vec::with_capacity(len * 2),
             programs: Vec::new(),
+            skipped: Vec::new(),
         };
         for request in batch {
             let Some(accessor) = accessors.next_if(|accessor| accessor.pubkey() == request.pubkey)
             else {
+                if carried_subscriptions.contains(&request.pubkey) {
+                    plan.skipped.push(request.pubkey);
+                }
                 continue;
             };
             let pubkey = request.pubkey;

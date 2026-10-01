@@ -162,11 +162,10 @@ impl ChainSync {
                     self.lost(coverage, Source::Grpc, pubkey).await?;
                 }
             }
-            grpc::Event::Update { stream, pubkey, target, account } => {
-                let sub = AccountSubscription { pubkey, target };
+            grpc::Event::Update { stream, sub, account } => {
                 if coverage.grpc_contains(stream, sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        error!(source = "gRPC", stream, %pubkey, %error, "account update failed");
+                        error!(source = "gRPC", stream, %sub.pubkey, %error, "account update failed");
                     }
                 }
             }
@@ -198,7 +197,7 @@ impl ChainSync {
             self.unsubscribe([pubkey]).await;
             return Ok(());
         }
-        let accessor = self.engine.account(target.unwrap_or(pubkey)).await?;
+        let accessor = self.engine.account(subscription.target()).await?;
         let account = match target {
             Some(_) => program::normalize_program_data(account, self.engine.rent())?,
             None if account.read().flags().contains(StateFlags::EXECUTABLE) => {

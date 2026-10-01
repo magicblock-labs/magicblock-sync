@@ -18,6 +18,8 @@ use yellowstone_grpc_proto::{
     tonic,
 };
 
+use crate::AccountSubscription;
+
 /// Configuration, transport, and stream failures.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -63,10 +65,8 @@ pub(super) enum Event {
     Update {
         /// Provider stream that delivered this retained update.
         stream: usize,
-        /// Retained account identity.
-        pubkey: Pubkey,
-        /// Program target when this is a ProgramData subscription.
-        target: Option<Pubkey>,
+        /// Retained account identity and optional ProgramData target.
+        sub: AccountSubscription,
         /// Raw account update, including zero-lamport updates.
         account: AccountBuilder,
     },

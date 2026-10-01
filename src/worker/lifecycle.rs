@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use dlp_api::{args::PostDelegationActions, Decrypt};
-use engine::PostFinalize;
+use engine::{AccountAccessor, EngineError, PostFinalize};
 use solana_account::{AccountBuilder, AccountMode};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -11,12 +11,15 @@ use crate::{aml, ata, delegation, grpc, AccountProperty, ChainSync, Error, Resul
 
 impl ChainSync {
     /// Loads dependencies for delegated actions before materializing the delegated account.
-    pub(super) async fn delegated(&self, delegation: grpc::Delegation) -> Result<()> {
-        if ata::is_eata(&delegation.account) {
-            return self.materialize_eata_delegation(delegation).await;
-        }
-        // Confined accounts have no commit authority: no actions, dependencies, or rescue.
-        if delegation.account.read().is(AccountMode::Magic) {
+    pub(super) async fn delegated(&self, mut delegation: grpc::Delegation) -> Result<()> {
+        let projected = ata::is_eata(&delegation.account);
+        if projected {
+            let Some(target) = self.project_delegation(delegation).await? else {
+                return Ok(());
+            };
+            delegation = target;
+        } else if delegation.account.read().is(AccountMode::Magic) {
+            // Confined accounts have no commit authority: no actions, dependencies, or rescue.
             self.engine
                 .account(delegation.pubkey)
                 .await?
@@ -24,23 +27,30 @@ impl ChainSync {
                 .await?;
             return Ok(());
         }
+        let pubkey = delegation.pubkey;
         let (prepared, dependencies) = self.prepare_delegation(delegation)?;
         self.sync(dependencies).await?;
-        self.materialize_delegation(prepared).await
+        self.materialize_delegation(prepared).await?;
+        if projected {
+            self.unsubscribe([pubkey]).await;
+        }
+        Ok(())
     }
 
     /// Projects a globally observed eATA delegation onto a resident canonical ATA.
-    async fn materialize_eata_delegation(&self, delegation: grpc::Delegation) -> Result<()> {
+    async fn project_delegation(
+        &self,
+        delegation: grpc::Delegation,
+    ) -> Result<Option<grpc::Delegation>> {
         let Some(candidates) = ata::candidates(delegation.pubkey, &delegation.account) else {
-            return Ok(());
+            return Ok(None);
         };
         for ata in candidates {
             let accessor = self.engine.account(ata).await?;
             if !accessor.exists() {
                 continue;
             }
-            let base = self.resident_account(ata)?;
-            let Some(base) = base else {
+            let Some(base) = self.resident_account(ata)? else {
                 continue;
             };
             let Some(account) = ata::project(
@@ -57,19 +67,14 @@ impl ChainSync {
                 continue;
             }
             drop(accessor);
-            let projected = grpc::Delegation {
+            return Ok(Some(grpc::Delegation {
                 pubkey: ata,
                 account,
                 record: delegation.record,
                 source_program: delegation.source_program,
-            };
-            let (prepared, dependencies) = self.prepare_delegation(projected)?;
-            self.sync(dependencies).await?;
-            self.materialize_delegation(prepared).await?;
-            self.unsubscribe([ata]).await;
-            return Ok(());
+            }));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Reads the current Engine image after acquiring any required account lease.
@@ -78,7 +83,7 @@ impl ChainSync {
         let loader = accounts.loader();
         let account = loader
             .read(&pubkey, |account| AccountBuilder::from(account.clone()))
-            .map_err(|error| engine::EngineError::State(error.into()))?;
+            .map_err(|error| EngineError::State(error.into()))?;
         Ok(account)
     }
 
@@ -96,24 +101,30 @@ impl ChainSync {
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
         // Keep invalid actions with the trusted image so every acquisition path
         // can schedule rescue without trying to load their dependencies.
+        let actions = if appended.is_empty() {
+            Ok(None)
+        } else {
+            match borsh::from_slice::<PostDelegationActions>(appended) {
+                Ok(actions) => actions
+                    .decrypt_with_keypair(self.engine.signer())
+                    .map(Some)
+                    .map_err(Error::from),
+                Err(error) => Err(error.into()),
+            }
+        };
         let mut dependencies = BTreeMap::new();
-        let actions: Result<_> = (!appended.is_empty())
-            .then(|| {
-                let compact: PostDelegationActions = borsh::from_slice(appended)?;
-                let actions = compact.decrypt_with_keypair(self.engine.signer())?;
-                for action in &actions {
-                    dependencies.insert(action.program_id, AccountProperty::Program);
-                    for meta in &action.accounts {
-                        let property =
-                            dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
-                        if meta.is_writable {
-                            *property = AccountProperty::Writable;
-                        }
+        if let Ok(Some(actions)) = &actions {
+            for action in actions {
+                dependencies.insert(action.program_id, AccountProperty::Program);
+                for meta in &action.accounts {
+                    let property =
+                        dependencies.entry(meta.pubkey).or_insert(AccountProperty::Readonly);
+                    if meta.is_writable {
+                        *property = AccountProperty::Writable;
                     }
                 }
-                Ok(actions)
-            })
-            .transpose();
+            }
+        }
         // The target must not hold its lease while these dependencies are acquired.
         dependencies.remove(&pubkey);
         let dependencies = dependencies
@@ -218,7 +229,7 @@ impl ChainSync {
     }
 
     /// Applies the existing undelegation lifecycle rule to one Engine target.
-    async fn undelegate_target(accessor: engine::AccountAccessor<'_>, slot: u64) -> Result<()> {
+    async fn undelegate_target(accessor: AccountAccessor<'_>, slot: u64) -> Result<()> {
         let pubkey = accessor.pubkey();
         let Some((mode, observed)) = accessor.observed() else {
             return Ok(());

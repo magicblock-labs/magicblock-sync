@@ -80,9 +80,8 @@ impl Coverage {
 
     /// Accepts a sent filter only for the current logical subscription.
     pub(super) fn confirmed(&mut self, stream: usize, pubkey: Pubkey, generation: u64) {
-        if let Some(entry) =
-            self.entries.get_mut(&pubkey).filter(|entry| entry.generation == generation)
-        {
+        let Some(entry) = self.entries.get_mut(&pubkey) else { return };
+        if entry.generation == generation {
             entry.grpc = Some(stream);
         }
     }
@@ -111,17 +110,16 @@ impl Coverage {
     pub(super) fn evicted(&mut self, target: Pubkey) -> impl Iterator<Item = Pubkey> + '_ {
         AccountSubscription::for_target(target).into_iter().filter_map(|sub| {
             let Occupied(entry) = self.entries.entry(sub.pubkey) else { return None };
-            (entry.get().sub == sub).then(|| entry.remove().sub.pubkey)
+            if entry.get().sub != sub {
+                return None;
+            }
+            Some(entry.remove().sub.pubkey)
         })
     }
 
     /// An Engine target survives while any other logical subscription names it.
     fn eviction_target(&self, sub: AccountSubscription) -> Option<Pubkey> {
-        let target = sub.target.unwrap_or(sub.pubkey);
-        (!self
-            .entries
-            .values()
-            .any(|entry| entry.sub.target.unwrap_or(entry.sub.pubkey) == target))
-        .then_some(target)
+        let target = sub.target();
+        (!self.entries.values().any(|entry| entry.sub.target() == target)).then_some(target)
     }
 }

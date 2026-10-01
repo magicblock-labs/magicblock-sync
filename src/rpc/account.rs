@@ -21,9 +21,9 @@ pub enum DecodeError {
 /// Borrowed RPC account before owner and payload validation.
 #[derive(Deserialize)]
 pub(crate) struct WireAccount<'a> {
-    /// Compressed bytes and their declared encoding.
+    /// Base64-encoded compressed bytes and their declared encoding.
     #[serde(borrow)]
-    data: EncodedData<'a>,
+    data: (&'a str, &'a str),
     /// Base58 owner pending public-key validation.
     owner: &'a str,
     /// Balance at the response context slot.
@@ -53,12 +53,3 @@ impl WireAccount<'_> {
 
 /// Encoding accepted by the shared account decoder.
 pub(super) const ENCODING: &str = "base64+zstd";
-
-/// Encoded payload and its encoding label.
-#[derive(Deserialize)]
-struct EncodedData<'a>(
-    /// Base64-encoded compressed account bytes.
-    &'a str,
-    /// Encoding declared by the provider.
-    &'a str,
-);

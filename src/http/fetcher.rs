@@ -7,7 +7,7 @@ use engine::Engine;
 use hyper::{body::Bytes, header::CONTENT_TYPE};
 use json::LazyValue;
 use reqwest::{redirect::Policy, retry, Client};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use tokio::time::{self, Instant};
@@ -49,23 +49,6 @@ struct Provider {
     until: AtomicU64,
 }
 
-/// Preserves key positions because `getMultipleAccounts` returns values in request order.
-#[derive(Serialize)]
-struct BatchParams(
-    /// Requested pubkeys in response order.
-    Vec<String>,
-    /// Shared encoding, finality, and slot floor.
-    AccountConfig,
-);
-
-/// Selected provider and its stable error-reporting index.
-struct SelectedProvider<'a> {
-    /// Position in the configured endpoint list.
-    index: usize,
-    /// Endpoint and its shared cooldown state.
-    provider: &'a Provider,
-}
-
 impl Fetcher {
     /// Rejects an empty provider list and shares provider cooldowns across fetches.
     pub fn new(providers: Vec<Url>, engine: Engine) -> Result<Self> {
@@ -97,14 +80,15 @@ impl Fetcher {
         // retry against a snapshot older than the one this call required.
         let minimum = min_slot.unwrap_or(0).max(self.engine.accounts().chain_slot());
         let deadline = Instant::now() + OVERALL;
-        let params = BatchParams(
+        // Preserve positions: getMultipleAccounts returns values in request order.
+        let params = (
             keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
             AccountConfig::new(Some(minimum)),
         );
         let request = Request::new(1, GET_MULTIPLE_ACCOUNTS, params);
         let body = Bytes::from(json::to_vec(&request)?);
         let mut last = None;
-        while let Some(SelectedProvider { index, provider }) = self.available(deadline).await {
+        while let Some((index, provider)) = self.available(deadline).await {
             let end = (Instant::now() + ATTEMPT).min(deadline);
             let result = self.attempt(provider, body.clone(), end, keys.len()).await;
             let error = match result {
@@ -129,7 +113,7 @@ impl Fetcher {
 
     /// Waits for the next cooldown only when no provider is eligible; returns
     /// `None` once the overall deadline has elapsed.
-    async fn available(&self, deadline: Instant) -> Option<SelectedProvider<'_>> {
+    async fn available(&self, deadline: Instant) -> Option<(usize, &Provider)> {
         while Instant::now() < deadline {
             let len = self.providers.len();
             let start = self.cursor.fetch_add(1, Relaxed) % len;
@@ -139,7 +123,7 @@ impl Fetcher {
                 let provider = &self.providers[index];
                 let until = provider.until.load(Relaxed);
                 if until <= now {
-                    return Some(SelectedProvider { index, provider });
+                    return Some((index, provider));
                 }
                 wake = wake.min(self.epoch + Duration::from_millis(until));
             }
@@ -182,10 +166,7 @@ impl Fetcher {
         let slot = result.context.slot;
         let mut accounts = Vec::with_capacity(expected);
         for account in result.value {
-            accounts.push(match account {
-                Some(account) => Some(account.decode(slot)?),
-                None => None,
-            });
+            accounts.push(account.map(|account| account.decode(slot)).transpose()?);
         }
         Ok(Snapshot { accounts, slot })
     }

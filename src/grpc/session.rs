@@ -34,7 +34,7 @@ use super::{
     client::Command, delegation::Delegations, transaction, Delegation, Error, Event, Result,
     StreamConfig,
 };
-use crate::{AccountSubscription, DUPLICATION_DELAY};
+use crate::{delegation, AccountSubscription, DUPLICATION_DELAY};
 
 /// Desired account interest and delegation state for one provider stream.
 pub(super) struct Session {
@@ -312,8 +312,7 @@ impl Session {
             self.engine.accounts().advance_chain_slot(slot);
             let event = Event::Update {
                 stream: self.id,
-                pubkey: key,
-                target: desired.sub.target,
+                sub: desired.sub,
                 account: image,
             };
             self.send(event).await;
@@ -321,7 +320,7 @@ impl Session {
         if !candidate {
             return Ok(());
         }
-        if let Some(record) = crate::delegation::record(&account.data) {
+        if let Some(record) = delegation::record(&account.data) {
             if let Some(delegation) = self.delegations.record(key, &account, record) {
                 self.delegated(delegation).await;
             }

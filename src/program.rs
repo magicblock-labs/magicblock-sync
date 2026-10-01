@@ -1,8 +1,11 @@
 //! Converts remote loader layouts into Engine's ELF account format.
 
+use std::mem::{offset_of, size_of};
+
 use solana_account::{AccountBuilder, AccountMode};
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_loader_v4_interface::state::{LoaderV4State, LoaderV4Status};
+use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4};
 
@@ -57,11 +60,7 @@ pub(super) fn normalize_program_data(
 }
 
 /// Configures a normalized ELF account for read-only Engine execution.
-fn elf_account(
-    account: AccountBuilder,
-    owner: solana_pubkey::Pubkey,
-    rent: &Rent,
-) -> AccountBuilder {
+fn elf_account(account: AccountBuilder, owner: Pubkey, rent: &Rent) -> AccountBuilder {
     let len = account.read().data().len();
     account
         .lamports(rent.minimum_balance(len))
@@ -87,12 +86,12 @@ fn v4_elf(data: &[u8]) -> Result<&[u8]> {
     let offset = LoaderV4State::program_data_offset();
     let header = data.get(..offset).ok_or(Error::Program("Loader V4 account is too short"))?;
     // Decode the discriminant as bytes so malformed input cannot create an invalid enum.
-    let status_offset = std::mem::offset_of!(LoaderV4State, status);
-    let status = header
-        .get(status_offset..status_offset + std::mem::size_of::<u64>())
+    let status_offset = offset_of!(LoaderV4State, status);
+    let bytes = header
+        .get(status_offset..status_offset + size_of::<u64>())
         .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_le_bytes)
         .ok_or(Error::Program("Loader V4 status is missing"))?;
+    let status = u64::from_le_bytes(bytes);
     if status == LoaderV4Status::Retracted as u64 {
         return Err(Error::Program("Loader V4 program is retracted"));
     }

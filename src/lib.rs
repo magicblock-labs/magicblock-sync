@@ -117,7 +117,7 @@ pub enum Error {
     #[error("at least one gRPC stream is required")]
     NoGrpcStreams,
     #[error("Engine account operation failed: {0}")]
-    Engine(#[from] engine::EngineError),
+    Engine(#[from] EngineError),
     #[error("invalid program: {0}")]
     Program(&'static str),
     #[error("invalid ProgramData: {0}")]
@@ -152,22 +152,18 @@ impl ChainSync {
         let fetcher = Fetcher::new(config.http, engine.clone())?;
         let (events, grpc_rx) = mpsc::channel(8192);
         let authority = config.grpc.authority;
-        let grpc = config
-            .grpc
-            .streams
-            .into_iter()
-            .enumerate()
-            .map(|(id, stream)| {
-                grpc::Client::new(
-                    id,
-                    stream,
-                    authority,
-                    engine.clone(),
-                    events.clone(),
-                    shutdown,
-                )
-            })
-            .collect::<grpc::Result<Vec<_>>>()?;
+        let mut grpc = Vec::with_capacity(config.grpc.streams.len());
+        for (id, stream) in config.grpc.streams.into_iter().enumerate() {
+            let client = grpc::Client::new(
+                id,
+                stream,
+                authority,
+                engine.clone(),
+                events.clone(),
+                shutdown,
+            )?;
+            grpc.push(client);
+        }
         let sync = Arc::new(Self {
             aml,
             engine,
@@ -230,6 +226,11 @@ struct AccountSubscription {
 }
 
 impl AccountSubscription {
+    /// Engine account updated by this subscription.
+    fn target(self) -> Pubkey {
+        self.target.unwrap_or(self.pubkey)
+    }
+
     /// Canonical ProgramData subscription that updates the owning program.
     fn program_data(pubkey: Pubkey) -> Self {
         Self {

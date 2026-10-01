@@ -81,7 +81,7 @@ impl Client {
             return Err(Error::Status(response.status()));
         }
         let assessment: Assessment = json::from_slice(&response.bytes().await?)?;
-        Ok(assessment.is_risky.then(|| *pubkey))
+        Ok(assessment.is_risky.then_some(*pubkey))
     }
 }
 
