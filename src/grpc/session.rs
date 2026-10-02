@@ -15,6 +15,7 @@ use engine::Engine;
 use futures::{SinkExt, StreamExt};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
+use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver},
     time::{self, Instant},
@@ -34,8 +35,7 @@ use yellowstone_grpc_proto::{
 };
 
 use super::{
-    client::Command, delegation::Delegations, transaction, Delegation, Error, Event, Result,
-    StreamConfig,
+    client::Command, delegation::Delegations, transaction, Error, Event, Result, StreamConfig,
 };
 use crate::metrics::{self, Transport};
 use crate::{delegation, AccountSubscription, DUPLICATION_DELAY};
@@ -161,7 +161,7 @@ impl Session {
         }
     }
 
-    /// Sends the full subscription request, including account and delegation filters.
+    /// Sends the full subscription request, including Clock, account, and delegation filters.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
         sink.send(self.request()).await.map_err(Into::into)
     }
@@ -249,24 +249,29 @@ impl Session {
         }
     }
 
-    /// Builds a request for tracked accounts, DLP-owned accounts, accepted delegation records,
-    /// and successful DLP transactions used to detect undelegation.
+    /// Builds a request for Clock, tracked accounts, DLP-owned accounts, accepted delegation
+    /// records, and successful DLP transactions used to detect undelegation.
     fn request(&mut self) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             commitment: Some(CommitmentLevel::Confirmed as i32),
             ..Default::default()
         };
+        // Keep mandatory Clock coverage independent of retained-account rebuilds.
+        let clock = SubscribeRequestFilterAccounts {
+            account: vec![clock::ID.to_string()],
+            ..Default::default()
+        };
+        request.accounts.insert(CLOCK_FILTER.into(), clock);
         if !self.retained_filter.is_empty() {
             self.retained_filter
                 .insert_into_subscribe_request(&mut request, RETAINED_FILTER);
         }
-        let owner = vec![dlp_api::id().to_string()];
-        let candidates = SubscribeRequestFilterAccounts {
-            owner: owner.clone(),
+        let dlp = SubscribeRequestFilterAccounts {
+            owner: vec![dlp_api::id().to_string()],
             nonempty_txn_signature: Some(true),
             ..Default::default()
         };
-        request.accounts.insert(CANDIDATES_FILTER.into(), candidates);
+        request.accounts.insert(CANDIDATES_FILTER.into(), dlp.clone());
 
         let authority_offset =
             AccountDiscriminator::SPACE + offset_of!(DelegationRecord, authority);
@@ -278,12 +283,7 @@ impl Session {
                 memcmp(0, discriminator.clone()),
                 memcmp(authority_offset as u64, authority.to_bytes().to_vec()),
             ];
-            let records = SubscribeRequestFilterAccounts {
-                owner: owner.clone(),
-                nonempty_txn_signature: Some(true),
-                filters,
-                ..Default::default()
-            };
+            let records = SubscribeRequestFilterAccounts { filters, ..dlp.clone() };
             request.accounts.insert(label.into(), records);
         }
 
@@ -297,12 +297,16 @@ impl Session {
         request
     }
 
-    /// Forwards tracked updates, discovers requests, and matches same-slot delegation pairs.
+    /// Advances the Clock watermark, forwards tracked updates, and discovers DLP lifecycle events.
     async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
         let mut account = update.account.ok_or(Error::Protocol("missing account image"))?;
         let key = super::pubkey(&account.pubkey)?;
+        if key == clock::ID {
+            // Clock is not transaction-written; its context slot is the confirmed watermark.
+            self.engine.accounts().advance_chain_slot(slot);
+        }
         let candidate = account.owner == dlp_api::id().as_ref();
         if let Some(desired) = self.desired.get(&key).filter(|_| self.retained_filter.contains(key))
         {
@@ -315,7 +319,6 @@ impl Session {
                 .executable(account.executable)
                 .slot(slot)
                 .data(data);
-            self.engine.accounts().advance_chain_slot(slot);
             let event = Event::Update {
                 stream: self.id,
                 sub: desired.sub,
@@ -331,26 +334,19 @@ impl Session {
             .map(|request| request.delegated_account)
             .filter(|pubkey| key == undelegation_request_pda_from_delegated_account(pubkey));
         if let Some(pubkey) = request {
-            self.engine.accounts().advance_chain_slot(slot);
             self.send(Event::UndelegationRequested { pubkey, slot }).await;
         }
         let delegation = delegation::record(&account.data)
             .and_then(|record| self.delegations.record(key, &account, record));
         if let Some(delegation) = delegation {
-            self.delegated(delegation).await;
+            self.send(Event::Delegated(delegation)).await;
         }
         // Account data may parse as a record by coincidence. Consider both roles;
         // a match is valid only at the application's derived delegation-record address.
         if let Some(delegation) = self.delegations.account(key, account) {
-            self.delegated(delegation).await;
+            self.send(Event::Delegated(delegation)).await;
         }
         Ok(())
-    }
-
-    /// Advances Engine's confirmed chain slot before reporting the resolved delegation.
-    async fn delegated(&self, delegation: Delegation) {
-        self.engine.accounts().advance_chain_slot(delegation.account.read().slot());
-        self.send(Event::Delegated(delegation)).await;
     }
 
     async fn send(&self, event: Event) {
@@ -359,6 +355,7 @@ impl Session {
 }
 
 const RETAINED_FILTER: &str = "retained";
+const CLOCK_FILTER: &str = "clock";
 const CANDIDATES_FILTER: &str = "candidates";
 const RECORDS_FILTER: &str = "records";
 const CONFINED_FILTER: &str = "confined";

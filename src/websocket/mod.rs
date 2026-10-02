@@ -101,7 +101,7 @@ pub(super) enum Event {
     },
     /// Lost subscriptions; earlier queued updates precede this event.
     Dropped {
-        /// Lost account subscriptions, excluding internal `Clock` and cancelled requests.
+        /// Lost account subscriptions, excluding cancelled requests.
         pubkeys: Vec<Pubkey>,
     },
 }

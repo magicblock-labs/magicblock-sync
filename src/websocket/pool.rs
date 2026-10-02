@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use ahash::AHashMap;
 use nucleus::shutdown::{Service, ShutdownManager, ShutdownReason};
-use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::{
         mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
@@ -68,10 +67,9 @@ struct Socket {
     commands: UnboundedSender<Command>,
     /// Aborted when this entry is replaced or dropped.
     task: JoinHandle<()>,
-    /// Requested account subscriptions and pending replies; excludes internal `Clock`.
+    /// Requested account subscriptions and pending replies.
     accounts: AHashMap<Pubkey, Subscription>,
     ready: bool,
-    clock: bool,
     /// Reconnect delay reset after observed readiness.
     backoff: Duration,
 }
@@ -79,11 +77,6 @@ struct Socket {
 impl Socket {
     fn healthy(&self) -> bool {
         self.ready && !self.commands.is_closed()
-    }
-
-    /// The internal `Clock` subscription consumes provider capacity too.
-    fn occupied(&self) -> usize {
-        self.accounts.len() + usize::from(self.clock)
     }
 }
 
@@ -114,7 +107,7 @@ impl Pool {
         let mut shutdown = manager.handle(Service::ChainSyncWebSocket);
         tokio::spawn(async move {
             for provider in 0..registry.config.providers.len() {
-                registry.open(provider, true);
+                registry.open(provider);
             }
             tokio::select! {
                 _ = shutdown.signalled() => {},
@@ -186,7 +179,7 @@ struct Registry {
     events: Sender<Event>,
     /// Socket outcomes arrive independently of public updates.
     notices: UnboundedSender<Notice>,
-    /// Capacity occupied by account subscription states and internal `Clock` subscriptions.
+    /// Capacity occupied by requested account subscription states.
     occupied: usize,
     /// Capacity allocated to all entries, including connecting sockets.
     capacity: usize,
@@ -328,7 +321,7 @@ impl Registry {
                 continue;
             }
             let limit = self.config.providers[socket.id.provider].subs_per_connection;
-            if socket.occupied() < limit {
+            if socket.accounts.len() < limit {
                 return Ok(index);
             }
         }
@@ -359,8 +352,7 @@ impl Registry {
                 let provider = self.config.providers[connection.provider].url.host_str();
                 metrics::transport(Transport::WebSocket);
                 let socket = &mut self.sockets[connection.index];
-                self.occupied -= socket.occupied();
-                let clock = socket.clock;
+                self.occupied -= socket.accounts.len();
                 let delay =
                     (socket.backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
                 let mut pubkeys = Vec::new();
@@ -394,9 +386,7 @@ impl Registry {
                     generation: connection.generation + 1,
                     ..connection
                 };
-                let replacement = self.spawn(id, delay, clock);
-                self.occupied += replacement.occupied();
-                self.sockets[connection.index] = replacement;
+                self.sockets[connection.index] = self.spawn(id, delay);
             }
         }
         if self.should_grow() {
@@ -445,15 +435,9 @@ impl Registry {
         }
     }
 
-    /// Starts a connection with internal `Clock` queued before account subscription commands.
-    fn spawn(&self, id: ConnectionId, backoff: Duration, clock: bool) -> Socket {
+    /// Starts a connection ready to accept requested account subscriptions.
+    fn spawn(&self, id: ConnectionId, backoff: Duration) -> Socket {
         let (commands, receiver) = mpsc::unbounded_channel();
-        if clock {
-            let _ = commands.send(Command::Subscribe(AccountSubscription {
-                pubkey: clock::ID,
-                program: None,
-            }));
-        }
         let task = tokio::spawn(Session::start(
             id,
             self.config.providers[id.provider].url.clone(),
@@ -468,7 +452,6 @@ impl Registry {
             task,
             accounts: AHashMap::new(),
             ready: false,
-            clock,
             backoff,
         }
     }
@@ -505,19 +488,18 @@ impl Registry {
         // A full provider or one without healthy sockets naturally opens an empty batch.
         let batch = healthy.min(config.max_connections - count);
         for _ in 0..batch {
-            self.open(provider, false);
+            self.open(provider);
         }
     }
 
     /// Allocates a pool entry and starts its first connection attempt.
-    fn open(&mut self, provider: usize, clock: bool) {
+    fn open(&mut self, provider: usize) {
         let id = ConnectionId {
             provider,
             index: self.sockets.len(),
             generation: 0,
         };
-        let socket = self.spawn(id, Duration::ZERO, clock);
-        self.occupied += socket.occupied();
+        let socket = self.spawn(id, Duration::ZERO);
         self.sockets.push(socket);
         self.capacity += self.config.providers[provider].subs_per_connection;
     }

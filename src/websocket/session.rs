@@ -17,7 +17,6 @@ use json::{JsonValueTrait, LazyValue};
 use serde::{Deserialize, Serialize};
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
-use solana_sdk_ids::sysvar::clock;
 use tokio::{
     sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     time::{self, Instant, MissedTickBehavior, Sleep},
@@ -296,9 +295,6 @@ impl Session {
             Some(value) => value.decode(slot)?,
             None => AccountBuilder::default(),
         };
-        if sub.pubkey == clock::ID {
-            return Ok(());
-        }
         self.events
             .send(Event::Update { sub, account })
             .await
@@ -314,17 +310,15 @@ impl Session {
     ) -> Result<()> {
         if let Some(error) = error {
             let error: RpcError = json::from_str(error.as_raw_str())?;
-            // Clock is mandatory; rejected unsubscribe leaves remote capacity ambiguous.
-            return match pending.command {
-                Command::Subscribe(account) if account.pubkey != clock::ID => {
-                    self.notify(Notice::Acknowledged {
-                        connection: self.id,
-                        pubkey: account.pubkey,
-                        result: Err(Error::Rpc(error)),
-                    })
-                }
-                _ => Err(Error::Rpc(error)),
+            // Rejected unsubscribe leaves remote capacity ambiguous.
+            let Command::Subscribe(account) = pending.command else {
+                return Err(Error::Rpc(error));
             };
+            return self.notify(Notice::Acknowledged {
+                connection: self.id,
+                pubkey: account.pubkey,
+                result: Err(Error::Rpc(error)),
+            });
         }
         let result = result.ok_or(Error::Protocol("missing RPC result"))?;
         let (pubkey, remote) = match pending.command {
@@ -341,9 +335,6 @@ impl Session {
                 // Route notifications before waking the pool's subscribe waiter.
                 if self.active.insert(remote, account).is_some() {
                     return Err(Error::Protocol("duplicate remote subscription ID"));
-                }
-                if account.pubkey == clock::ID {
-                    return Ok(());
                 }
                 (account.pubkey, Some(remote))
             }
