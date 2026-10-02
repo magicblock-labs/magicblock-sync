@@ -3,16 +3,10 @@ use std::collections::hash_map::Entry::Occupied;
 use ahash::AHashMap;
 use solana_pubkey::Pubkey;
 
-use crate::AccountSubscription;
+use crate::{metrics, AccountSubscription};
 
-/// Identity of a transport that can deliver an account update.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Source {
-    /// The WebSocket pool's single subscription for an account.
-    WebSocket,
-    /// The gRPC stream selected for this key.
-    Grpc,
-}
+/// Transport identity shared by coverage transitions and loss metrics.
+pub(super) use crate::metrics::Transport as Source;
 
 /// Confirmed coverage for one logical subscription.
 struct Entry {
@@ -26,7 +20,19 @@ struct Entry {
     grpc: Option<usize>,
 }
 
-/// Single-owner account coverage; transport workers report outcomes but never mutate it.
+impl Entry {
+    /// Gauge label for the current source combination, or `None` after final-source loss.
+    fn coverage(&self) -> Option<&'static str> {
+        match (self.ws, self.grpc.is_some()) {
+            (true, false) => Some("ws_only"),
+            (false, true) => Some("grpc_only"),
+            (true, true) => Some("both"),
+            (false, false) => None,
+        }
+    }
+}
+
+/// Account coverage mutated only by the ChainSync worker; transports report changes as events.
 #[derive(Default)]
 pub(super) struct Coverage {
     /// Keys with at least one confirmed source.
@@ -39,42 +45,45 @@ impl Coverage {
     /// Records a WS acknowledgement and returns its current generation for gRPC reuse.
     pub(super) fn acknowledged(&mut self, sub: AccountSubscription) -> u64 {
         if let Some(entry) = self.entries.get_mut(&sub.pubkey) {
+            let before = entry.coverage();
             entry.ws = true;
+            metrics::coverage(before, entry.coverage());
             return entry.generation;
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        self.entries.insert(
-            sub.pubkey,
-            Entry {
-                sub,
-                generation,
-                ws: true,
-                grpc: None,
-            },
-        );
+        let entry = Entry {
+            sub,
+            generation,
+            ws: true,
+            grpc: None,
+        };
+        metrics::coverage(None, entry.coverage());
+        self.entries.insert(sub.pubkey, entry);
         generation
     }
 
     /// Removes the logical subscription, including any in-flight transport request.
     pub(super) fn removed(&mut self, pubkey: Pubkey) -> Option<Pubkey> {
         let entry = self.entries.remove(&pubkey)?;
+        metrics::coverage(entry.coverage(), None);
         self.eviction_target(entry.sub)
     }
 
     /// Drops one source; returns whether coverage ended and any Engine target to evict.
     pub(super) fn lost(&mut self, source: Source, pubkey: Pubkey) -> (bool, Option<Pubkey>) {
         let Some(entry) = self.entries.get_mut(&pubkey) else { return (false, None) };
+        let before = entry.coverage();
         match source {
-            Source::WebSocket => {
-                entry.ws = false;
-            }
+            Source::WebSocket => entry.ws = false,
             Source::Grpc => entry.grpc = None,
         }
+        metrics::coverage(before, entry.coverage());
         // Losing WebSocket alone does not evict an account with a confirmed gRPC copy.
         if entry.ws || entry.grpc.is_some() {
             return (false, None);
         }
+        metrics::lost(source);
         (true, self.removed(pubkey))
     }
 
@@ -82,7 +91,9 @@ impl Coverage {
     pub(super) fn confirmed(&mut self, stream: usize, pubkey: Pubkey, generation: u64) {
         let Some(entry) = self.entries.get_mut(&pubkey) else { return };
         if entry.generation == generation {
+            let before = entry.coverage();
             entry.grpc = Some(stream);
+            metrics::coverage(before, entry.coverage());
         }
     }
 
@@ -113,7 +124,9 @@ impl Coverage {
             if entry.get().sub != sub {
                 return None;
             }
-            Some(entry.remove().sub.pubkey)
+            let entry = entry.remove();
+            metrics::coverage(entry.coverage(), None);
+            Some(entry.sub.pubkey)
         })
     }
 
@@ -121,5 +134,14 @@ impl Coverage {
     fn eviction_target(&self, sub: AccountSubscription) -> Option<Pubkey> {
         let target = sub.target();
         (!self.entries.values().any(|entry| entry.sub.target() == target)).then_some(target)
+    }
+}
+
+impl Drop for Coverage {
+    /// Removes this worker's surviving subscriptions from process-wide coverage gauges.
+    fn drop(&mut self) {
+        for entry in self.entries.values() {
+            metrics::coverage(entry.coverage(), None);
+        }
     }
 }

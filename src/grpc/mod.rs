@@ -61,9 +61,8 @@ pub struct StreamConfig {
 
 /// Ordered account and lifecycle events from one provider.
 pub(super) enum Event {
-    /// Retained account builder in `Uninit` mode for caller classification.
+    /// Retained account update in `Uninit` mode, before Engine materialization.
     Update {
-        /// Provider stream that delivered this retained update.
         stream: usize,
         /// Retained account identity and optional ProgramData target.
         sub: AccountSubscription,
@@ -73,19 +72,12 @@ pub(super) enum Event {
     /// New delegation matched to the account's delegation record PDA.
     Delegated(Delegation),
     /// Accounts undelegated in a successful transaction at this slot.
-    Undelegated {
-        /// Distinct undelegated accounts.
-        pubkeys: SmallVec<[Pubkey; 1]>,
-        /// Confirmed undelegation slot.
-        slot: u64,
-    },
+    Undelegated { pubkeys: SmallVec<[Pubkey; 1]>, slot: u64 },
     /// A retained filter was sent on a live stream for this logical generation.
     Confirmed {
-        /// Stream that sent or already retained the account filter.
         stream: usize,
-        /// Exact retained account key.
         pubkey: Pubkey,
-        /// Owner-issued identity of the current logical subscription.
+        /// Generation assigned by the coverage registry to reject stale confirmations.
         gen: u64,
     },
     /// The outer stream attempt ended; Yellowstone's internal reconnect does not emit this.
@@ -104,7 +96,11 @@ fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
         .map_err(|_| Error::Protocol("invalid public key"))
 }
 
+/// Shutdown-managed stream commands and client handle.
 mod client;
+/// Same-slot matching of delegated account images and delegation records.
 mod delegation;
+/// Yellowstone sessions, retained filters, and ordered event delivery.
 mod session;
+/// DLP lifecycle decoding from successful transactions and their CPIs.
 mod transaction;

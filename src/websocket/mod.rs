@@ -2,7 +2,7 @@
 //!
 //! Drain the event receiver while awaiting pool operations. Acknowledgement
 //! confirms a subscription, not an initial snapshot. On connection loss,
-//! callers may retry missing coverage. Each attempt uses ready capacity
+//! subscription requests may be retried. Each attempt uses ready capacity
 //! or fails without queuing behind a reconnect.
 //!
 
@@ -54,6 +54,7 @@ pub enum Error {
     Tls(#[from] tokio_rustls::rustls::Error),
 }
 
+/// WebSocket result retaining connection, protocol, and subscription failures.
 type Result<T> = std::result::Result<T, Error>;
 
 /// Endpoint and capacity limits for one provider.
@@ -87,11 +88,11 @@ pub(super) struct ConnectionId {
 
 /// Account and connection events, ordered within each connection only.
 pub(super) enum Event {
-    /// Server acknowledged a user subscription.
+    /// Server acknowledged a requested account subscription.
     Acknowledged(AccountSubscription),
-    /// Caller requested intentional removal, before server acknowledgement.
+    /// The last subscription reference was released, before unsubscribe acknowledgement.
     Removed(Pubkey),
-    /// Confirmed update builder in `Uninit` mode for caller classification.
+    /// Confirmed account update in `Uninit` mode, before Engine materialization.
     Update {
         /// Observed account and optional ProgramData target.
         sub: AccountSubscription,
@@ -100,15 +101,16 @@ pub(super) enum Event {
     },
     /// Lost subscriptions; earlier queued updates precede this event.
     Dropped {
-        /// Lost user subscriptions, excluding internal `Clock` and cancelled operations.
+        /// Lost account subscriptions, excluding internal `Clock` and cancelled requests.
         pubkeys: Vec<Pubkey>,
-        /// Cause of loss, including event-delivery failure.
-        error: Error,
     },
 }
 
 pub(super) use pool::Pool;
 
+/// Provider capacity, subscription routing, and replacement connections.
 mod pool;
+/// Socket requests, acknowledgements, notifications, and timeouts.
 mod session;
+/// TCP/TLS connection setup and WebSocket upgrade.
 mod transport;

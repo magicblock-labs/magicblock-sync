@@ -16,7 +16,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver},
     time::{self, Instant},
 };
-use tracing::warn;
+use tracing::error;
 use yellowstone_grpc_client::{
     ClientTlsConfig, GeyserGrpcClient, GeyserGrpcClientError, ReconnectConfig, SubscribeRequestSink,
 };
@@ -34,15 +34,14 @@ use super::{
     client::Command, delegation::Delegations, transaction, Delegation, Error, Event, Result,
     StreamConfig,
 };
+use crate::metrics::{self, Transport};
 use crate::{delegation, AccountSubscription, DUPLICATION_DELAY};
 
 /// Desired account interest and delegation state for one provider stream.
 pub(super) struct Session {
     /// Stable index in the configured provider list.
     id: usize,
-    /// Endpoint and provider credentials.
     config: StreamConfig,
-    /// Authority observed for delegation lifecycle events.
     authority: Pubkey,
     /// Physical account filter; a rebuild sends changes before confirming coverage.
     retained_filter: CompressedAccountFilterSet,
@@ -50,7 +49,6 @@ pub(super) struct Session {
     desired: AHashMap<Pubkey, TrackedAccount>,
     /// Engine owns the confirmed-observation watermark.
     engine: Engine,
-    /// Ordered account and lifecycle event delivery.
     events: mpsc::Sender<Event>,
     /// Same-slot application and record matching.
     delegations: Delegations,
@@ -60,7 +58,7 @@ pub(super) struct Session {
 struct TrackedAccount {
     /// Exact key and optional ProgramData target.
     sub: AccountSubscription,
-    /// Owner-issued logical subscription generation.
+    /// Generation assigned by the coverage registry to reject stale confirmations.
     gen: u64,
     /// Time the track command arrived, which starts the duplication delay.
     tracked_at: Instant,
@@ -93,9 +91,11 @@ impl Session {
     pub(super) async fn run(mut self, mut commands: UnboundedReceiver<Command>) -> Result<()> {
         loop {
             let Err(error) = self.subscribe(&mut commands).await else { return Ok(()) };
+            let retryable = recoverable(&error);
+            metrics::transport(self.id, Transport::Grpc);
+            error!(stream = self.id, retryable, %error, "gRPC session failed");
             let _ = self.events.send(Event::Lost(self.id)).await;
-            if recoverable(&error) {
-                warn!(%error, "gRPC unavailable; retrying");
+            if retryable {
                 #[allow(clippy::disallowed_methods)]
                 time::sleep(RETRY_DELAY).await;
             } else {
@@ -236,7 +236,7 @@ impl Session {
         Ok((!remove.is_empty() || !added.is_empty()).then_some(added))
     }
 
-    /// Reports account filter delivery to the single coverage owner.
+    /// Reports account filter delivery to the ChainSync worker.
     async fn confirm(&self, confirmations: impl IntoIterator<Item = (Pubkey, u64)>) {
         for (pubkey, gen) in confirmations {
             self.send(Event::Confirmed { stream: self.id, pubkey, gen }).await;
@@ -339,25 +339,17 @@ impl Session {
         self.send(Event::Delegated(delegation)).await;
     }
 
-    /// Sends an event to the coverage owner.
     async fn send(&self, event: Event) {
         let _ = self.events.send(event).await;
     }
 }
 
-/// Label for the exact retained-account filter.
 const RETAINED_FILTER: &str = "retained";
-/// Label for DLP-owned application candidates.
 const CANDIDATES_FILTER: &str = "candidates";
-/// Label for delegation record candidates.
 const RECORDS_FILTER: &str = "records";
-/// Label for authority-free confinement records.
 const CONFINED_FILTER: &str = "confined";
-/// Label for successful ownership-return transactions.
 const RELEASES_FILTER: &str = "releases";
-/// Opaque heartbeat identity echoed to Yellowstone.
 const PING_ID: i32 = 1;
-/// Maximum decoded provider message size.
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Builds a byte-level field comparison for an account filter.

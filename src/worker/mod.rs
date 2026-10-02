@@ -16,12 +16,13 @@ use tokio::{
     sync::mpsc::{Receiver, UnboundedReceiver},
     time,
 };
-use tracing::{error, warn};
+use tracing::error;
 
 use self::coverage::{Coverage, Source};
 use crate::{
     ata,
     grpc::{self, Command},
+    metrics::{self, Op},
     program, websocket, AccountSubscription, ChainSync, Result, DUPLICATION_DELAY,
 };
 
@@ -45,14 +46,22 @@ impl ChainSync {
             biased;
             _ = shutdown.signalled() => ShutdownReason::Signalled,
             result = self.run_updates(websocket, grpc, evictions) => match result {
-                Ok(()) => ShutdownReason::Unexpected,
-                Err(error) => ShutdownReason::Error(Box::new(error)),
+                Ok(()) => {
+                    error!("ChainSync worker stopped unexpectedly");
+                    ShutdownReason::Unexpected
+                }
+                Err(error) => {
+                    error!(%error, "ChainSync worker stopped unexpectedly");
+                    ShutdownReason::Error(Box::new(error))
+                }
             },
         };
         drop(self);
         shutdown.terminate(reason);
     }
 
+    /// Owns coverage and serializes transport updates, evictions, and filter rebuilds.
+    /// Ends when Engine's eviction channel closes or an event handler fails.
     async fn run_updates(
         &self,
         mut websocket: Receiver<websocket::Event>,
@@ -117,12 +126,11 @@ impl ChainSync {
             websocket::Event::Update { sub, account } => {
                 if coverage.ws_contains(sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        error!(source = "WS", %sub.pubkey, %error, "account update failed");
+                        error!(%sub.pubkey, %error, "WS update failed");
                     }
                 }
             }
-            websocket::Event::Dropped { pubkeys, error } => {
-                warn!(lost = pubkeys.len(), %error, "WebSocket subscriptions lost");
+            websocket::Event::Dropped { pubkeys } => {
                 for pubkey in pubkeys {
                     self.lost(coverage, Source::WebSocket, pubkey).await?;
                 }
@@ -165,7 +173,7 @@ impl ChainSync {
             grpc::Event::Update { stream, sub, account } => {
                 if coverage.grpc_contains(stream, sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        error!(source = "gRPC", stream, %sub.pubkey, %error, "account update failed");
+                        error!(stream, %sub.pubkey, %error, "gRPC update failed");
                     }
                 }
             }
@@ -192,6 +200,7 @@ impl ChainSync {
         subscription: AccountSubscription,
         account: AccountBuilder,
     ) -> Result<()> {
+        let _timer = metrics::time(Op::Apply);
         let AccountSubscription { pubkey, target } = subscription;
         if target.is_none() && ata::is_raw_eata(pubkey, &account) {
             self.unsubscribe([pubkey]).await;

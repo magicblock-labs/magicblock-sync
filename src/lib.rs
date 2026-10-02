@@ -24,6 +24,8 @@ mod delegation;
 mod grpc;
 /// Confirmed HTTP account snapshots.
 mod http;
+/// Private process-wide operation and transport instrumentation.
+mod metrics;
 /// Executable and ProgramData normalization.
 mod program;
 /// Shared RPC wire types and account decoding.
@@ -144,6 +146,7 @@ impl ChainSync {
         config: ChainSyncConfig,
         shutdown: &mut ShutdownManager,
     ) -> Result<Arc<Self>> {
+        metrics::init();
         if config.grpc.streams.is_empty() {
             return Err(Error::NoGrpcStreams);
         }

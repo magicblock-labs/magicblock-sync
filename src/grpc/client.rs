@@ -9,7 +9,12 @@ use crate::AccountSubscription;
 /// One serialized change to a stream's logical account interest.
 pub(crate) enum Command {
     /// Tracks an acknowledged WS account until its filter becomes eligible.
-    Track { sub: AccountSubscription, gen: u64 },
+    Track {
+        /// Exact subscribed key and optional ProgramData target.
+        sub: AccountSubscription,
+        /// Generation assigned by the coverage registry to reject stale confirmations.
+        gen: u64,
+    },
     /// Ends logical interest immediately; remote removal waits for a rebuild.
     Remove(Pubkey),
     /// Sends the full filter only when aged additions or removals changed it.
@@ -36,9 +41,8 @@ impl Client {
             let reason = tokio::select! {
                 biased;
                 _ = shutdown.signalled() => ShutdownReason::Signalled,
-                result = session.run(requests) => match result {
-                    Ok(()) => ShutdownReason::Unexpected,
-                    Err(error) => ShutdownReason::Error(Box::new(error)),
+                Err(error) = session.run(requests) => {
+                    ShutdownReason::Error(Box::new(error))
                 },
             };
             shutdown.terminate(reason);

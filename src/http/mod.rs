@@ -46,16 +46,64 @@ pub(super) use fetcher::{Fetcher, Snapshot};
 impl Error {
     /// Distinguishes transient endpoint failures from final decoding failures.
     fn retryable(&self) -> bool {
+        matches!(
+            self.outcome(),
+            Outcome::Timeout | Outcome::RateLimited | Outcome::Behind | Outcome::Unavailable
+        )
+    }
+
+    /// Shared classification for retry policy and provider attempt metrics.
+    pub(crate) fn outcome(&self) -> Outcome {
         match self {
-            Error::Status(status) => {
-                status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+            Self::Timeout(_) => Outcome::Timeout,
+            Self::Request(error) if error.is_timeout() => Outcome::Timeout,
+            Self::Status(status) if status.as_u16() == 408 => Outcome::Timeout,
+            Self::Status(status) if status.as_u16() == 429 => Outcome::RateLimited,
+            Self::Rpc(RpcError { code: -32016, .. }) => Outcome::Behind,
+            Self::Rpc(RpcError { code: -32005, .. }) => Outcome::Unavailable,
+            Self::Status(status) if status.is_server_error() => Outcome::Unavailable,
+            Self::Request(error) if !error.is_builder() && !error.is_decode() => {
+                Outcome::Unavailable
             }
-            Error::Rpc(RpcError { code, .. }) => matches!(code, -32005 | -32016),
-            Error::Request(error) => !error.is_builder() && !error.is_decode(),
-            Error::Timeout(_) => true,
-            _ => false,
+            Self::Protocol(_) | Self::Json(_) | Self::Account(_) => Outcome::InvalidResponse,
+            Self::Request(error) if error.is_decode() => Outcome::InvalidResponse,
+            _ => Outcome::Other,
         }
     }
 }
 
+/// Low-cardinality provider results shared by retry policy and metrics.
+#[derive(Clone, Copy)]
+pub(crate) enum Outcome {
+    /// The provider returned a valid snapshot.
+    Success,
+    /// The request timed out or the provider returned HTTP 408.
+    Timeout,
+    /// The provider returned HTTP 429.
+    RateLimited,
+    /// RPC -32016 reports that the required context slot is unavailable.
+    Behind,
+    /// Transient transport, server, or RPC -32005 failure.
+    Unavailable,
+    /// Malformed protocol data, JSON, response body, or account encoding.
+    InvalidResponse,
+    /// A non-retryable failure outside the recognized categories.
+    Other,
+}
+
+impl Outcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate_limited",
+            Self::Behind => "behind",
+            Self::Unavailable => "unavailable",
+            Self::InvalidResponse => "invalid_response",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Snapshot requests, provider failover, and shared endpoint cooldowns.
 mod fetcher;

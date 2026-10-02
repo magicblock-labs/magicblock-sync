@@ -11,23 +11,25 @@ use serde::Deserialize;
 use solana_account::AccountBuilder;
 use solana_pubkey::Pubkey;
 use tokio::time::{self, Instant};
+use tracing::{error, info, warn};
 use url::Url;
 
+use crate::metrics::{self, Op};
 use crate::rpc::{AccountConfig, ContextValue, Request, WireAccount};
 
 use super::{Error, Result};
 
-/// Confirmed account snapshot with one account per requested key in request order.
-/// Accounts enter in `Uninit` mode.
+/// One confirmed RPC response with an optional account image per key, in request order.
+/// Decoded images enter in `Uninit` mode; separate fetches may have different context slots.
 pub struct Snapshot {
     /// `None` only for an explicit RPC null; invalid accounts fail the batch.
     pub accounts: Vec<Option<AccountBuilder>>,
-    /// Confirmed context slot shared by every account in this response.
+    /// RPC response context slot stamped on each decoded account image.
     pub slot: u64,
 }
 
 /// Fetches confirmed account batches with same-chain provider failover.
-/// Callers split batches and manage subscriptions.
+/// ChainSync acquisition handles batch limits and subscriptions separately.
 pub struct Fetcher {
     /// Reusable HTTP connections without implicit redirects or retries.
     client: reqwest::Client,
@@ -43,7 +45,6 @@ pub struct Fetcher {
 
 /// Endpoint with eligibility shared across concurrent fetches.
 struct Provider {
-    /// Configured same-chain HTTP endpoint.
     url: Url,
     /// Milliseconds since `Fetcher::epoch` when this endpoint becomes eligible.
     until: AtomicU64,
@@ -76,6 +77,7 @@ impl Fetcher {
     /// Transient failures retry within a ten-second budget. Malformed responses
     /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
+        let _timer = metrics::time(Op::HttpFetch);
         // Fix the floor for all provider attempts in this fetch; a failover must not
         // retry against a snapshot older than the one this call required.
         let minimum = min_slot.unwrap_or(0).max(self.engine.accounts().chain_slot());
@@ -88,14 +90,26 @@ impl Fetcher {
         let request = Request::new(1, GET_MULTIPLE_ACCOUNTS, params);
         let body = Bytes::from(json::to_vec(&request)?);
         let mut last = None;
+        let mut failures = 0;
         while let Some((index, provider)) = self.available(deadline).await {
             let end = (Instant::now() + ATTEMPT).min(deadline);
             let result = self.attempt(provider, body.clone(), end, keys.len()).await;
+            metrics::http_attempt(index, &result);
             let error = match result {
-                Ok(snapshot) => return Ok(snapshot),
+                Ok(snapshot) => {
+                    if failures > 0 {
+                        info!(provider = index, failures, minimum, "HTTP fetch recovered");
+                    }
+                    return Ok(snapshot);
+                }
                 Err(error) => error,
             };
             let retry = error.retryable();
+            if retry {
+                warn!(provider = index, %error, minimum, "HTTP attempt failed; retrying");
+            } else {
+                error!(provider = index, %error, minimum, "HTTP attempt failed");
+            }
             let error = Error::Provider {
                 provider: index,
                 source: Box::new(error),
@@ -107,8 +121,11 @@ impl Fetcher {
             let until = (self.epoch.elapsed() + COOLDOWN).as_millis() as u64;
             provider.until.fetch_max(until, Relaxed);
             last = Some(Box::new(error));
+            failures += 1;
         }
-        Err(Error::Deadline { last })
+        let error = Error::Deadline { last };
+        warn!(cause = ?error, minimum, failures, "HTTP retries exhausted");
+        Err(error)
     }
 
     /// Waits for the next cooldown only when no provider is eligible; returns
@@ -133,7 +150,7 @@ impl Fetcher {
     }
 
     /// Rejects a short or long result before decoding, preserving the snapshot's
-    /// one-value-per-key contract for callers that use positional indices.
+    /// one-value-per-key contract used by acquisition's positional indices.
     async fn attempt(
         &self,
         provider: &Provider,
@@ -141,6 +158,7 @@ impl Fetcher {
         end: Instant,
         expected: usize,
     ) -> Result<Snapshot> {
+        let _timer = metrics::time(Op::HttpAttempt);
         let response = self
             .client
             .post(provider.url.clone())

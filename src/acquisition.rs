@@ -11,13 +11,16 @@ use solana_pubkey::Pubkey;
 use solana_sdk_ids::bpf_loader_upgradeable;
 
 use crate::{
-    ata, delegation, grpc, http::Snapshot, program, AccountProperty, AccountSubscription,
-    ChainSync, Result, SyncAccount,
+    ata, delegation, grpc,
+    http::Snapshot,
+    metrics::{self, Op},
+    program, AccountProperty, AccountSubscription, ChainSync, Result, SyncAccount,
 };
 
 impl ChainSync {
     /// Resolves each acquisition wave before applying actions that depend on later waves.
     pub(super) async fn sync_waves(&self, mut accounts: Vec<SyncAccount>) -> Result<()> {
+        let _timer = metrics::time(Op::Sync);
         accounts.sort_unstable_by_key(|account| account.pubkey);
         accounts.dedup_by_key(|account| account.pubkey);
         // Promoted accounts keep their first-wave WS subscriptions until their refetch resolves.
@@ -316,7 +319,7 @@ impl ChainSync {
     /// Releases subscriptions; failed releases mean their socket or pool entry is already gone.
     pub(super) async fn unsubscribe(&self, keys: impl IntoIterator<Item = Pubkey>) {
         let pending = keys.into_iter().map(|key| self.websocket.unsubscribe(key));
-        // A failed request means the socket or pool owner already removed it.
+        // A failed release means its socket or pool entry is already gone.
         let _ = future::join_all(pending).await;
     }
 }

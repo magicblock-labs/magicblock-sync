@@ -8,13 +8,12 @@ use crate::delegation;
 
 /// Delegation matched to an application account's delegation record PDA.
 pub struct Delegation {
-    /// Application account's public key.
     pub pubkey: Pubkey,
     /// Account with original owner, `Delegated` or confined `Magic` mode, and delegation slot.
     pub account: AccountBuilder,
     /// Full record, including appended post-delegation actions.
     pub record: Vec<u8>,
-    /// Logical owner validated by the matched delegation record.
+    /// Original owning program from the matched delegation record.
     pub source_program: Pubkey,
 }
 
@@ -69,7 +68,6 @@ enum PendingDelegation {
 }
 
 impl Delegations {
-    /// Tracks delegations for one validator.
     pub(super) fn new(authority: Pubkey) -> Self {
         Self {
             authority,

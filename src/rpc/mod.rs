@@ -15,7 +15,7 @@ pub struct Error {
     pub code: i64,
     /// Provider's human-readable explanation.
     pub message: String,
-    /// Optional provider-specific diagnostics preserved for the caller.
+    /// Optional provider-specific diagnostics retained with the RPC error.
     pub data: Option<Value>,
 }
 
@@ -24,18 +24,13 @@ pub(crate) use account::WireAccount;
 /// Typed request wrapped in the common JSON-RPC envelope.
 #[derive(Serialize)]
 pub(crate) struct Request<P> {
-    /// Fixed JSON-RPC protocol version.
     jsonrpc: &'static str,
-    /// Request identity for acknowledgement matching.
     id: u64,
-    /// Transport-selected RPC operation.
     method: &'static str,
-    /// Operation-specific positional arguments.
     params: P,
 }
 
 impl<P> Request<P> {
-    /// Fixes the envelope to JSON-RPC 2.0 while leaving request IDs to the transport.
     pub(crate) fn new(id: u64, method: &'static str, params: P) -> Self {
         Self {
             jsonrpc: VERSION,
@@ -50,9 +45,7 @@ impl<P> Request<P> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccountConfig {
-    /// Compressed representation accepted by the decoder.
     encoding: &'static str,
-    /// Shared confirmed finality.
     commitment: &'static str,
     /// HTTP freshness floor, absent from subscriptions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,16 +74,14 @@ pub(crate) struct Context {
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub(crate) struct ContextValue<T> {
-    /// Observation context for the whole value.
     pub(crate) context: Context,
     /// Required payload; null is valid only for nullable `T`.
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pub(crate) value: T,
 }
 
-/// Protocol version required by the RPC envelope.
 pub(crate) const VERSION: &str = "2.0";
-/// Finality shared by snapshots and subscriptions.
 const COMMITMENT: &str = "confirmed";
 
+/// Compressed account-wire decoding and its typed failures.
 mod account;

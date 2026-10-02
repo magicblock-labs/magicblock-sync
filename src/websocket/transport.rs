@@ -40,7 +40,7 @@ static TLS: LazyLock<TlsResult<TlsConnector, tokio_rustls::rustls::Error>> = Laz
     Ok(TlsConnector::from(Arc::new(config)))
 });
 
-/// Opens a provider socket; the caller bounds connection setup time.
+/// Opens a provider socket; the session enforces the connection setup timeout.
 pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer)> {
     let host = match url.host().ok_or(Error::Protocol("provider URL has no host"))? {
         Host::Ipv6(ip) => ip.to_string(),

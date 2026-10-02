@@ -5,9 +5,13 @@ use engine::{AccountAccessor, EngineError, PostFinalize};
 use solana_account::{AccountBuilder, AccountMode};
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
-use tracing::warn;
+use tracing::{error, warn};
 
-use crate::{aml, ata, delegation, grpc, AccountProperty, ChainSync, Error, Result, SyncAccount};
+use crate::{
+    aml, ata, delegation, grpc,
+    metrics::{self, Op},
+    AccountProperty, ChainSync, Error, Result, SyncAccount,
+};
 
 impl ChainSync {
     /// Loads dependencies for delegated actions before materializing the delegated account.
@@ -142,6 +146,7 @@ impl ChainSync {
 
     /// Assesses action signers before acquiring the target after dependency resolution.
     pub(crate) async fn materialize_delegation(&self, prepared: PreparedDelegation) -> Result<()> {
+        let _timer = metrics::time(Op::Delegate);
         let PreparedDelegation {
             pubkey,
             account,
@@ -164,9 +169,11 @@ impl ChainSync {
             Err(error) => Err(error),
         };
         let Err(error) = result else { return Ok(()) };
-        warn!(%pubkey, %error, "delegation activation failed; scheduling undelegation");
+        metrics::activation_failed();
+        warn!(%pubkey, %error, "activation failed; rescuing");
         if let Err(rescue_error) = self.rescue_delegation(pubkey, account, source_program).await {
-            warn!(%pubkey, %error, %rescue_error, "delegation rescue failed");
+            metrics::rescue("failed");
+            error!(%pubkey, %error, %rescue_error, "rescue failed");
             return Err(error);
         }
         Ok(())
@@ -181,13 +188,14 @@ impl ChainSync {
     ) -> engine::Result<()> {
         let slot = account.read().slot();
         let accessor = self.engine.account(pubkey).await?;
-        // A concurrent activation or later lifecycle transition owns this key now.
+        // An activated or superseding account state needs no rescue for this image.
         let superseded = match accessor.observed() {
             Some((AccountMode::Magic, _)) => true,
             Some((AccountMode::Transient, observed)) if observed == slot => true,
             _ => accessor.skipped(AccountMode::Delegated, slot).is_some(),
         };
         if superseded {
+            metrics::rescue("superseded");
             return Ok(());
         }
         let action = delegation::rescue_action(self.engine.authority(), pubkey);
@@ -195,12 +203,15 @@ impl ChainSync {
             source_program,
             actions: vec![action],
         };
-        accessor.materialize(account, Some(rescue)).await
+        accessor.materialize(account, Some(rescue)).await?;
+        metrics::rescue("scheduled");
+        Ok(())
     }
 
     /// Deletes the account only when the event is current and the observed mode permits
     /// removal.
     pub(super) async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<()> {
+        let _timer = metrics::time(Op::Undelegate);
         let accessor = self.engine.account(pubkey).await?;
         if accessor.exists() {
             return Self::undelegate_target(accessor, slot).await;
@@ -251,6 +262,7 @@ pub(crate) struct PreparedDelegation {
     account: AccountBuilder,
     /// Decoded actions, or a payload error that requires rescue undelegation.
     actions: Result<Option<Vec<Instruction>>>,
-    /// Logical owner from the validated delegation record, including eATA projection.
+    /// Original owning program from the validated delegation record.
+    /// For an eATA projection, this is the eATA program, not the ATA's token program.
     source_program: Pubkey,
 }

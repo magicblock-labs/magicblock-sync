@@ -7,16 +7,18 @@ use spl_token_2022_interface::{extension::StateWithExtensions, state::Account as
 
 use crate::delegation;
 
+/// Program whose derived eATA accounts may project onto canonical token ATAs.
 const EATA_PROGRAM_ID: Pubkey = pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
 
 /// Fields needed from eATA's custom wire state.
 struct Eata {
+    /// Token authority used in both eATA and canonical ATA derivation.
     owner: Pubkey,
+    /// Token mint used in address derivation and the projected account image.
     mint: Pubkey,
     amount: u64,
 }
 
-/// Whether the current account owner is the eATA program.
 pub(crate) fn is_eata(account: &AccountBuilder) -> bool {
     account.read().owner() == EATA_PROGRAM_ID
 }
@@ -112,9 +114,13 @@ fn token_account(pubkey: Pubkey, account: &AccountBuilder) -> Option<TokenAccoun
 
 /// An eATA is trusted only when its owner and derived address agree with its data.
 fn eata_data(pubkey: Pubkey, account: &AccountBuilder) -> Option<Eata> {
+    /// Width of each owner or mint key in the eATA wire layout.
     const KEY_LEN: usize = size_of::<Pubkey>();
+    /// First byte of the token amount, following owner and mint.
     const MINT_END: usize = KEY_LEN * 2;
+    /// Legacy layout length, ending after the token amount.
     const BASE_LEN: usize = MINT_END + size_of::<u64>();
+    /// Current layout length, including the bump byte and trailing bytes.
     const CURRENT_LEN: usize = BASE_LEN + 8;
 
     let image = account.read();

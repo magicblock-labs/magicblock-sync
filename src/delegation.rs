@@ -42,7 +42,8 @@ pub(crate) fn snapshot_record<'a>(
     belongs_to(metadata, authority).then_some((metadata, data))
 }
 
-/// Configures the Engine representation after a caller validates the record.
+/// Restores the recorded owning program and slot, then selects delegated or confined mode.
+/// Requires a validated record whose authority is local or permits authority-free confinement.
 pub(crate) fn account(account: AccountBuilder, record: &DelegationRecord) -> AccountBuilder {
     let account = account.owner(record.owner).slot(record.delegation_slot);
     // No authority can commit a confined account back to the base chain.

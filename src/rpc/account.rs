@@ -26,15 +26,13 @@ pub(crate) struct WireAccount<'a> {
     data: (&'a str, &'a str),
     /// Base58 owner pending public-key validation.
     owner: &'a str,
-    /// Balance at the response context slot.
     lamports: u64,
-    /// Executable flag from the provider.
     executable: bool,
 }
 
 impl WireAccount<'_> {
     /// Validates the declared encoding and owner, then stamps the response slot.
-    /// The resulting builder remains `Uninit` for the caller to classify.
+    /// The resulting builder remains `Uninit`; decoding does not establish delegation.
     pub(crate) fn decode(self, slot: u64) -> Result<AccountBuilder, DecodeError> {
         if self.data.1 != ENCODING {
             return Err(DecodeError::Protocol("unsupported account encoding"));
@@ -51,5 +49,4 @@ impl WireAccount<'_> {
     }
 }
 
-/// Encoding accepted by the shared account decoder.
 pub(super) const ENCODING: &str = "base64+zstd";

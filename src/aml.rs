@@ -1,5 +1,5 @@
 //! Signer assessment does not establish delegation or authorize mutation.
-//! Only high-risk verdicts reject activation; service failures leave activation to caller retry.
+//! Only high-risk verdicts reject activation; service failures propagate without entering rescue.
 
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ pub(crate) struct Client {
     endpoint: Url,
 }
 
+/// Server-owned risk verdict for one action signer.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Assessment {
@@ -49,6 +50,7 @@ struct Assessment {
 }
 
 impl Client {
+    /// Validates HTTPS or loopback HTTP and disables redirects and implicit retries.
     pub(crate) fn new(config: Config) -> Result<Self> {
         let loopback = match config.endpoint.host() {
             Some(Host::Ipv4(ip)) => ip.is_loopback(),
@@ -70,6 +72,7 @@ impl Client {
         Ok(Self { http, endpoint: config.endpoint })
     }
 
+    /// Returns the signer only for a high-risk verdict; service failures remain errors.
     async fn assess(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>> {
         let response = self
             .http

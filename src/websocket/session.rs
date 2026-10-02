@@ -24,11 +24,8 @@ use tokio::{
 };
 use url::Url;
 
-/// RPC method for starting confirmed account updates.
 const ACCOUNT_SUBSCRIBE: &str = "accountSubscribe";
-/// RPC method for releasing a provider subscription ID.
 const ACCOUNT_UNSUBSCRIBE: &str = "accountUnsubscribe";
-/// Notification method accepted for account updates.
 const ACCOUNT_NOTIFICATION: &str = "accountNotification";
 
 /// Account operations assigned to one connection attempt.
@@ -37,7 +34,6 @@ pub(super) enum Command {
     Subscribe(AccountSubscription),
     /// Release of an acknowledged provider subscription.
     Unsubscribe {
-        /// Account being released.
         pubkey: Pubkey,
         /// Acknowledged provider subscription ID.
         remote: u64,
@@ -48,18 +44,15 @@ pub(super) enum Command {
 pub(super) enum Notice {
     /// Connection is accepting commands.
     Connected(ConnectionId),
-    /// Remote outcome for a caller operation.
+    /// Provider result for a subscribe or unsubscribe request.
     Acknowledged {
-        /// Connection responsible for the operation.
         connection: ConnectionId,
-        /// Account whose operation completed.
         pubkey: Pubkey,
         /// Provider subscription ID on subscribe, none on unsubscribe.
         result: Result<Option<u64>>,
     },
     /// All subscriptions on this attempt were lost.
     Dropped {
-        /// Failed attempt identity.
         connection: ConnectionId,
         /// Cause retained for public loss reporting.
         error: Error,
@@ -68,7 +61,6 @@ pub(super) enum Notice {
 
 /// Connection and RPC acknowledgement budget.
 const TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum commands in one socket write batch.
 pub(super) const COMMAND_CAP: usize = 256;
 /// Ping cadence; a missing pong invalidates the connection.
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -93,13 +85,11 @@ pub(super) struct Session {
     timers: FuturesUnordered<Abortable<Sleep>>,
     /// Provider subscription IDs routed to account keys and update targets.
     active: AHashMap<u64, AccountSubscription>,
-    /// Attempt identity carried by lifecycle outcomes.
     id: ConnectionId,
     /// Registry-only lifecycle channel.
     notices: UnboundedSender<Notice>,
     /// Reused across serialization and transport masking.
     output: Vec<u8>,
-    /// Bounded public update delivery.
     events: Sender<Event>,
 }
 
