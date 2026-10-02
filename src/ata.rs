@@ -7,7 +7,7 @@ use spl_token_2022_interface::{extension::StateWithExtensions, state::Account as
 
 use crate::delegation;
 
-/// Program whose derived eATA accounts may project onto canonical token ATAs.
+/// Program owning eATA balances projected onto canonical token ATAs.
 const EATA_PROGRAM_ID: Pubkey = pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
 
 /// Fields needed from eATA's custom wire state.
@@ -23,7 +23,7 @@ pub(crate) fn is_eata(account: &AccountBuilder) -> bool {
     account.read().owner() == EATA_PROGRAM_ID
 }
 
-/// A raw eATA image, whether restored or temporarily owned by the DLP.
+/// Recognizes valid eATA data at its derived address, including while DLP-owned.
 pub(crate) fn is_raw_eata(pubkey: Pubkey, account: &AccountBuilder) -> bool {
     eata_data(pubkey, account).is_some()
 }
@@ -34,7 +34,8 @@ pub(crate) fn companion(pubkey: Pubkey, account: &AccountBuilder) -> Option<Pubk
     derive_eata(token.owner, token.mint).map(|(pubkey, _)| pubkey)
 }
 
-/// Projected ATAs carry an uncloseable marker and delegated lifecycle mode.
+/// Checks whether this delegated or transient ATA is a projection of the given eATA.
+/// Projections have the default pubkey as close authority, preventing local closure.
 pub(crate) fn is_projection_of(ata: Pubkey, eata: Pubkey, account: &AccountBuilder) -> bool {
     if !matches!(
         account.read().mode(),
@@ -47,7 +48,8 @@ pub(crate) fn is_projection_of(ata: Pubkey, eata: Pubkey, account: &AccountBuild
         && derive_eata(token.owner, token.mint).is_some_and(|(pubkey, _)| pubkey == eata)
 }
 
-/// ATA candidates for a restored eATA. The token program is not stored in eATA.
+/// Returns legacy-token and Token-2022 ATA addresses for an eATA-owned account.
+/// Both are needed because eATA data does not identify the token program.
 pub(crate) fn candidates(pubkey: Pubkey, account: &AccountBuilder) -> Option<[Pubkey; 2]> {
     if !is_eata(account) {
         return None;
@@ -61,7 +63,7 @@ pub(crate) fn candidates(pubkey: Pubkey, account: &AccountBuilder) -> Option<[Pu
 }
 
 /// Projects an eATA's balance and delegation slot onto a canonical ATA.
-/// The token program, layout, extensions, and rent fields come from the base image.
+/// Preserves the base ATA's token program and extensions; native-token ATAs retain only rent lamports.
 pub(crate) fn project(
     ata: Pubkey,
     base: AccountBuilder,

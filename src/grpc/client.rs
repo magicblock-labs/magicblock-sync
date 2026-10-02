@@ -6,26 +6,29 @@ use tokio::sync::mpsc;
 use super::{session::Session, Event, Result, StreamConfig};
 use crate::AccountSubscription;
 
-/// One serialized change to a stream's logical account interest.
+/// Account-subscription changes processed by one gRPC stream.
 pub(crate) enum Command {
-    /// Tracks an acknowledged WS account until its filter becomes eligible.
+    /// Tracks a WebSocket subscription; new gRPC filter entries wait for the duplication delay.
     Track {
-        /// Exact subscribed key and optional ProgramData target.
+        /// Remote account address and the local account its updates belong to.
         sub: AccountSubscription,
         /// Generation assigned by the coverage registry to reject stale confirmations.
         gen: u64,
     },
-    /// Ends logical interest immediately; remote removal waits for a rebuild.
+    /// Stops forwarding this account's updates when processed; filter removal waits for a rebuild.
     Remove(Pubkey),
-    /// Sends the full filter only when aged additions or removals changed it.
+    /// Updates the filter for removed accounts and accounts whose duplication delay has elapsed.
     Rebuild,
 }
 
 /// Control handle for one shutdown-managed Yellowstone stream.
-pub(crate) struct Client(mpsc::UnboundedSender<Command>);
+pub(crate) struct Client {
+    commands: mpsc::UnboundedSender<Command>,
+    hostname: Option<Box<str>>,
+}
 
 impl Client {
-    /// Starts one stream while sharing ordered events and the HTTP freshness watermark.
+    /// Starts a provider stream that reports events and advances Engine's confirmed chain slot.
     pub(crate) fn new(
         id: usize,
         config: StreamConfig,
@@ -35,6 +38,7 @@ impl Client {
         manager: &mut ShutdownManager,
     ) -> Result<Self> {
         let (commands, requests) = mpsc::unbounded_channel();
+        let hostname = config.endpoint.host_str().map(Box::from);
         let session = Session::new(id, config, authority, engine, events)?;
         let mut shutdown = manager.handle(Service::ChainSyncGrpc(id));
         tokio::spawn(async move {
@@ -47,11 +51,16 @@ impl Client {
             };
             shutdown.terminate(reason);
         });
-        Ok(Self(commands))
+        Ok(Self { commands, hostname })
     }
 
-    /// Queues a logical change without waiting for remote filter delivery.
+    /// Provider hostname for diagnostics, without formatting or allocation.
+    pub(crate) fn hostname(&self) -> Option<&str> {
+        self.hostname.as_deref()
+    }
+
+    /// Queues a subscription change without waiting for the stream to process or send it.
     pub(crate) fn command(&self, command: Command) {
-        let _ = self.0.send(command);
+        let _ = self.commands.send(command);
     }
 }

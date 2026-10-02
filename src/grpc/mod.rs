@@ -1,4 +1,4 @@
-//! Streams confirmed retained-account and delegation events from Yellowstone.
+//! Streams confirmed updates for tracked accounts and discovers DLP delegation events.
 //!
 //! Yellowstone reconnects and may replay, but does not guarantee gapless delivery.
 //! Consumers reconcile gaps and deduplicate events before applying lifecycle changes.
@@ -64,7 +64,7 @@ pub(super) enum Event {
     /// Retained account update in `Uninit` mode, before Engine materialization.
     Update {
         stream: usize,
-        /// Retained account identity and optional ProgramData target.
+        /// Remote account address and the local account its updates belong to.
         sub: AccountSubscription,
         /// Raw account update, including zero-lamport updates.
         account: AccountBuilder,
@@ -73,7 +73,8 @@ pub(super) enum Event {
     Delegated(Delegation),
     /// Accounts undelegated in a successful transaction at this slot.
     Undelegated { pubkeys: SmallVec<[Pubkey; 1]>, slot: u64 },
-    /// A retained filter was sent on a live stream for this logical generation.
+    /// This account was included in a sent filter for the given subscription generation.
+    /// Reports a local send, not server acknowledgement or proof of gapless coverage.
     Confirmed {
         stream: usize,
         pubkey: Pubkey,

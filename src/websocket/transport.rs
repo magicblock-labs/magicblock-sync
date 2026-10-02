@@ -65,7 +65,7 @@ pub(super) async fn connect(url: &Url) -> Result<(Reader, Writer)> {
     Ok((FragmentCollectorRead::new(reader), writer))
 }
 
-/// Verifies the server key and rejects unsolicited WebSocket extensions.
+/// Upgrades to WebSocket, checking `Sec-WebSocket-Accept` and rejecting unrequested extensions.
 async fn upgrade<S>(url: &Url, stream: S) -> Result<WebSocket<TokioIo<Upgraded>>>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -83,8 +83,8 @@ where
         .header("Sec-WebSocket-Version", "13")
         .body(Empty::<Bytes>::new())?;
     let (socket, response) = handshake::client(&TokioExecutor::new(), request, stream).await?;
-    // The helper checks the HTTP upgrade headers but not the key or unsolicited
-    // extensions. Preserve the client handshake guarantees of the previous transport.
+    // The helper checks upgrade headers but not Sec-WebSocket-Accept or extensions.
+    // Verify the response to our key and reject extensions we did not request.
     let headers = response.headers();
     if headers.get("Sec-WebSocket-Accept").map(|value| value.as_bytes()) != Some(accept.as_bytes())
         || headers.contains_key("Sec-WebSocket-Extensions")

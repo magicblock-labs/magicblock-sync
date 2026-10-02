@@ -5,23 +5,23 @@ use solana_pubkey::Pubkey;
 
 use crate::{metrics, AccountSubscription};
 
-/// Transport identity shared by coverage transitions and loss metrics.
+/// Transport that supplied or lost an account subscription.
 pub(super) use crate::metrics::Transport as Source;
 
-/// Confirmed coverage for one logical subscription.
+/// Tracks which transports currently cover one account subscription.
 struct Entry {
-    /// Exact subscribed key and optional ProgramData Engine target.
+    /// Remote address and the local account its updates belong to.
     sub: AccountSubscription,
     /// Distinguishes a current subscription from late transport confirmations.
     generation: u64,
-    /// Whether the WS pool has acknowledged this account.
+    /// Whether WebSocket subscription acknowledgement was received and the source is still active.
     ws: bool,
-    /// The one confirmed gRPC stream, if any.
+    /// gRPC stream that sent this account's filter, if it has not since reported loss.
     grpc: Option<usize>,
 }
 
 impl Entry {
-    /// Gauge label for the current source combination, or `None` after final-source loss.
+    /// Metric label for the active transports; `None` when neither remains.
     fn coverage(&self) -> Option<&'static str> {
         match (self.ws, self.grpc.is_some()) {
             (true, false) => Some("ws_only"),
@@ -32,17 +32,17 @@ impl Entry {
     }
 }
 
-/// Account coverage mutated only by the ChainSync worker; transports report changes as events.
+/// Active account subscriptions, updated only by the ChainSync event worker.
 #[derive(Default)]
 pub(super) struct Coverage {
-    /// Keys with at least one confirmed source.
+    /// Remote addresses covered by at least one active transport.
     entries: AHashMap<Pubkey, Entry>,
-    /// Monotonic identity for newly acknowledged logical subscriptions.
+    /// Counter distinguishing new subscriptions from delayed confirmations of removed ones.
     generation: u64,
 }
 
 impl Coverage {
-    /// Records a WS acknowledgement and returns its current generation for gRPC reuse.
+    /// Records a WebSocket acknowledgement and returns the generation to attach to gRPC commands.
     pub(super) fn acknowledged(&mut self, sub: AccountSubscription) -> u64 {
         if let Some(entry) = self.entries.get_mut(&sub.pubkey) {
             let before = entry.coverage();
@@ -63,14 +63,20 @@ impl Coverage {
         generation
     }
 
-    /// Removes the logical subscription, including any in-flight transport request.
+    /// Removes coverage for a remote address; returns the local address to evict if uncovered.
+    /// For ProgramData, the returned address is the program, not the removed remote address.
     pub(super) fn removed(&mut self, pubkey: Pubkey) -> Option<Pubkey> {
         let entry = self.entries.remove(&pubkey)?;
         metrics::coverage(entry.coverage(), None);
-        self.eviction_target(entry.sub)
+        let local_pubkey = entry.sub.local_pubkey();
+        let covered = AccountSubscription::for_account(local_pubkey)
+            .into_iter()
+            .any(|sub| self.entries.get(&sub.pubkey).is_some_and(|entry| entry.sub == sub));
+        (!covered).then_some(local_pubkey)
     }
 
-    /// Drops one source; returns whether coverage ended and any Engine target to evict.
+    /// Drops one transport for a remote address; returns whether that address lost all coverage
+    /// and the local address to evict, if no other subscription feeds it.
     pub(super) fn lost(&mut self, source: Source, pubkey: Pubkey) -> (bool, Option<Pubkey>) {
         let Some(entry) = self.entries.get_mut(&pubkey) else { return (false, None) };
         let before = entry.coverage();
@@ -87,7 +93,7 @@ impl Coverage {
         (true, self.removed(pubkey))
     }
 
-    /// Accepts a sent filter only for the current logical subscription.
+    /// Records a sent gRPC filter only if its generation still matches the current subscription.
     pub(super) fn confirmed(&mut self, stream: usize, pubkey: Pubkey, generation: u64) {
         let Some(entry) = self.entries.get_mut(&pubkey) else { return };
         if entry.generation == generation {
@@ -97,12 +103,12 @@ impl Coverage {
         }
     }
 
-    /// Filters buffered WS updates after logical removal or source loss.
+    /// Accepts an update only if this exact subscription still has WebSocket coverage.
     pub(super) fn ws_contains(&self, sub: AccountSubscription) -> bool {
         self.entries.get(&sub.pubkey).is_some_and(|entry| entry.sub == sub && entry.ws)
     }
 
-    /// Filters buffered gRPC updates after logical removal or source loss.
+    /// Accepts an update only if this exact subscription is still covered by the sending gRPC stream.
     pub(super) fn grpc_contains(&self, stream: usize, sub: AccountSubscription) -> bool {
         self.entries
             .get(&sub.pubkey)
@@ -117,23 +123,16 @@ impl Coverage {
             .collect()
     }
 
-    /// Ends the target's coverage without requesting another Engine eviction.
-    pub(super) fn evicted(&mut self, target: Pubkey) -> impl Iterator<Item = Pubkey> + '_ {
-        AccountSubscription::for_target(target).into_iter().filter_map(|sub| {
-            let Occupied(entry) = self.entries.entry(sub.pubkey) else { return None };
-            if entry.get().sub != sub {
-                return None;
-            }
-            let entry = entry.remove();
-            metrics::coverage(entry.coverage(), None);
-            Some(entry.sub.pubkey)
-        })
-    }
-
-    /// An Engine target survives while any other logical subscription names it.
-    fn eviction_target(&self, sub: AccountSubscription) -> Option<Pubkey> {
-        let target = sub.target();
-        (!self.entries.values().any(|entry| entry.sub.target() == target)).then_some(target)
+    /// Removes coverage only if the stored subscription matches; returns whether it was removed.
+    /// Used during cache eviction, so no further Engine eviction is requested.
+    pub(super) fn remove(&mut self, sub: AccountSubscription) -> bool {
+        let Occupied(entry) = self.entries.entry(sub.pubkey) else { return false };
+        if entry.get().sub != sub {
+            return false;
+        }
+        let entry = entry.remove();
+        metrics::coverage(entry.coverage(), None);
+        true
     }
 }
 

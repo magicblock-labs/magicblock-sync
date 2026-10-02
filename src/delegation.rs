@@ -14,7 +14,7 @@ pub(crate) fn record(data: &[u8]) -> Option<&DelegationRecord> {
     DelegationRecord::try_from_bytes_with_discriminator(data).ok()
 }
 
-/// Whether a record activates locally, including authority-free confinement.
+/// Accepts this Engine's authority or the default authority used for confined accounts.
 pub(crate) fn belongs_to(record: &DelegationRecord, authority: Pubkey) -> bool {
     record.authority == authority || record.authority == Pubkey::default()
 }
@@ -24,7 +24,7 @@ pub(crate) fn appended(data: &[u8]) -> Option<&[u8]> {
     data.get(DelegationRecord::size_with_discriminator()..)
 }
 
-/// Resolves an HTTP snapshot's application account and delegation record.
+/// Returns a parsed record only if both snapshots are DLP-owned and its authority is accepted.
 pub(crate) fn snapshot_record<'a>(
     account: &AccountBuilder,
     record_account: Option<&'a AccountBuilder>,
@@ -54,7 +54,7 @@ pub(crate) fn account(account: AccountBuilder, record: &DelegationRecord) -> Acc
     }
 }
 
-/// Schedules commit and undelegation after a failed trusted activation.
+/// Builds the commit-and-undelegate rescue action for a validated delegation that failed activation.
 /// MagicRoot vouches for the readonly authority signer during PostFinalize.
 pub(crate) fn rescue_action(authority: Pubkey, pubkey: Pubkey) -> Instruction {
     // Authority and Magic Context occupy action indices 0 and 1.

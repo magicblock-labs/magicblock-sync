@@ -6,7 +6,7 @@ use yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo;
 
 use crate::delegation;
 
-/// Delegation matched to an application account's delegation record PDA.
+/// Account image restored using its matching delegation-record update.
 pub struct Delegation {
     pub pubkey: Pubkey,
     /// Account with original owner, `Delegated` or confined `Magic` mode, and delegation slot.
@@ -23,7 +23,7 @@ pub(super) struct Delegations {
     authority: Pubkey,
     /// Slot shared by pending observations; replay may move backward.
     slot: u64,
-    /// Unresolved halves and ignored markers keyed by record PDA.
+    /// Unmatched account/record updates and rejection markers, keyed by delegation-record address.
     pending: AHashMap<Pubkey, PendingDelegation>,
 }
 
@@ -84,8 +84,8 @@ impl Delegations {
         }
     }
 
-    /// Only a local or confined record for this slot can activate an application
-    /// update. Other records leave an ignored marker for the rest of the slot.
+    /// Matches records for this authority or confinement only when their delegation slot matches.
+    /// Other records block matching updates for the rest of the observed slot.
     pub(super) fn record(
         &mut self,
         key: Pubkey,
@@ -129,8 +129,8 @@ impl Delegations {
             (Account(account), Record(record)) | (Record(record), Account(account)) => {
                 return Some(account.resolve(record));
             }
-            // An irrelevant record blocks activation for this slot; otherwise keep
-            // the newest unmatched update for a later counterpart in that same slot.
+            // A rejected record blocks matching for this slot. Otherwise retain
+            // the latest account or record update until its counterpart arrives.
             (Ignored, _) | (_, Ignored) => Ignored,
             (_, pending) => pending,
         };

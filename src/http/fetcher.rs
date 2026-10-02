@@ -28,14 +28,14 @@ pub struct Snapshot {
     pub slot: u64,
 }
 
-/// Fetches confirmed account batches with same-chain provider failover.
-/// ChainSync acquisition handles batch limits and subscriptions separately.
+/// Fetches confirmed account batches, retrying transient failures across providers on the same chain.
+/// Callers split requests into batches of at most 100 keys and arrange subscriptions.
 pub struct Fetcher {
     /// Reusable HTTP connections without implicit redirects or retries.
     client: reqwest::Client,
     /// Stable endpoint order used for error reporting.
     providers: Vec<Provider>,
-    /// Engine confirmed-observation watermark sampled at fetch entry.
+    /// Supplies the confirmed chain slot used as the minimum for each HTTP fetch.
     engine: Engine,
     /// Rotating first candidate for provider selection.
     cursor: AtomicUsize,
@@ -43,10 +43,10 @@ pub struct Fetcher {
     epoch: Instant,
 }
 
-/// Endpoint with eligibility shared across concurrent fetches.
+/// Endpoint whose retry cooldown is shared by all concurrent fetches.
 struct Provider {
     url: Url,
-    /// Milliseconds since `Fetcher::epoch` when this endpoint becomes eligible.
+    /// Milliseconds since `Fetcher::epoch` when this endpoint's cooldown ends.
     until: AtomicU64,
 }
 
@@ -70,22 +70,22 @@ impl Fetcher {
         })
     }
 
-    /// Fetches 1–100 keys at confirmed commitment. The greater of `min_slot`
-    /// and the shared watermark sets a floor that remains fixed across failover.
-    /// HTTP responses do not advance the watermark.
+    /// Fetches 1–100 keys at confirmed commitment. Uses the greater of `min_slot`
+    /// and Engine's confirmed chain slot as the minimum response context slot.
+    /// This minimum stays fixed across retries; HTTP responses do not advance Engine's chain slot.
     ///
     /// Transient failures retry within a ten-second budget. Malformed responses
     /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
         let _timer = metrics::time(Op::HttpFetch);
-        // Fix the floor for all provider attempts in this fetch; a failover must not
-        // retry against a snapshot older than the one this call required.
-        let minimum = min_slot.unwrap_or(0).max(self.engine.accounts().chain_slot());
+        // Keep the same minimum slot when changing providers, so a retry cannot
+        // accept a snapshot older than this call requires.
+        let min_ctx_slot = min_slot.unwrap_or(0).max(self.engine.accounts().chain_slot());
         let deadline = Instant::now() + OVERALL;
         // Preserve positions: getMultipleAccounts returns values in request order.
         let params = (
             keys.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            AccountConfig::new(Some(minimum)),
+            AccountConfig::new(Some(min_ctx_slot)),
         );
         let request = Request::new(1, GET_MULTIPLE_ACCOUNTS, params);
         let body = Bytes::from(json::to_vec(&request)?);
@@ -94,11 +94,12 @@ impl Fetcher {
         while let Some((index, provider)) = self.available(deadline).await {
             let end = (Instant::now() + ATTEMPT).min(deadline);
             let result = self.attempt(provider, body.clone(), end, keys.len()).await;
-            metrics::http_attempt(index, &result);
+            metrics::http_attempt(&result);
+            let hostname = provider.url.host_str();
             let error = match result {
                 Ok(snapshot) => {
                     if failures > 0 {
-                        info!(provider = index, failures, minimum, "HTTP fetch recovered");
+                        info!(hostname, failures, min_ctx_slot, "HTTP fetch recovered");
                     }
                     return Ok(snapshot);
                 }
@@ -106,9 +107,9 @@ impl Fetcher {
             };
             let retry = error.retryable();
             if retry {
-                warn!(provider = index, %error, minimum, "HTTP attempt failed; retrying");
+                warn!(hostname, %error, min_ctx_slot, "HTTP attempt failed; retrying");
             } else {
-                error!(provider = index, %error, minimum, "HTTP attempt failed");
+                error!(hostname, %error, min_ctx_slot, "HTTP attempt failed");
             }
             let error = Error::Provider {
                 provider: index,
@@ -117,18 +118,18 @@ impl Fetcher {
             if !retry {
                 return Err(error);
             }
-            // Cooldown is provider-wide, so concurrent batches avoid the same failing endpoint.
+            // Share the cooldown so other batches skip this endpoint while it recovers.
             let until = (self.epoch.elapsed() + COOLDOWN).as_millis() as u64;
             provider.until.fetch_max(until, Relaxed);
             last = Some(Box::new(error));
             failures += 1;
         }
         let error = Error::Deadline { last };
-        warn!(cause = ?error, minimum, failures, "HTTP retries exhausted");
+        warn!(cause = ?error, min_ctx_slot, failures, "HTTP retries exhausted");
         Err(error)
     }
 
-    /// Waits for the next cooldown only when no provider is eligible; returns
+    /// Selects a provider, waiting for the earliest cooldown only if all are cooling down; returns
     /// `None` once the overall deadline has elapsed.
     async fn available(&self, deadline: Instant) -> Option<(usize, &Provider)> {
         while Instant::now() < deadline {
@@ -149,8 +150,8 @@ impl Fetcher {
         None
     }
 
-    /// Rejects a short or long result before decoding, preserving the snapshot's
-    /// one-value-per-key contract used by acquisition's positional indices.
+    /// Makes one provider request and decodes its snapshot.
+    /// Rejects a mismatched account count before decoding images so request positions stay valid.
     async fn attempt(
         &self,
         provider: &Provider,

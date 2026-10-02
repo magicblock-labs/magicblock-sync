@@ -1,4 +1,4 @@
-/// Confirmed coverage and redundancy scheduling for the event worker.
+/// Tracks active WebSocket and gRPC subscriptions and rejects updates after removal.
 mod coverage;
 /// Delegation activation, rescue, and undelegation lifecycle.
 mod lifecycle;
@@ -27,7 +27,7 @@ use crate::{
 };
 
 impl ChainSync {
-    /// Stable per-key assignment keeps a recently removed remote filter reusable.
+    /// Always assigns a remote address to the same gRPC stream so its filter entry can be reused.
     fn grpc_client(&self, pubkey: Pubkey) -> &grpc::Client {
         let mut hash = DefaultHasher::new();
         pubkey.hash(&mut hash);
@@ -71,8 +71,8 @@ impl ChainSync {
         let mut coverage = Coverage::default();
         let mut tick = time::interval(DUPLICATION_DELAY);
         tick.tick().await;
-        // Coverage changes and account application share this loop so buffered updates
-        // cannot overtake a source removal or revive an evicted target.
+        // Process coverage changes and updates in one loop so removal takes effect
+        // before later buffered updates are checked and applied.
         loop {
             tokio::select! {
                 biased;
@@ -95,16 +95,19 @@ impl ChainSync {
         }
     }
 
-    /// Claims only an eviction that still applies, excluding concurrent acquisition.
+    /// Deletes a cached mirror only if it is still eligible after acquiring its Engine lease.
     async fn evict_cached(&self, pubkey: Pubkey, coverage: &mut Coverage) -> Result<()> {
         let Some(accessor) = self.engine.account(pubkey).await?.into_cached_eviction() else {
             return Ok(());
         };
-        for key in coverage.evicted(pubkey) {
-            self.grpc_client(key).command(Command::Remove(key));
+        for sub in AccountSubscription::for_account(pubkey) {
+            if coverage.remove(sub) {
+                self.grpc_client(sub.pubkey).command(Command::Remove(sub.pubkey));
+            }
         }
-        // Queue cleanup under the lease so reacquisition cannot subscribe ahead of it.
-        self.websocket.evict(pubkey).await?;
+        // Hold the Engine lease until unsubscribe is queued, so reacquisition cannot
+        // queue a new subscription before the old one is removed.
+        self.websocket.unsubscribe_account(pubkey).await?;
         accessor.delete().await?;
         Ok(())
     }
@@ -117,10 +120,10 @@ impl ChainSync {
                 self.grpc_client(sub.pubkey).command(Command::Track { sub, gen });
             }
             websocket::Event::Removed(pubkey) => {
-                let target = coverage.removed(pubkey);
+                let local_pubkey = coverage.removed(pubkey);
                 self.grpc_client(pubkey).command(Command::Remove(pubkey));
-                if let Some(target) = target {
-                    self.evict(target).await?;
+                if let Some(local_pubkey) = local_pubkey {
+                    self.evict(local_pubkey).await?;
                 }
             }
             websocket::Event::Update { sub, account } => {
@@ -139,21 +142,21 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Drops a source and ends gRPC interest if no confirmed copy survives.
+    /// Drops one transport's coverage and removes the gRPC subscription if neither remains.
     async fn lost(&self, coverage: &mut Coverage, source: Source, pubkey: Pubkey) -> Result<()> {
-        let (ended, target) = coverage.lost(source, pubkey);
+        let (ended, local_pubkey) = coverage.lost(source, pubkey);
         if ended {
             self.grpc_client(pubkey).command(Command::Remove(pubkey));
         }
-        if let Some(target) = target {
-            self.evict(target).await?;
+        if let Some(local_pubkey) = local_pubkey {
+            self.evict(local_pubkey).await?;
         }
         Ok(())
     }
 
-    /// Removes a target only when Engine still considers it non-authoritative.
-    async fn evict(&self, target: Pubkey) -> Result<()> {
-        if let Some(accessor) = self.engine.account(target).await?.into_eviction() {
+    /// Deletes a present Engine account only if it is still non-authoritative under its lease.
+    async fn evict(&self, local_pubkey: Pubkey) -> Result<()> {
+        if let Some(accessor) = self.engine.account(local_pubkey).await?.into_eviction() {
             accessor.delete().await?;
         }
         Ok(())
@@ -173,7 +176,8 @@ impl ChainSync {
             grpc::Event::Update { stream, sub, account } => {
                 if coverage.grpc_contains(stream, sub) {
                     if let Err(error) = self.apply(sub, account).await {
-                        error!(stream, %sub.pubkey, %error, "gRPC update failed");
+                        let provider = self.grpc[stream].hostname();
+                        error!(provider, %sub.pubkey, %error, "gRPC update failed");
                     }
                 }
             }
@@ -194,20 +198,20 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Applies a streamed account update to its subscribed account or program target.
+    /// Materializes a remote update under its own address, or under the program for ProgramData.
     async fn apply(
         &self,
         subscription: AccountSubscription,
         account: AccountBuilder,
     ) -> Result<()> {
         let _timer = metrics::time(Op::Apply);
-        let AccountSubscription { pubkey, target } = subscription;
-        if target.is_none() && ata::is_raw_eata(pubkey, &account) {
+        let AccountSubscription { pubkey, program } = subscription;
+        if program.is_none() && ata::is_raw_eata(pubkey, &account) {
             self.unsubscribe([pubkey]).await;
             return Ok(());
         }
-        let accessor = self.engine.account(subscription.target()).await?;
-        let account = match target {
+        let accessor = self.engine.account(subscription.local_pubkey()).await?;
+        let account = match program {
             Some(_) => program::normalize_program_data(account, self.engine.rent())?,
             None if account.read().flags().contains(StateFlags::EXECUTABLE) => {
                 program::normalize(account, None, self.engine.rent())?

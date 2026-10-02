@@ -6,7 +6,7 @@ use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, InnerInstruction, SubscribeUpdateTransactionInfo,
 };
 
-/// Borrowed instruction shape shared by top-level and CPI decoding.
+/// Common instruction fields borrowed from top-level instructions and CPIs.
 struct InstructionView<'a> {
     /// Index into static transaction account keys.
     program: u32,
@@ -56,7 +56,7 @@ pub(super) fn undelegated_accounts(
     };
     let dlp = dlp_api::id();
     let outer = message.instructions.iter().map(InstructionView::from);
-    // Inner instructions use the same static key table as top-level instructions.
+    // Resolve both instruction kinds against static keys only; lookup-table keys are unsupported.
     let inner = meta
         .inner_instructions
         .iter()

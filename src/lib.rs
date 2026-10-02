@@ -32,7 +32,7 @@ mod program;
 mod rpc;
 /// Confirmed WebSocket subscription pool.
 mod websocket;
-/// Stream application and delayed gRPC coverage.
+/// Applies transport updates and adds delayed gRPC subscriptions.
 mod worker;
 
 use std::{borrow::Borrow, sync::Arc, time::Duration};
@@ -47,7 +47,7 @@ use url::Url;
 use crate::http::Fetcher;
 use crate::websocket::Pool;
 
-/// gRPC duplication delay and filter scan cadence.
+/// Delay before adding a WebSocket subscription to gRPC; also the filter rebuild interval.
 const DUPLICATION_DELAY: Duration = Duration::from_secs(30 * 60);
 
 pub use aml::{Config as AmlConfig, Error as AmlError};
@@ -60,7 +60,7 @@ pub use websocket::{
 
 /// Provider configuration for HTTP snapshots and live WebSocket/gRPC updates.
 pub struct ChainSyncConfig {
-    /// Checks every post-delegation action signer; `None` disables assessment.
+    /// Checks each distinct post-delegation action signer; `None` disables assessment.
     pub aml: Option<AmlConfig>,
     /// HTTP snapshot providers.
     pub http: Vec<Url>,
@@ -79,7 +79,8 @@ pub enum AccountProperty {
     Writable,
     /// Read-only transaction account.
     Readonly,
-    /// Executable program; its ProgramData companion is fetched and subscribed over WebSocket.
+    /// Executable program; fetches and subscribes to its derived ProgramData address too.
+    /// After fetching, keeps only ProgramData for Loader V3 or the program for other loaders.
     Program,
 }
 
@@ -97,11 +98,11 @@ pub struct SyncAccount {
 pub struct ChainSync {
     /// Assesses action signers without granting delegation or mutation authority.
     aml: Option<aml::Client>,
-    /// Acquires missing-account leases and materializes their snapshots.
+    /// Owns account leases and materialization into local state.
     engine: Engine,
     /// Supplies confirmed snapshots for missing accounts.
     fetcher: Fetcher,
-    /// Tracks accounts before their snapshots are fetched.
+    /// Subscribes to accounts before their HTTP snapshots are fetched.
     websocket: Pool,
     /// Keeps all gRPC streams alive for the synchronizer's lifetime.
     grpc: Vec<grpc::Client>,
@@ -139,7 +140,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl ChainSync {
     /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
-    /// Owns Engine's sole eviction receiver to unsubscribe evicted cached mirrors.
+    /// Takes Engine's sole cache-eviction receiver to remove cached mirrors and their subscriptions.
     /// The worker and transports join Engine's coordinated shutdown.
     pub fn new(
         engine: Engine,
@@ -191,8 +192,10 @@ impl ChainSync {
     /// Read-only accounts, programs, and payers are subscribed over WebSocket
     /// before fetching. Writable accounts are fetched without WebSocket subscriptions.
     /// Programs include ProgramData; writable accounts and payers include their
-    /// derived delegation record. Records are fetched only. A payer's WebSocket
-    /// subscription is removed when its initial snapshot resolves as delegated here.
+    /// derived delegation record. Delegation records are fetched but not subscribed.
+    /// After fetching, Loader V3 keeps the ProgramData subscription; other loaders
+    /// keep the program subscription. A payer's WebSocket subscription is removed
+    /// when its initial snapshot resolves as delegated here.
     /// Read-only DLP-owned accounts and executable Loader V3 programs are refetched
     /// with their derived companions before materialization; a read-only subscription
     /// is also removed when its account resolves as delegated here.
@@ -203,8 +206,9 @@ impl ChainSync {
     /// A gRPC-only subscription remains covered without a WebSocket copy.
     ///
     /// An account is resolved as delegated only when its primary and delegation-record
-    /// snapshots are DLP-owned and the record names this Engine. Other snapshots retain
-    /// their fetched owner and mode. HTTP `null` becomes a default account.
+    /// snapshots are DLP-owned and the record names this Engine's authority.
+    /// Records with the default authority instead produce confined `Magic` accounts.
+    /// Other snapshots retain their fetched owner and mode. HTTP `null` becomes a default account.
     ///
     /// Writable and program pubkeys must be unique; repeated payer and read-only
     /// requests are collapsed. Requested accounts must not overlap a program's
@@ -219,31 +223,35 @@ impl ChainSync {
     }
 }
 
-/// Account subscription and optional target for ProgramData account updates.
+/// Remote address watched by a transport and optional Loader V3 program to update.
+///
+/// Ordinary subscriptions watch and update the same address. Loader V3 subscriptions
+/// watch ProgramData but materialize its normalized ELF at the local program address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AccountSubscription {
-    /// Address observed by the transport.
+    /// Remote account address requested from the provider.
     pubkey: Pubkey,
-    /// Program to update when `pubkey` is its Loader V3 ProgramData account.
-    target: Option<Pubkey>,
+    /// Program address to materialize ProgramData ELF under; `None` updates `pubkey` itself.
+    program: Option<Pubkey>,
 }
 
 impl AccountSubscription {
-    /// Engine account updated by this subscription.
-    fn target(self) -> Pubkey {
-        self.target.unwrap_or(self.pubkey)
+    /// Local address where this subscription's updates are materialized.
+    fn local_pubkey(self) -> Pubkey {
+        self.program.unwrap_or(self.pubkey)
     }
 
-    /// Canonical ProgramData subscription that updates the owning program.
+    /// Returns a ProgramData subscription whose updates belong to the local program address.
     fn program_data(pubkey: Pubkey) -> Self {
         Self {
             pubkey: get_program_data_address(&pubkey),
-            target: Some(pubkey),
+            program: Some(pubkey),
         }
     }
 
-    /// Direct and canonical ProgramData identities that can materialize this target.
-    fn for_target(pubkey: Pubkey) -> [Self; 2] {
-        [Self { pubkey, target: None }, Self::program_data(pubkey)]
+    /// Returns the subscriptions that can update this local address:
+    /// the address itself and its derived ProgramData address.
+    fn for_account(pubkey: Pubkey) -> [Self; 2] {
+        [Self { pubkey, program: None }, Self::program_data(pubkey)]
     }
 }

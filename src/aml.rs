@@ -89,9 +89,8 @@ impl Client {
 }
 
 /// Returns high-risk signers after assessing each distinct signer concurrently.
-/// Service failures are errors, not rejection verdicts; no target leases are held.
-pub(crate) async fn check(client: Option<&Client>, actions: &[Instruction]) -> Result<Vec<Pubkey>> {
-    let Some(client) = client else { return Ok(Vec::new()) };
+/// Service failures are errors, not rejection verdicts. Call before acquiring the account's lease.
+pub(crate) async fn check(client: &Client, actions: &[Instruction]) -> Result<Vec<Pubkey>> {
     let mut signers: Vec<_> = actions
         .iter()
         .flat_map(|action| &action.accounts)

@@ -18,12 +18,12 @@ use crate::{
 };
 
 impl ChainSync {
-    /// Resolves each acquisition wave before applying actions that depend on later waves.
+    /// Fetches requested accounts and discovered dependencies, then applies actions dependency-first.
     pub(super) async fn sync_waves(&self, mut accounts: Vec<SyncAccount>) -> Result<()> {
         let _timer = metrics::time(Op::Sync);
         accounts.sort_unstable_by_key(|account| account.pubkey);
         accounts.dedup_by_key(|account| account.pubkey);
-        // Promoted accounts keep their first-wave WS subscriptions until their refetch resolves.
+        // Keep the initial WebSocket subscription while refetching an account with its companion.
         let mut carried_subscriptions = BTreeSet::new();
         let mut floor = None;
         let mut deferred = Vec::new();
@@ -33,7 +33,7 @@ impl ChainSync {
             let mut delegations = Vec::new();
             let mut start = 0;
             while start < accounts.len() {
-                // Companions consume RPC positions even though Engine leases only primaries.
+                // Count companion addresses toward the RPC limit of 100 accounts per request.
                 let mut end = start;
                 let mut size = 0;
                 while let Some(account) = accounts.get(end) {
@@ -66,7 +66,7 @@ impl ChainSync {
 
             let mut next = BTreeMap::new();
             floor = next_floor;
-            // Every batch lease is gone before dependencies can acquire overlapping keys.
+            // Batch leases are already released, so dependency fetches can acquire overlapping keys.
             for account in promotions {
                 let SyncAccount { pubkey, property } = account;
                 next.insert(pubkey, property);
@@ -83,7 +83,8 @@ impl ChainSync {
                     }
                 };
                 for SyncAccount { pubkey, property } in dependencies {
-                    // Keep the stronger companion request when actions name the same key.
+                    // A program needs ProgramData; a writable account needs its delegation record.
+                    // Do not let a readonly request for the same key drop either companion.
                     let current = next.entry(pubkey).or_insert(property);
                     if property == AccountProperty::Program
                         || (*current == AccountProperty::Readonly
@@ -157,8 +158,8 @@ impl ChainSync {
         Ok(outcome)
     }
 
-    /// Fetches eATA and record pairs after the first image reveals an ATA's seeds.
-    /// No companion is subscribed or materialized under its raw address.
+    /// Fetches each ATA's eATA and delegation record using the snapshot's token owner and mint.
+    /// These companions are fetched only; any delegated balance is materialized under the ATA address.
     async fn fetch_ata_companions(
         &self,
         plan: &FetchPlan<'_>,
@@ -205,7 +206,7 @@ impl ChainSync {
         Ok(projected)
     }
 
-    /// Materializes complete snapshots and defers readonly discoveries and action targets.
+    /// Materializes snapshots, deferring accounts that need companions or action dependencies.
     async fn materialize_batch(
         &self,
         accounts: Vec<PendingAccount<'_>>,
@@ -230,8 +231,8 @@ impl ChainSync {
             }
             if projected_record.is_none() && pending.property == AccountProperty::Readonly {
                 let image = account.read();
-                // These roles request a companion on the next wave without changing
-                // the original readonly subscription's ownership.
+                // Refetch with the required companion while keeping the initial
+                // readonly subscription active.
                 let property = if image.owner() == dlp_api::id() {
                     Some(AccountProperty::Writable)
                 } else if image.owner() == bpf_loader_upgradeable::ID
@@ -295,9 +296,9 @@ impl ChainSync {
         Ok(outcome)
     }
 
-    /// Waits for every subscription request and removes successful subscriptions if any fail.
+    /// Waits for every subscription request; on failure, releases references acquired by this batch.
     async fn subscribe(&self, subscriptions: &[AccountSubscription]) -> Result<()> {
-        // Settle every admitted request so acknowledged subscriptions can be cleaned up.
+        // Wait for all requests so one failure cannot leave another successful request untracked.
         let requests = subscriptions.iter().map(|&sub| self.websocket.subscribe(sub));
         let mut subscribed = Vec::with_capacity(subscriptions.len());
         let mut failure = None;
@@ -316,10 +317,10 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Releases subscriptions; failed releases mean their socket or pool entry is already gone.
+    /// Releases one subscription reference per remote address, not per local destination.
+    /// Disconnect and pool-shutdown errors are ignored during cleanup.
     pub(super) async fn unsubscribe(&self, keys: impl IntoIterator<Item = Pubkey>) {
         let pending = keys.into_iter().map(|key| self.websocket.unsubscribe(key));
-        // A failed release means its socket or pool entry is already gone.
         let _ = future::join_all(pending).await;
     }
 }
@@ -336,20 +337,20 @@ struct PendingAccount<'engine> {
     record_index: Option<usize>,
 }
 
-/// Delegation deferred until the batch's other account leases are released.
+/// Delegated account awaiting action dependencies after its initial lease is released.
 struct PendingDelegation {
     /// Resolved account and its full delegation record.
     delegation: grpc::Delegation,
-    /// Whether successful materialization should remove the primary subscription.
+    /// Whether to release the primary subscription reference after materialization succeeds.
     unsubscribe: bool,
 }
 
 /// Work discovered from one batch after its account leases have been released.
 #[derive(Default)]
 struct BatchOutcome {
-    /// Incomplete readonly primaries needing companions.
+    /// Readonly accounts to refetch with delegation-record or ProgramData companions.
     promotions: Vec<SyncAccount>,
-    /// Highest first-wave slot among promoted primaries.
+    /// Minimum slot for refetching: the highest snapshot slot among accounts needing companions.
     promotion_slot: Option<u64>,
     /// Delegated accounts whose action dependencies must resolve before materialization.
     delegations: Vec<PendingDelegation>,
@@ -361,11 +362,11 @@ struct FetchPlan<'engine> {
     accounts: Vec<PendingAccount<'engine>>,
     /// Primary and companion keys in HTTP response order.
     keys: Vec<Pubkey>,
-    /// Accounts subscribed before the HTTP request.
+    /// Subscription references to acquire before the HTTP request.
     subscriptions: Vec<AccountSubscription>,
     /// Program and ProgramData positions used during normalization.
     programs: Vec<(usize, usize)>,
-    /// Promoted keys materialized by another wave before their leases were reacquired.
+    /// Refetches skipped because Engine now has the account; their carried subscriptions need release.
     skipped: Vec<Pubkey>,
 }
 
@@ -397,11 +398,11 @@ impl<'e> FetchPlan<'e> {
             let pubkey = request.pubkey;
             let index = plan.keys.len();
             plan.keys.push(pubkey);
-            // A promoted key already has coverage from the discovery fetch.
+            // An account queued for refetch keeps its subscription from the first fetch.
             if request.property != AccountProperty::Writable
                 && !carried_subscriptions.contains(&pubkey)
             {
-                plan.subscriptions.push(AccountSubscription { pubkey, target: None });
+                plan.subscriptions.push(AccountSubscription { pubkey, program: None });
             }
             let record_index = match request.property {
                 AccountProperty::Payer | AccountProperty::Writable => {
@@ -429,7 +430,7 @@ impl<'e> FetchPlan<'e> {
         plan
     }
 
-    /// Selects the program or ProgramData subscription to release after normalization.
+    /// Chooses the unused subscription: the program for Loader V3, ProgramData for other loaders.
     fn subscriptions_to_remove(&self, snapshot: &Snapshot) -> Vec<Pubkey> {
         let mut prune = Vec::new();
         for &(program_index, data_index) in &self.programs {

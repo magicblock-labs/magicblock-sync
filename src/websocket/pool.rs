@@ -22,20 +22,20 @@ use tracing::{info, warn};
 
 /// Subscription handle for a shutdown-managed WebSocket pool.
 pub(crate) struct Pool {
-    /// Bounded queue for account subscription requests and cache evictions.
+    /// Bounded queue for subscription and unsubscribe requests.
     commands: Sender<SubscriptionRequest>,
 }
 
 type Reply = oneshot::Sender<Result<()>>;
 
-/// One account operation submitted to the registry.
+/// Subscription request processed by the pool registry.
 enum SubscriptionRequest {
-    /// Subscribes once and reports the server acknowledgement.
+    /// Adds a subscription reference, waiting for server acknowledgement if not already active.
     Subscribe(AccountSubscription, Reply),
-    /// Unsubscribes and reports the server outcome.
+    /// Releases one reference for a remote address, waiting for acknowledgement if it was the last.
     Unsubscribe(Pubkey, Reply),
-    /// Unsubscribes all accounts that materialize one cached Engine target.
-    Evict(Pubkey),
+    /// Removes all active remote subscriptions feeding a local address, ignoring reference counts.
+    UnsubscribeAccount(Pubkey),
 }
 
 /// Per-account state that occupies socket capacity.
@@ -43,18 +43,18 @@ enum Subscription {
     /// Subscribe request awaiting a server acknowledgement.
     Pending {
         reply: Reply,
-        /// Account and optional ProgramData target to publish on acknowledgement.
+        /// Remote address and local account reported when the server acknowledges.
         account: AccountSubscription,
-        /// Unsubscribe waiter if removal overtook the subscribe acknowledgement.
+        /// Unsubscribe caller waiting for a pending subscribe to finish before cancellation.
         cancel: Option<Reply>,
     },
     /// Acknowledged subscription shared by identical acquisition requests.
     Active {
         /// Provider subscription ID used to unsubscribe.
         remote: u64,
-        /// Exact subscription identity; a different target cannot share it.
+        /// Remote address and local account; requests can share only if both match.
         account: AccountSubscription,
-        /// Unreleased subscription references; the last release unsubscribes.
+        /// Number of acquisition requests sharing this subscription; the last release unsubscribes.
         refs: usize,
     },
     /// Unsubscribe awaiting acknowledgement or socket loss.
@@ -133,8 +133,7 @@ impl Pool {
 
     /// Retains an acknowledged subscription; identical active requests share one provider ID.
     /// Acknowledgement does not include an initial account image.
-    /// The target is retained in queued updates, including those buffered before
-    /// an unsubscribe completes.
+    /// Updates retain the local account to update, even if queued before unsubscribe completes.
     ///
     /// Capacity failures return immediately. Do not cancel: admitted work may
     /// complete after the caller stops waiting.
@@ -142,8 +141,9 @@ impl Pool {
         self.request(SubscriptionRequest::Subscribe, account).await
     }
 
-    /// Releases one subscription reference; the last release unsubscribes remotely.
-    /// Do not overlap ordinary subscribe and unsubscribe operations for the same key.
+    /// Releases one reference for the remote address `pubkey`; the last release unsubscribes remotely.
+    /// For Loader V3 ELF updates, pass the ProgramData address, not the local program address.
+    /// Do not overlap ordinary subscribe and unsubscribe operations for the same remote address.
     ///
     /// Already-lost subscriptions are a no-op; buffered updates may still arrive.
     /// Connection loss returns [`Error::Disconnected`]; the registry logs its cause.
@@ -151,15 +151,18 @@ impl Pool {
         self.request(SubscriptionRequest::Unsubscribe, pubkey).await
     }
 
-    /// Orders cache cleanup before subsequent acquisition without waiting for I/O.
-    pub(crate) async fn evict(&self, target: Pubkey) -> Result<()> {
+    /// Queues removal of all active remote subscriptions feeding `local_pubkey`,
+    /// regardless of reference count.
+    /// For a Loader V3 program, this removes its ProgramData subscription too.
+    /// Does not wait for provider acknowledgement; caller holds the local account lease until queued.
+    pub(crate) async fn unsubscribe_account(&self, local_pubkey: Pubkey) -> Result<()> {
         self.commands
-            .send(SubscriptionRequest::Evict(target))
+            .send(SubscriptionRequest::UnsubscribeAccount(local_pubkey))
             .await
             .map_err(|_| Error::Closed)
     }
 
-    /// Waits for registry admission and the server's operation outcome.
+    /// Queues a request and waits for the registry's reply.
     async fn request<T>(
         &self,
         make: impl FnOnce(T, Reply) -> SubscriptionRequest,
@@ -177,9 +180,9 @@ struct Registry {
     config: Config,
     /// Entries retain stable indices across reconnects.
     sockets: Vec<Socket>,
-    /// Pubkey to socket index; lifecycle state lives in that entry.
+    /// Maps each remote account address to the socket holding its subscription state.
     routes: AHashMap<Pubkey, usize>,
-    /// Public updates and lifecycle events share this queue.
+    /// Account updates, subscription acknowledgements, removals, and connection losses.
     events: Sender<Event>,
     /// Socket outcomes arrive independently of public updates.
     notices: UnboundedSender<Notice>,
@@ -208,7 +211,9 @@ impl Registry {
                         SubscriptionRequest::Unsubscribe(pubkey, reply) => {
                             self.unsubscribe(pubkey, reply).await;
                         }
-                        SubscriptionRequest::Evict(target) => self.evict(target).await,
+                        SubscriptionRequest::UnsubscribeAccount(local_pubkey) => {
+                            self.unsubscribe_account(local_pubkey).await;
+                        }
                     }
                 }
                 Some(notice) = notices.recv() => self.notice(notice).await,
@@ -216,9 +221,10 @@ impl Registry {
         }
     }
 
-    /// Releases all subscription references for an evicted Engine target.
-    async fn evict(&mut self, target: Pubkey) {
-        for sub in AccountSubscription::for_target(target) {
+    /// Removes matching direct and ProgramData subscriptions for a local address.
+    /// Unlike `unsubscribe`, releases all references rather than one remote-address reference.
+    async fn unsubscribe_account(&mut self, local_pubkey: Pubkey) {
+        for sub in AccountSubscription::for_account(local_pubkey) {
             let pubkey = sub.pubkey;
             let Some(&index) = self.routes.get(&pubkey) else { continue };
             let Some(Subscription::Active { account, refs, .. }) =
@@ -229,6 +235,7 @@ impl Registry {
             if *account != sub {
                 continue;
             }
+            // Force unsubscribe even when several acquisition requests share this subscription.
             *refs = 1;
             let (reply, _) = oneshot::channel();
             self.unsubscribe(pubkey, reply).await;
@@ -288,8 +295,8 @@ impl Registry {
             self.sockets[index].accounts.get(&pubkey),
             Some(Subscription::Active { refs: 1, .. })
         ) {
-            // Queue logical removal before provider unsubscribe so buffered updates
-            // fail the worker's coverage check. Remaining references retain coverage.
+            // Tell the worker to reject buffered updates before sending provider unsubscribe.
+            // Shared subscriptions reach this point only when their last reference is released.
             let _ = self.events.send(Event::Removed(pubkey)).await;
         }
         let socket = &mut self.sockets[index];
@@ -336,8 +343,8 @@ impl Registry {
     async fn notice(&mut self, notice: Notice) {
         match notice {
             Notice::Connected(connection) => {
-                let provider = connection.provider;
                 if connection.generation > 0 {
+                    let provider = self.config.providers[connection.provider].url.host_str();
                     info!(provider, "WS reconnected");
                 }
                 let socket = &mut self.sockets[connection.index];
@@ -349,8 +356,8 @@ impl Registry {
                 return self.acknowledge(connection, pubkey, result).await;
             }
             Notice::Dropped { connection, error } => {
-                let provider = connection.provider;
-                metrics::transport(provider, Transport::WebSocket);
+                let provider = self.config.providers[connection.provider].url.host_str();
+                metrics::transport(Transport::WebSocket);
                 let socket = &mut self.sockets[connection.index];
                 self.occupied -= socket.occupied();
                 let clock = socket.clock;
@@ -361,7 +368,7 @@ impl Registry {
                     self.routes.remove(&pubkey);
                     let report = match entry {
                         Subscription::Pending { reply, cancel, .. } => {
-                            // Cancelled subscriptions do not report a source loss.
+                            // A cancelled sub must not trigger account eviction on socket loss.
                             let report = cancel.is_none();
                             let _ = reply.send(Err(Error::Disconnected));
                             if let Some(reply) = cancel {
@@ -409,7 +416,7 @@ impl Registry {
         let (reply, cancel, result) = match (state, result) {
             (Subscription::Pending { reply, account, cancel }, Ok(Some(remote))) => {
                 if let Some(cancel) = cancel {
-                    // Unsubscribe raced the subscribe acknowledgement; never publish coverage.
+                    // The caller already requested unsubscribe; do not report this as active.
                     socket.accounts.insert(pubkey, Subscription::Unsubscribing(cancel));
                     let _ = socket.commands.send(Command::Unsubscribe { pubkey, remote });
                 } else {
@@ -444,7 +451,7 @@ impl Registry {
         if clock {
             let _ = commands.send(Command::Subscribe(AccountSubscription {
                 pubkey: clock::ID,
-                target: None,
+                program: None,
             }));
         }
         let task = tokio::spawn(Session::start(

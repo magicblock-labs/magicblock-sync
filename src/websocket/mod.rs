@@ -94,7 +94,7 @@ pub(super) enum Event {
     Removed(Pubkey),
     /// Confirmed account update in `Uninit` mode, before Engine materialization.
     Update {
-        /// Observed account and optional ProgramData target.
+        /// Remote subscription and optional program address to materialize ProgramData ELF under.
         sub: AccountSubscription,
         /// Decoded account state, including zero-lamport updates.
         account: AccountBuilder,

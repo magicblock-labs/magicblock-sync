@@ -14,14 +14,14 @@ use crate::{
 };
 
 impl ChainSync {
-    /// Loads dependencies for delegated actions before materializing the delegated account.
+    /// Projects eATA delegations when needed, loads action dependencies, then materializes the account.
     pub(super) async fn delegated(&self, mut delegation: grpc::Delegation) -> Result<()> {
         let projected = ata::is_eata(&delegation.account);
         if projected {
-            let Some(target) = self.project_delegation(delegation).await? else {
+            let Some(projection) = self.project_delegation(delegation).await? else {
                 return Ok(());
             };
-            delegation = target;
+            delegation = projection;
         } else if delegation.account.read().is(AccountMode::Magic) {
             // Confined accounts have no commit authority: no actions, dependencies, or rescue.
             self.engine
@@ -41,7 +41,7 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Projects a globally observed eATA delegation onto a resident canonical ATA.
+    /// Projects a gRPC eATA delegation onto a matching ATA already present in Engine.
     async fn project_delegation(
         &self,
         delegation: grpc::Delegation,
@@ -81,7 +81,7 @@ impl ChainSync {
         Ok(None)
     }
 
-    /// Reads the current Engine image after acquiring any required account lease.
+    /// Copies the current Engine account image; callers hold its lease when checking lifecycle state.
     fn resident_account(&self, pubkey: Pubkey) -> Result<Option<AccountBuilder>> {
         let accounts = self.engine.accounts();
         let loader = accounts.loader();
@@ -91,7 +91,7 @@ impl ChainSync {
         Ok(account)
     }
 
-    /// Decodes action dependencies without acquiring the delegated account's lease.
+    /// Decodes and decrypts actions, returning their dependencies without taking an account lease.
     pub(crate) fn prepare_delegation(
         &self,
         delegation: grpc::Delegation,
@@ -103,8 +103,8 @@ impl ChainSync {
             source_program,
         } = delegation;
         let appended = delegation::appended(&record).ok_or(Error::Record("record too short"))?;
-        // Keep invalid actions with the trusted image so every acquisition path
-        // can schedule rescue without trying to load their dependencies.
+        // Retain decoding errors with the validated delegation so materialization
+        // can schedule rescue instead of trying to fetch unusable action dependencies.
         let actions = if appended.is_empty() {
             Ok(None)
         } else {
@@ -129,7 +129,7 @@ impl ChainSync {
                 }
             }
         }
-        // The target must not hold its lease while these dependencies are acquired.
+        // The delegated account itself is materialized later; do not fetch it as a dependency.
         dependencies.remove(&pubkey);
         let dependencies = dependencies
             .into_iter()
@@ -144,7 +144,8 @@ impl ChainSync {
         Ok((prepared, dependencies))
     }
 
-    /// Assesses action signers before acquiring the target after dependency resolution.
+    /// After dependencies are fetched, checks action signers and materializes under an Engine lease.
+    /// Invalid actions, rejected signers, and materialization failures enter rescue.
     pub(crate) async fn materialize_delegation(&self, prepared: PreparedDelegation) -> Result<()> {
         let _timer = metrics::time(Op::Delegate);
         let PreparedDelegation {
@@ -155,9 +156,12 @@ impl ChainSync {
         } = prepared;
         let result = match actions {
             Ok(actions) => {
-                // Service failures return before the lease; only rejection enters rescue.
-                let rejected =
-                    aml::check(self.aml.as_ref(), actions.as_deref().unwrap_or_default()).await?;
+                // An unavailable AML service is not a rejection: return without scheduling rescue.
+                let rejected = if let (Some(aml), Some(actions)) = (&self.aml, &actions) {
+                    aml::check(aml, actions).await?
+                } else {
+                    Default::default()
+                };
                 if rejected.is_empty() {
                     let actions = actions.map(|actions| PostFinalize { source_program, actions });
                     let accessor = self.engine.account(pubkey).await?;
@@ -179,7 +183,7 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Reacquires the target after failed materialization before scheduling rescue.
+    /// Acquires the account's lease and schedules rescue unless local state already supersedes it.
     async fn rescue_delegation(
         &self,
         pubkey: Pubkey,
@@ -188,7 +192,7 @@ impl ChainSync {
     ) -> engine::Result<()> {
         let slot = account.read().slot();
         let accessor = self.engine.account(pubkey).await?;
-        // An activated or superseding account state needs no rescue for this image.
+        // Skip rescue for an already handled delegation, newer state, or confined account.
         let superseded = match accessor.observed() {
             Some((AccountMode::Magic, _)) => true,
             Some((AccountMode::Transient, observed)) if observed == slot => true,
@@ -208,13 +212,12 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Deletes the account only when the event is current and the observed mode permits
-    /// removal.
+    /// Handles undelegation by deleting an eligible local account or its projected ATAs.
     pub(super) async fn undelegated(&self, pubkey: Pubkey, slot: u64) -> Result<()> {
         let _timer = metrics::time(Op::Undelegate);
         let accessor = self.engine.account(pubkey).await?;
         if accessor.exists() {
-            return Self::undelegate_target(accessor, slot).await;
+            return Self::undelegate_account(accessor, slot).await;
         }
         drop(accessor);
         let snapshot = self.fetcher.fetch(&[pubkey], Some(slot)).await?;
@@ -233,14 +236,15 @@ impl ChainSync {
                 continue;
             };
             if ata::is_projection_of(ata, pubkey, &account) {
-                Self::undelegate_target(accessor, slot).await?;
+                Self::undelegate_account(accessor, slot).await?;
             }
         }
         Ok(())
     }
 
-    /// Applies the existing undelegation lifecycle rule to one Engine target.
-    async fn undelegate_target(accessor: AccountAccessor<'_>, slot: u64) -> Result<()> {
+    /// Deletes a present account unless the event is older or its mode is authoritative.
+    /// `Transient` accounts may be deleted: their undelegation is already in progress.
+    async fn undelegate_account(accessor: AccountAccessor<'_>, slot: u64) -> Result<()> {
         let pubkey = accessor.pubkey();
         let Some((mode, observed)) = accessor.observed() else {
             return Ok(());
@@ -254,13 +258,13 @@ impl ChainSync {
     }
 }
 
-/// Delegated image and trusted actions ready to apply after dependency acquisition.
+/// Delegated account and action-decoding result held while action dependencies are fetched.
 pub(crate) struct PreparedDelegation {
     /// Account whose lease is acquired only after action dependencies resolve.
     pubkey: Pubkey,
     /// Delegated image to materialize under that lease.
     account: AccountBuilder,
-    /// Decoded actions, or a payload error that requires rescue undelegation.
+    /// Decrypted actions, or a decoding/decryption error that requires rescue undelegation.
     actions: Result<Option<Vec<Instruction>>>,
     /// Original owning program from the validated delegation record.
     /// For an eATA projection, this is the eATA program, not the ATA's token program.

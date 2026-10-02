@@ -37,26 +37,26 @@ use super::{
 use crate::metrics::{self, Transport};
 use crate::{delegation, AccountSubscription, DUPLICATION_DELAY};
 
-/// Desired account interest and delegation state for one provider stream.
+/// Account subscriptions and delegation matching for one Yellowstone provider stream.
 pub(super) struct Session {
     /// Stable index in the configured provider list.
     id: usize,
     config: StreamConfig,
     authority: Pubkey,
-    /// Physical account filter; a rebuild sends changes before confirming coverage.
+    /// Account filter sent to Yellowstone; may retain removed keys until the next rebuild.
     retained_filter: CompressedAccountFilterSet,
-    /// Logical interest, including WS copies still within the duplication delay.
+    /// Accounts to track, including WebSocket subscriptions still waiting for their gRPC copy.
     desired: AHashMap<Pubkey, TrackedAccount>,
-    /// Engine owns the confirmed-observation watermark.
+    /// Stores the confirmed chain slot used to seed replay and constrain HTTP snapshots.
     engine: Engine,
     events: mpsc::Sender<Event>,
-    /// Same-slot application and record matching.
+    /// Matches DLP-owned account updates to delegation records observed in the same slot.
     delegations: Delegations,
 }
 
-/// One WS-confirmed account awaiting or retaining a gRPC filter entry.
+/// WebSocket-acknowledged subscription waiting for or already included in the gRPC filter.
 struct TrackedAccount {
-    /// Exact key and optional ProgramData target.
+    /// Remote account address and the local account its updates belong to.
     sub: AccountSubscription,
     /// Generation assigned by the coverage registry to reject stale confirmations.
     gen: u64,
@@ -65,7 +65,7 @@ struct TrackedAccount {
 }
 
 impl Session {
-    /// Keeps the exact retained-account filter across Yellowstone reconnects.
+    /// Creates a session whose account filter survives Yellowstone reconnects.
     pub(super) fn new(
         id: usize,
         config: StreamConfig,
@@ -92,8 +92,9 @@ impl Session {
         loop {
             let Err(error) = self.subscribe(&mut commands).await else { return Ok(()) };
             let retryable = recoverable(&error);
-            metrics::transport(self.id, Transport::Grpc);
-            error!(stream = self.id, retryable, %error, "gRPC session failed");
+            metrics::transport(Transport::Grpc);
+            let provider = self.config.endpoint.host_str();
+            error!(provider, retryable, %error, "gRPC session failed");
             let _ = self.events.send(Event::Lost(self.id)).await;
             if retryable {
                 #[allow(clippy::disallowed_methods)]
@@ -118,10 +119,11 @@ impl Session {
         let mut client = builder.connect().await?;
         self.sync_filter()?;
         let mut request = self.request();
-        // Seed only new sessions; filter refreshes leave replay to Yellowstone.
+        // Set the replay start only when opening a stream; Yellowstone handles replay
+        // on its internal reconnects, and filter refreshes must not restart it.
         request.from_slot = Some(self.engine.accounts().chain_slot().saturating_sub(2));
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
-        // Reconnect keeps local filter membership; confirm only keys included in this request.
+        // Report only tracked accounts included in the initial filter, not those still waiting.
         for (&pubkey, entry) in &self.desired {
             if self.retained_filter.contains(pubkey) {
                 self.confirm([(pubkey, entry.gen)]).await;
@@ -157,12 +159,12 @@ impl Session {
         Ok(())
     }
 
-    /// Sends the complete current physical filter on the live stream.
+    /// Sends the full subscription request, including account and delegation filters.
     async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
         sink.send(self.request()).await.map_err(Into::into)
     }
 
-    /// Answers a heartbeat, then restores the full subscription request.
+    /// Answers a server ping, then resends the full subscription request.
     async fn ping(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
         let request = SubscribeRequest {
             ping: Some(SubscribeRequestPing { id: PING_ID }),
@@ -184,7 +186,7 @@ impl Session {
         Ok(())
     }
 
-    /// Applies logical interest immediately and sends its full filter only when it changes.
+    /// Updates tracked accounts; only a rebuild sends a changed filter to Yellowstone.
     async fn command(&mut self, command: Command, sink: &mut SubscribeRequestSink) -> Result<()> {
         match command {
             Command::Track { sub, gen } => {
@@ -204,7 +206,8 @@ impl Session {
             Command::Rebuild => {
                 let added = self.sync_filter()?;
                 if let Some(added) = added {
-                    // Publish the new filter before claiming its added keys as covered.
+                    // Notify the worker only after sending the filter; Yellowstone
+                    // does not acknowledge individual account subscriptions.
                     self.refresh(sink).await?;
                     self.confirm(added).await;
                 }
@@ -213,7 +216,8 @@ impl Session {
         Ok(())
     }
 
-    /// Prunes removed keys and adds aged keys without reallocating an unchanged filter.
+    /// Removes untracked keys and adds accounts whose duplication delay has elapsed.
+    /// Returns newly added keys if the filter changed, or `None` if it did not.
     fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>> {
         let remove: Vec<_> = self
             .retained_filter
@@ -236,15 +240,15 @@ impl Session {
         Ok((!remove.is_empty() || !added.is_empty()).then_some(added))
     }
 
-    /// Reports account filter delivery to the ChainSync worker.
+    /// Reports accounts included in a sent filter; this is not a server acknowledgement.
     async fn confirm(&self, confirmations: impl IntoIterator<Item = (Pubkey, u64)>) {
         for (pubkey, gen) in confirmations {
             self.send(Event::Confirmed { stream: self.id, pubkey, gen }).await;
         }
     }
 
-    /// Sends the exact retained-account filter alongside DLP delegation discovery and
-    /// successful ownership-return transaction filters, including on reconnect.
+    /// Builds a request for tracked accounts, DLP-owned accounts, accepted delegation records,
+    /// and successful DLP transactions used to detect undelegation.
     fn request(&mut self) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             commitment: Some(CommitmentLevel::Confirmed as i32),
@@ -291,7 +295,7 @@ impl Session {
         request
     }
 
-    /// Routes retained updates and discovers same-slot delegation pairs.
+    /// Forwards tracked account updates and matches same-slot account/record pairs for delegation.
     async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
@@ -301,7 +305,7 @@ impl Session {
         if let Some(desired) = self.desired.get(&key).filter(|_| self.retained_filter.contains(key))
         {
             let owner = super::pubkey(&account.owner)?;
-            // Delegation matching still needs the DLP bytes after the retained update is sent.
+            // Keep DLP-owned data for delegation matching after forwarding the account update.
             let data = if candidate { account.data.clone() } else { mem::take(&mut account.data) };
             let image = AccountBuilder::default()
                 .owner(owner)
@@ -325,15 +329,15 @@ impl Session {
                 self.delegated(delegation).await;
             }
         }
-        // Application data can resemble a record. Only a matching record PDA
-        // establishes its role, so the update may be considered both ways.
+        // Account data may parse as a record by coincidence. Consider both roles;
+        // a match is valid only at the application's derived delegation-record address.
         if let Some(delegation) = self.delegations.account(key, account) {
             self.delegated(delegation).await;
         }
         Ok(())
     }
 
-    /// Raises the shared watermark for a resolved delegation before delivery.
+    /// Advances Engine's confirmed chain slot before reporting the resolved delegation.
     async fn delegated(&self, delegation: Delegation) {
         self.engine.accounts().advance_chain_slot(delegation.account.read().slot());
         self.send(Event::Delegated(delegation)).await;

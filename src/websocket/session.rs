@@ -54,7 +54,7 @@ pub(super) enum Notice {
     /// All subscriptions on this attempt were lost.
     Dropped {
         connection: ConnectionId,
-        /// Cause retained for public loss reporting.
+        /// Connection failure logged by the pool before reporting lost subscriptions.
         error: Error,
     },
 }
@@ -83,7 +83,7 @@ pub(super) struct Session {
     pending: AHashMap<u64, Pending>,
     /// Acknowledgement deadlines for pending commands.
     timers: FuturesUnordered<Abortable<Sleep>>,
-    /// Provider subscription IDs routed to account keys and update targets.
+    /// Maps provider subscription IDs to remote addresses and the Engine accounts to update.
     active: AHashMap<u64, AccountSubscription>,
     id: ConnectionId,
     /// Registry-only lifecycle channel.
@@ -355,14 +355,13 @@ impl Session {
         })
     }
 
-    /// Preserves per-socket lifecycle order without blocking public updates.
+    /// Reports connection and RPC outcomes through the pool's unbounded channel.
     fn notify(&self, notice: Notice) -> Result<()> {
         self.notices.send(notice).map_err(|_| Error::Closed)
     }
 }
 
-// Borrow payloads until routing is validated; account updates still use typed decoding.
-/// Borrowed envelope whose routing identity is validated before payload decoding.
+/// Borrowed RPC envelope; decode its payload only after checking the request or subscription ID.
 #[derive(Deserialize)]
 struct Envelope<'a> {
     /// Notification method when no request ID is present.

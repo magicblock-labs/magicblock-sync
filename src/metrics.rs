@@ -1,4 +1,4 @@
-//! Process-wide ChainSync metrics; provider indices are scoped by transport.
+//! Process-wide ChainSync metrics with fixed outcome and transport labels.
 
 use std::sync::OnceLock;
 
@@ -12,18 +12,18 @@ use crate::http::{Error as HttpError, Outcome};
 /// Shared collectors registered once for all ChainSync instances.
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
-/// Low-cardinality timing boundaries within account synchronization.
+/// Account synchronization operations measured by duration.
 #[derive(Clone, Copy)]
 pub(crate) enum Op {
     /// All acquisition waves, dependencies, leases, and materialization.
     Sync,
     /// A complete snapshot fetch, including retries and cooldown waits.
     HttpFetch,
-    /// A coverage-admitted streamed update, including its Engine lease.
+    /// Applying an update from an active subscription, including time waiting for its Engine lease.
     Apply,
     /// Non-confined delegation materialization, including assessment and rescue.
     Delegate,
-    /// One account's ownership-return handler, including any ATA resolution.
+    /// Handling one undelegation event, including any projected ATA lookup.
     Undelegate,
     /// One provider request, including response decoding.
     HttpAttempt,
@@ -62,17 +62,17 @@ impl Transport {
 struct Metrics {
     /// Elapsed microseconds grouped by operation.
     durations: OperationCounters,
-    /// Current logical subscriptions grouped by confirmed source combination.
+    /// Active account subscriptions grouped by WebSocket-only, gRPC-only, or both transports.
     coverage: IntGaugeVec,
-    /// Unexpected losses of a logical subscription's final source.
+    /// Account subscriptions that lost their last active transport unexpectedly.
     losses: IntCounterVec,
     /// Failed activations that enter rescue, regardless of its outcome.
     activation_failures: IntCounter,
     /// Rescue scheduling results and superseded-image decisions.
     rescues: IntCounterVec,
-    /// Returned HTTP attempts grouped by provider and classified outcome.
+    /// Completed HTTP attempts grouped by result category.
     http: IntCounterVec,
-    /// WS attempt and gRPC outer-session failures grouped by provider.
+    /// WS attempt and gRPC outer-session failures grouped by transport.
     transport: IntCounterVec,
 }
 
@@ -100,15 +100,15 @@ pub(crate) fn init() {
             &["outcome"],
         ),
         http: counter_vec(
-            spec("sync_http_attempts", "HTTP attempt results by provider"),
-            &["provider", "outcome"],
+            spec("sync_http_attempts", "HTTP attempt results"),
+            &["outcome"],
         ),
         transport: counter_vec(
             spec(
                 "sync_transport_failures",
                 "WS attempt and gRPC outer-session failures",
             ),
-            &["transport", "provider"],
+            &["transport"],
         ),
     });
 }
@@ -122,7 +122,7 @@ pub(crate) fn time(op: Op) -> OperationTimer<'static> {
     op.time(METRICS.get().map(|metrics| &metrics.durations))
 }
 
-/// Moves one logical subscription between `ws_only`, `grpc_only`, and `both`.
+/// Updates gauges when a subscription changes between `ws_only`, `grpc_only`, and `both`.
 /// `None` means no confirmed coverage; unchanged states do not update gauges.
 pub(crate) fn coverage(before: Option<&'static str>, after: Option<&'static str>) {
     if before == after {
@@ -157,21 +157,18 @@ pub(crate) fn rescue(outcome: &'static str) {
     });
 }
 
-/// Counts one failed WS attempt or gRPC outer session by provider index.
+/// Counts one failed WS attempt or gRPC outer session by transport.
 /// Yellowstone's internal reconnects do not enter this boundary.
-pub(crate) fn transport(provider: usize, transport: Transport) {
+pub(crate) fn transport(transport: Transport) {
     with_metrics(&METRICS, |metrics| {
-        metrics
-            .transport
-            .with_label_values(&[transport.label(), &provider.to_string()])
-            .inc();
+        metrics.transport.with_label_values(&[transport.label()]).inc();
     });
 }
 
-/// Counts a returned HTTP attempt using the retry policy's error classification.
-pub(crate) fn http_attempt<T>(provider: usize, result: &Result<T, HttpError>) {
+/// Counts a completed HTTP attempt using the retry policy's error categories.
+pub(crate) fn http_attempt<T>(result: &Result<T, HttpError>) {
     with_metrics(&METRICS, |metrics| {
         let outcome = result.as_ref().err().map_or(Outcome::Success, HttpError::outcome);
-        metrics.http.with_label_values(&[&provider.to_string(), outcome.label()]).inc();
+        metrics.http.with_label_values(&[outcome.label()]).inc();
     });
 }

@@ -47,7 +47,7 @@ impl<P> Request<P> {
 pub(crate) struct AccountConfig {
     encoding: &'static str,
     commitment: &'static str,
-    /// HTTP freshness floor, absent from subscriptions.
+    /// Minimum response context slot for HTTP; omitted from WebSocket subscriptions.
     #[serde(skip_serializing_if = "Option::is_none")]
     min_context_slot: Option<u64>,
 }
@@ -70,12 +70,12 @@ pub(crate) struct Context {
     pub(crate) slot: u64,
 }
 
-/// Context and required value, allowing explicit null only when `T` does.
+/// RPC response context and payload; a missing `value` is an error even when `T` is optional.
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub(crate) struct ContextValue<T> {
     pub(crate) context: Context,
-    /// Required payload; null is valid only for nullable `T`.
+    /// Explicit null is valid for `Option<T>`, but omitting the field is not.
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pub(crate) value: T,
 }
