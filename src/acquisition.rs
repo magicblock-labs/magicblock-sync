@@ -96,9 +96,6 @@ impl ChainSync {
                 ready.push((prepared, pubkey, unsubscribe));
             }
             deferred.push(ready);
-            if next.is_empty() {
-                break;
-            }
             accounts = next
                 .into_iter()
                 .map(|(pubkey, property)| SyncAccount { pubkey, property })
@@ -271,12 +268,10 @@ impl ChainSync {
                 && (projected
                     || pending.property == AccountProperty::Payer
                     || carried_subscriptions.contains(&pubkey));
-            let has_actions = match &record {
-                Some((_, record)) => {
-                    delegation::appended(record).is_some_and(|actions| !actions.is_empty())
-                }
-                None => false,
-            };
+            let has_actions = record
+                .as_ref()
+                .and_then(|(_, record)| delegation::appended(record))
+                .is_some_and(|actions| !actions.is_empty());
             let defer = account.read().is(AccountMode::Delegated) && has_actions;
             if let Some((source_program, record)) = record.filter(|_| defer) {
                 let delegation = grpc::Delegation {

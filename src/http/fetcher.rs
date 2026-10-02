@@ -32,7 +32,7 @@ pub struct Snapshot {
 /// Callers split requests into batches of at most 100 keys and arrange subscriptions.
 pub struct Fetcher {
     /// Reusable HTTP connections without implicit redirects or retries.
-    client: reqwest::Client,
+    client: Client,
     /// Stable endpoint order used for error reporting.
     providers: Vec<Provider>,
     /// Supplies the confirmed chain slot used as the minimum for each HTTP fetch.

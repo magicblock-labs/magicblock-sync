@@ -187,6 +187,11 @@ impl ChainSync {
                     error!(%pubkey, %error, "delegation failed");
                 }
             }
+            grpc::Event::UndelegationRequested { pubkey, slot } => {
+                if let Err(error) = self.undelegation_requested(pubkey, slot).await {
+                    error!(%pubkey, slot, %error, "undelegation scheduling failed");
+                }
+            }
             grpc::Event::Undelegated { pubkeys, slot } => {
                 for pubkey in pubkeys {
                     if let Err(error) = self.undelegated(pubkey, slot).await {

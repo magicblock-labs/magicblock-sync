@@ -71,6 +71,8 @@ pub(super) enum Event {
     },
     /// New delegation matched to the account's delegation record PDA.
     Delegated(Delegation),
+    /// Canonical DLP request to undelegate a local account, observed at this slot.
+    UndelegationRequested { pubkey: Pubkey, slot: u64 },
     /// Accounts undelegated in a successful transaction at this slot.
     Undelegated { pubkeys: SmallVec<[Pubkey; 1]>, slot: u64 },
     /// This account was included in a sent filter for the given subscription generation.

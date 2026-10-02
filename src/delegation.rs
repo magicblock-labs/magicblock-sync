@@ -54,17 +54,15 @@ pub(crate) fn account(account: AccountBuilder, record: &DelegationRecord) -> Acc
     }
 }
 
-/// Builds the commit-and-undelegate rescue action for a validated delegation that failed activation.
-/// MagicRoot vouches for the readonly authority signer during PostFinalize.
-pub(crate) fn rescue_action(authority: Pubkey, pubkey: Pubkey) -> Instruction {
+/// Builds commit-and-undelegate for either a local request or failed-activation rescue.
+/// The authority signs directly, or MagicRoot vouches for it during PostFinalize.
+pub(crate) fn undelegation_action(authority: Pubkey, pubkey: Pubkey) -> Instruction {
     // Authority and Magic Context occupy action indices 0 and 1.
-    let commit_type = CommitTypeArgs::Standalone(vec![2]);
-    let undelegate = CommitAndUndelegateArgs {
-        commit_type,
-        undelegate_type: UndelegateTypeArgs::Standalone,
-    };
     let args = MagicIntentBundleArgs {
-        commit_and_undelegate: Some(undelegate),
+        commit_and_undelegate: Some(CommitAndUndelegateArgs {
+            commit_type: CommitTypeArgs::Standalone(vec![2]),
+            undelegate_type: UndelegateTypeArgs::Standalone,
+        }),
         ..Default::default()
     };
     let instruction = MagicBlockInstruction::ScheduleIntentBundle(args);

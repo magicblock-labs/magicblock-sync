@@ -202,13 +202,32 @@ impl ChainSync {
             metrics::rescue("superseded");
             return Ok(());
         }
-        let action = delegation::rescue_action(self.engine.authority(), pubkey);
+        let action = delegation::undelegation_action(self.engine.authority(), pubkey);
         let rescue = PostFinalize {
             source_program,
             actions: vec![action],
         };
         accessor.materialize(account, Some(rescue)).await?;
         metrics::rescue("scheduled");
+        Ok(())
+    }
+
+    /// Schedules current local state only for a request at or after its delegation slot.
+    /// The serialized worker and resulting Transient mode suppress repeated observations;
+    /// confirmed undelegation, not scheduling success, permits eventual cleanup.
+    pub(super) async fn undelegation_requested(
+        &self,
+        pubkey: Pubkey,
+        slot: u64,
+    ) -> engine::Result<()> {
+        let accessor = self.engine.account(pubkey).await?;
+        if !matches!(accessor.observed(), Some((AccountMode::Delegated, at)) if slot >= at) {
+            return Ok(());
+        }
+        let action = delegation::undelegation_action(self.engine.authority(), pubkey);
+        // Hold the lease through completion to serialize Sync lifecycle mutations.
+        self.engine.transaction(&[action])?.execute().await??;
+        drop(accessor);
         Ok(())
     }
 

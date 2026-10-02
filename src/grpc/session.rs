@@ -4,9 +4,12 @@ use std::{
 };
 
 use ahash::AHashMap;
-use dlp_api::state::{
-    discriminator::{AccountDiscriminator, AccountWithDiscriminator},
-    DelegationRecord,
+use dlp_api::{
+    pda::undelegation_request_pda_from_delegated_account,
+    state::{
+        discriminator::{AccountDiscriminator, AccountWithDiscriminator},
+        DelegationRecord, UndelegationRequest,
+    },
 };
 use engine::Engine;
 use futures::{SinkExt, StreamExt};
@@ -151,12 +154,11 @@ impl Session {
         sink: &mut SubscribeRequestSink,
     ) -> Result<()> {
         match update.update_oneof {
-            Some(UpdateOneof::Ping(_)) => self.ping(sink).await?,
-            Some(UpdateOneof::Account(account)) => self.account(account).await?,
-            Some(UpdateOneof::Transaction(transaction)) => self.transaction(transaction).await?,
-            _ => {}
+            Some(UpdateOneof::Ping(_)) => self.ping(sink).await,
+            Some(UpdateOneof::Account(account)) => self.account(account).await,
+            Some(UpdateOneof::Transaction(transaction)) => self.transaction(transaction).await,
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Sends the full subscription request, including account and delegation filters.
@@ -295,7 +297,7 @@ impl Session {
         request
     }
 
-    /// Forwards tracked account updates and matches same-slot account/record pairs for delegation.
+    /// Forwards tracked updates, discovers requests, and matches same-slot delegation pairs.
     async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
@@ -321,13 +323,21 @@ impl Session {
             };
             self.send(event).await;
         }
-        if !candidate {
+        if !candidate || account.lamports == 0 {
             return Ok(());
         }
-        if let Some(record) = delegation::record(&account.data) {
-            if let Some(delegation) = self.delegations.record(key, &account, record) {
-                self.delegated(delegation).await;
-            }
+        let request = UndelegationRequest::try_from_bytes_with_discriminator(&account.data)
+            .ok()
+            .map(|request| request.delegated_account)
+            .filter(|pubkey| key == undelegation_request_pda_from_delegated_account(pubkey));
+        if let Some(pubkey) = request {
+            self.engine.accounts().advance_chain_slot(slot);
+            self.send(Event::UndelegationRequested { pubkey, slot }).await;
+        }
+        let delegation = delegation::record(&account.data)
+            .and_then(|record| self.delegations.record(key, &account, record));
+        if let Some(delegation) = delegation {
+            self.delegated(delegation).await;
         }
         // Account data may parse as a record by coincidence. Consider both roles;
         // a match is valid only at the application's derived delegation-record address.

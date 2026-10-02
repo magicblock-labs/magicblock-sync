@@ -94,8 +94,7 @@ pub(crate) async fn check(client: &Client, actions: &[Instruction]) -> Result<Ve
     let mut signers: Vec<_> = actions
         .iter()
         .flat_map(|action| &action.accounts)
-        .filter(|meta| meta.is_signer)
-        .map(|meta| &meta.pubkey)
+        .filter_map(|meta| meta.is_signer.then_some(&meta.pubkey))
         .collect();
     signers.sort_unstable();
     signers.dedup();
