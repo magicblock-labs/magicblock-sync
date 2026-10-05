@@ -1,10 +1,11 @@
 //! Streams confirmed updates for tracked accounts and discovers DLP delegation events.
 //!
 //! Yellowstone reconnects and may replay, but does not guarantee gapless delivery.
-//! Consumers reconcile gaps and deduplicate events before applying lifecycle changes.
 //! Delegation matching requires same-slot updates to the account and its derived
 //! delegation-record PDA. It assumes at most one delegation per account per slot.
 //! Undelegation detection uses static transaction keys, not lookup-table addresses.
+
+use std::time::Duration;
 
 use smallvec::SmallVec;
 use solana_account::AccountBuilder;
@@ -23,6 +24,8 @@ use crate::AccountSubscription;
 /// Configuration, transport, and stream failures.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("gRPC duplication delay must be nonzero")]
+    InvalidDuplicationDelay,
     #[error("gRPC client closed")]
     Closed,
     #[error("gRPC protocol: {0}")]
@@ -43,20 +46,16 @@ pub enum Error {
 
 pub(super) type Result<T> = std::result::Result<T, Error>;
 
-/// Shared delegation authority and Yellowstone account-update streams.
-pub struct Config {
-    /// Authority whose delegation lifecycle every stream observes.
-    pub authority: Pubkey,
-    /// At least one provider stream; accounts use at most one at a time.
-    pub streams: Vec<StreamConfig>,
-}
-
 /// Connection settings for one Yellowstone provider.
 pub struct StreamConfig {
     /// HTTP(S) endpoint without URL-embedded credentials.
     pub endpoint: Url,
     /// Optional provider `x-token`.
     pub token: Option<String>,
+    /// Delay before a WebSocket subscription is eligible for gRPC redundancy.
+    /// Must be nonzero. Eligible accounts enter the filter on the next periodic
+    /// rebuild rather than immediately.
+    pub duplication_delay: Duration,
 }
 
 /// Ordered account and lifecycle events from one provider.
@@ -91,7 +90,6 @@ pub(super) use client::Client;
 pub(super) use client::Command;
 pub(super) use delegation::Delegation;
 
-/// Validates a provider public key at the stream boundary.
 fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
     bytes
         .try_into()
@@ -99,11 +97,10 @@ fn pubkey(bytes: &[u8]) -> Result<Pubkey> {
         .map_err(|_| Error::Protocol("invalid public key"))
 }
 
-/// Shutdown-managed stream commands and client handle.
 mod client;
-/// Same-slot matching of delegated account images and delegation records.
 mod delegation;
-/// Yellowstone sessions, retained filters, and ordered event delivery.
 mod session;
-/// DLP lifecycle decoding from successful transactions and their CPIs.
 mod transaction;
+
+#[cfg(test)]
+mod tests;

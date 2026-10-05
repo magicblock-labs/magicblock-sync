@@ -100,3 +100,6 @@ fn v4_elf(data: &[u8]) -> Result<&[u8]> {
     }
     Ok(&data[offset..])
 }
+
+#[cfg(test)]
+mod test;

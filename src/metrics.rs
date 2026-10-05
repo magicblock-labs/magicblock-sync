@@ -16,7 +16,7 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 #[derive(Clone, Copy)]
 pub(crate) enum Op {
     /// All acquisition waves, dependencies, leases, and materialization.
-    Sync,
+    ChainSync,
     /// A complete snapshot fetch, including retries and cooldown waits.
     HttpFetch,
     /// Applying an update from an active subscription, including time waiting for its Engine lease.
@@ -32,7 +32,7 @@ pub(crate) enum Op {
 impl MetricOperation for Op {
     fn label(self) -> &'static str {
         match self {
-            Self::Sync => "sync",
+            Self::ChainSync => "chainsync",
             Self::HttpFetch => "http_fetch",
             Self::Apply => "apply",
             Self::Delegate => "delegate",
@@ -80,32 +80,41 @@ struct Metrics {
 pub(crate) fn init() {
     METRICS.get_or_init(|| Metrics {
         durations: OperationCounters::new(spec(
-            "sync_duration_micros",
+            "chainsync_duration_micros",
             "ChainSync operation duration in microseconds",
         )),
         coverage: gauge_vec(
-            spec("sync_coverage", "Logical subscriptions by coverage"),
+            spec("chainsync_coverage", "Logical subscriptions by coverage"),
             &["coverage"],
         ),
         losses: counter_vec(
-            spec("sync_coverage_losses", "Unexpected final-source losses"),
+            spec(
+                "chainsync_coverage_losses",
+                "Unexpected final-source losses",
+            ),
             &["source"],
         ),
         activation_failures: counter(
-            spec("sync_activation_failures", "Entries into activation rescue"),
+            spec(
+                "chainsync_activation_failures",
+                "Entries into activation rescue",
+            ),
             0,
         ),
         rescues: counter_vec(
-            spec("sync_rescues", "Rescue decisions and scheduling results"),
+            spec(
+                "chainsync_rescues",
+                "Rescue decisions and scheduling results",
+            ),
             &["outcome"],
         ),
         http: counter_vec(
-            spec("sync_http_attempts", "HTTP attempt results"),
+            spec("chainsync_http_attempts", "HTTP attempt results"),
             &["outcome"],
         ),
         transport: counter_vec(
             spec(
-                "sync_transport_failures",
+                "chainsync_transport_failures",
                 "WS attempt and gRPC outer-session failures",
             ),
             &["transport"],

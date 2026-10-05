@@ -38,44 +38,43 @@ use super::{
     client::Command, delegation::Delegations, transaction, Error, Event, Result, StreamConfig,
 };
 use crate::metrics::{self, Transport};
-use crate::{delegation, AccountSubscription, DUPLICATION_DELAY};
+use crate::{delegation, AccountSubscription};
 
 /// Account subscriptions and delegation matching for one Yellowstone provider stream.
 pub(super) struct Session {
-    /// Stable index in the configured provider list.
     id: usize,
     config: StreamConfig,
-    authority: Pubkey,
+    pub(super) authority: Pubkey,
     /// Account filter sent to Yellowstone; may retain removed keys until the next rebuild.
-    retained_filter: CompressedAccountFilterSet,
+    pub(super) retained_filter: CompressedAccountFilterSet,
     /// Accounts to track, including WebSocket subscriptions still waiting for their gRPC copy.
-    desired: AHashMap<Pubkey, TrackedAccount>,
+    pub(super) desired: AHashMap<Pubkey, TrackedAccount>,
     /// Stores the confirmed chain slot used to seed replay and constrain HTTP snapshots.
     engine: Engine,
     events: mpsc::Sender<Event>,
-    /// Matches DLP-owned account updates to delegation records observed in the same slot.
     delegations: Delegations,
 }
 
 /// WebSocket-acknowledged subscription waiting for or already included in the gRPC filter.
-struct TrackedAccount {
-    /// Remote account address and the local account its updates belong to.
-    sub: AccountSubscription,
+pub(super) struct TrackedAccount {
+    pub(super) sub: AccountSubscription,
     /// Generation assigned by the coverage registry to reject stale confirmations.
-    gen: u64,
+    pub(super) gen: u64,
     /// Time the track command arrived, which starts the duplication delay.
-    tracked_at: Instant,
+    pub(super) tracked_at: Instant,
 }
 
 impl Session {
-    /// Creates a session whose account filter survives Yellowstone reconnects.
     pub(super) fn new(
         id: usize,
         config: StreamConfig,
-        authority: Pubkey,
         engine: Engine,
         events: mpsc::Sender<Event>,
     ) -> Result<Self> {
+        if config.duplication_delay.is_zero() {
+            return Err(Error::InvalidDuplicationDelay);
+        }
+        let authority = engine.authority();
         Ok(Self {
             id,
             retained_filter: CompressedAccountFilterSet::with_capacity(u16::MAX as usize * 8)?,
@@ -108,7 +107,6 @@ impl Session {
         }
     }
 
-    /// Lets Yellowstone reconnect while processing filter changes and updates.
     async fn subscribe(&mut self, commands: &mut UnboundedReceiver<Command>) -> Result<()> {
         let mut builder = GeyserGrpcClient::build_from_shared(self.config.endpoint.to_string())?
             .x_token(self.config.token.clone())?
@@ -121,10 +119,9 @@ impl Session {
         }
         let mut client = builder.connect().await?;
         self.sync_filter()?;
-        let mut request = self.request();
         // Set the replay start only when opening a stream; Yellowstone handles replay
         // on its internal reconnects, and filter refreshes must not restart it.
-        request.from_slot = Some(self.engine.accounts().chain_slot().saturating_sub(2));
+        let request = self.request(Some(self.engine.accounts().chain_slot().saturating_sub(2)));
         let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
         // Report only tracked accounts included in the initial filter, not those still waiting.
         for (&pubkey, entry) in &self.desired {
@@ -132,11 +129,20 @@ impl Session {
                 self.confirm([(pubkey, entry.gen)]).await;
             }
         }
+        let mut tick = time::interval(self.config.duplication_delay);
+        tick.tick().await;
         loop {
             tokio::select! {
                 command = commands.recv() => {
                     let Some(command) = command else { return Ok(()) };
-                    self.command(command, &mut sink).await?;
+                    self.command(command).await;
+                }
+                _ = tick.tick() => {
+                    if let Some(added) = self.sync_filter()? {
+                        // Confirm coverage only after sending the filter to Yellowstone.
+                        self.refresh(&mut sink).await?;
+                        self.confirm(added).await;
+                    }
                 }
                 update = stream.next() => {
                     let update = update.ok_or(Error::Closed)?;
@@ -146,8 +152,6 @@ impl Session {
         }
     }
 
-    /// Handles ping, account, and transaction updates; other provider messages
-    /// do not change retained-account interest or delegation state.
     async fn process(
         &mut self,
         update: SubscribeUpdate,
@@ -161,9 +165,8 @@ impl Session {
         }
     }
 
-    /// Sends the full subscription request, including Clock, account, and delegation filters.
-    async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
-        sink.send(self.request()).await.map_err(Into::into)
+    pub(super) async fn refresh(&mut self, sink: &mut SubscribeRequestSink) -> Result<()> {
+        sink.send(self.request(None)).await.map_err(Into::into)
     }
 
     /// Answers a server ping, then resends the full subscription request.
@@ -176,7 +179,6 @@ impl Session {
         self.refresh(sink).await
     }
 
-    /// Reports accounts undelegated by successful transactions.
     async fn transaction(&mut self, update: SubscribeUpdateTransaction) -> Result<()> {
         self.delegations.set_slot(update.slot);
         let transaction = update.transaction.ok_or(Error::Protocol("missing transaction"))?;
@@ -189,7 +191,7 @@ impl Session {
     }
 
     /// Updates tracked accounts; only a rebuild sends a changed filter to Yellowstone.
-    async fn command(&mut self, command: Command, sink: &mut SubscribeRequestSink) -> Result<()> {
+    async fn command(&mut self, command: Command) {
         match command {
             Command::Track { sub, gen } => {
                 let entry = TrackedAccount {
@@ -205,22 +207,12 @@ impl Session {
             Command::Remove(pubkey) => {
                 self.desired.remove(&pubkey);
             }
-            Command::Rebuild => {
-                let added = self.sync_filter()?;
-                if let Some(added) = added {
-                    // Notify the worker only after sending the filter; Yellowstone
-                    // does not acknowledge individual account subscriptions.
-                    self.refresh(sink).await?;
-                    self.confirm(added).await;
-                }
-            }
         }
-        Ok(())
     }
 
     /// Removes untracked keys and adds accounts whose duplication delay has elapsed.
     /// Returns newly added keys if the filter changed, or `None` if it did not.
-    fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>> {
+    pub(super) fn sync_filter(&mut self) -> Result<Option<Vec<(Pubkey, u64)>>> {
         let remove: Vec<_> = self
             .retained_filter
             .iter()
@@ -233,7 +225,7 @@ impl Session {
         let mut added = Vec::new();
         for (&pubkey, entry) in &self.desired {
             if !self.retained_filter.contains(pubkey)
-                && entry.tracked_at.elapsed() >= DUPLICATION_DELAY
+                && entry.tracked_at.elapsed() >= self.config.duplication_delay
             {
                 self.retained_filter.insert(pubkey)?;
                 added.push((pubkey, entry.gen));
@@ -251,9 +243,10 @@ impl Session {
 
     /// Builds a request for Clock, tracked accounts, DLP-owned accounts, accepted delegation
     /// records, and successful DLP transactions used to detect undelegation.
-    fn request(&mut self) -> SubscribeRequest {
+    pub(super) fn request(&mut self, from_slot: Option<u64>) -> SubscribeRequest {
         let mut request = SubscribeRequest {
             commitment: Some(CommitmentLevel::Confirmed as i32),
+            from_slot,
             ..Default::default()
         };
         // Keep mandatory Clock coverage independent of retained-account rebuilds.
@@ -297,8 +290,7 @@ impl Session {
         request
     }
 
-    /// Advances the Clock watermark, forwards tracked updates, and discovers DLP lifecycle events.
-    async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
+    pub(super) async fn account(&mut self, update: SubscribeUpdateAccount) -> Result<()> {
         let slot = update.slot;
         self.delegations.set_slot(slot);
         let mut account = update.account.ok_or(Error::Protocol("missing account image"))?;
@@ -349,6 +341,7 @@ impl Session {
         Ok(())
     }
 
+    /// Worker shutdown drops delivery; the session is stopped by the same coordinated shutdown.
     async fn send(&self, event: Event) {
         let _ = self.events.send(event).await;
     }
@@ -356,14 +349,13 @@ impl Session {
 
 const RETAINED_FILTER: &str = "retained";
 const CLOCK_FILTER: &str = "clock";
-const CANDIDATES_FILTER: &str = "candidates";
-const RECORDS_FILTER: &str = "records";
-const CONFINED_FILTER: &str = "confined";
+pub(super) const CANDIDATES_FILTER: &str = "candidates";
+pub(super) const RECORDS_FILTER: &str = "records";
+pub(super) const CONFINED_FILTER: &str = "confined";
 const RELEASES_FILTER: &str = "releases";
 const PING_ID: i32 = 1;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
-/// Builds a byte-level field comparison for an account filter.
 fn memcmp(offset: u64, bytes: Vec<u8>) -> SubscribeRequestFilterAccountsFilter {
     let memcmp = SubscribeRequestFilterAccountsFilterMemcmp {
         offset,

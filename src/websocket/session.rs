@@ -284,10 +284,11 @@ impl Session {
             return Err(Error::Protocol("invalid notification method"));
         }
         let notification = message.params.ok_or(Error::Protocol("missing notification params"))?;
-        let sub = *self
-            .active
-            .get(&notification.subscription)
-            .ok_or(Error::Protocol("unknown remote subscription"))?;
+        // Logical removal can precede delivery of notifications buffered by the provider.
+        // An inactive ID has no authorized local target; ignore it without dropping other coverage.
+        let Some(&sub) = self.active.get(&notification.subscription) else {
+            return Ok(());
+        };
         let account: ContextValue<Option<WireAccount<'_>>> =
             json::from_str(notification.result.as_raw_str())?;
         let slot = account.context.slot;

@@ -1,6 +1,4 @@
-/// Tracks active WebSocket and gRPC subscriptions and rejects updates after removal.
 mod coverage;
-/// Delegation activation, rescue, and undelegation lifecycle.
 mod lifecycle;
 
 use std::{
@@ -12,10 +10,7 @@ use std::{
 use nucleus::shutdown::{ShutdownHandle, ShutdownReason};
 use solana_account::{AccountBuilder, StateFlags};
 use solana_pubkey::Pubkey;
-use tokio::{
-    sync::mpsc::{Receiver, UnboundedReceiver},
-    time,
-};
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tracing::error;
 
 use self::coverage::{Coverage, Source};
@@ -23,7 +18,7 @@ use crate::{
     ata,
     grpc::{self, Command},
     metrics::{self, Op},
-    program, websocket, AccountSubscription, ChainSync, Result, DUPLICATION_DELAY,
+    program, websocket, AccountSubscription, ChainSync, Result,
 };
 
 impl ChainSync {
@@ -34,7 +29,6 @@ impl ChainSync {
         &self.grpc[hash.finish() as usize % self.grpc.len()]
     }
 
-    /// Serializes source events, account application, and Engine eviction.
     pub(super) async fn run(
         self: Arc<Self>,
         websocket: Receiver<websocket::Event>,
@@ -60,7 +54,7 @@ impl ChainSync {
         shutdown.terminate(reason);
     }
 
-    /// Owns coverage and serializes transport updates, evictions, and filter rebuilds.
+    /// Owns coverage and serializes transport updates and evictions.
     /// Ends when Engine's eviction channel closes or an event handler fails.
     async fn run_updates(
         &self,
@@ -69,8 +63,6 @@ impl ChainSync {
         mut evictions: UnboundedReceiver<Pubkey>,
     ) -> Result<()> {
         let mut coverage = Coverage::default();
-        let mut tick = time::interval(DUPLICATION_DELAY);
-        tick.tick().await;
         // Process coverage changes and updates in one loop so removal takes effect
         // before later buffered updates are checked and applied.
         loop {
@@ -86,13 +78,19 @@ impl ChainSync {
                     let Some(pubkey) = pubkey else { return Ok(()) };
                     self.evict_cached(pubkey, &mut coverage).await?;
                 }
-                _ = tick.tick() => {
-                    for client in &self.grpc {
-                        client.command(Command::Rebuild);
-                    }
-                }
             }
         }
+    }
+
+    /// Revokes local coverage and queues removal from all transports without waiting for providers.
+    async fn unsubscribe_account(&self, pubkey: Pubkey, coverage: &mut Coverage) -> Result<()> {
+        for sub in AccountSubscription::for_account(pubkey) {
+            if coverage.remove(sub) {
+                self.grpc_client(sub.pubkey).command(Command::Remove(sub.pubkey));
+            }
+        }
+        self.websocket.unsubscribe_account(pubkey).await?;
+        Ok(())
     }
 
     /// Deletes a cached mirror only if it is still eligible after acquiring its Engine lease.
@@ -100,19 +98,13 @@ impl ChainSync {
         let Some(accessor) = self.engine.account(pubkey).await?.into_cached_eviction() else {
             return Ok(());
         };
-        for sub in AccountSubscription::for_account(pubkey) {
-            if coverage.remove(sub) {
-                self.grpc_client(sub.pubkey).command(Command::Remove(sub.pubkey));
-            }
-        }
         // Hold the Engine lease until unsubscribe is queued, so reacquisition cannot
         // queue a new subscription before the old one is removed.
-        self.websocket.unsubscribe_account(pubkey).await?;
+        self.unsubscribe_account(pubkey, coverage).await?;
         accessor.delete().await?;
         Ok(())
     }
 
-    /// Applies WebSocket coverage changes and filters buffered account updates.
     async fn on_websocket(&self, event: websocket::Event, coverage: &mut Coverage) -> Result<()> {
         match event {
             websocket::Event::Acknowledged(sub) => {
@@ -120,11 +112,10 @@ impl ChainSync {
                 self.grpc_client(sub.pubkey).command(Command::Track { sub, gen });
             }
             websocket::Event::Removed(pubkey) => {
-                let local_pubkey = coverage.removed(pubkey);
+                // Explicit release only revokes coverage. Its caller owns local state;
+                // delayed cleanup must not delete a snapshot installed by reacquisition.
+                coverage.removed(pubkey);
                 self.grpc_client(pubkey).command(Command::Remove(pubkey));
-                if let Some(local_pubkey) = local_pubkey {
-                    self.evict(local_pubkey).await?;
-                }
             }
             websocket::Event::Update { sub, account } => {
                 if coverage.ws_contains(sub) {
@@ -162,7 +153,6 @@ impl ChainSync {
         Ok(())
     }
 
-    /// Applies per-stream coverage, account, and delegation lifecycle events.
     async fn on_grpc(&self, event: grpc::Event, coverage: &mut Coverage) -> Result<()> {
         match event {
             grpc::Event::Confirmed { stream, pubkey, gen } => {
@@ -183,7 +173,7 @@ impl ChainSync {
             }
             grpc::Event::Delegated(delegation) => {
                 let pubkey = delegation.pubkey;
-                if let Err(error) = self.delegated(delegation).await {
+                if let Err(error) = self.delegated(delegation, coverage).await {
                     error!(%pubkey, %error, "delegation failed");
                 }
             }
@@ -227,3 +217,6 @@ impl ChainSync {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

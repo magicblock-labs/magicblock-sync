@@ -10,15 +10,12 @@ use crate::AccountSubscription;
 pub(crate) enum Command {
     /// Tracks a WebSocket subscription; new gRPC filter entries wait for the duplication delay.
     Track {
-        /// Remote account address and the local account its updates belong to.
         sub: AccountSubscription,
         /// Generation assigned by the coverage registry to reject stale confirmations.
         gen: u64,
     },
     /// Stops forwarding this account's updates when processed; filter removal waits for a rebuild.
     Remove(Pubkey),
-    /// Updates the filter for removed accounts and accounts whose duplication delay has elapsed.
-    Rebuild,
 }
 
 /// Control handle for one shutdown-managed Yellowstone stream.
@@ -28,18 +25,16 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    /// Starts a provider stream that reports events and advances Engine's confirmed chain slot.
     pub(crate) fn new(
         id: usize,
         config: StreamConfig,
-        authority: Pubkey,
         engine: Engine,
         events: mpsc::Sender<Event>,
         manager: &mut ShutdownManager,
     ) -> Result<Self> {
         let (commands, requests) = mpsc::unbounded_channel();
         let hostname = config.endpoint.host_str().map(Box::from);
-        let session = Session::new(id, config, authority, engine, events)?;
+        let session = Session::new(id, config, engine, events)?;
         let mut shutdown = manager.handle(Service::ChainSyncGrpc(id));
         tokio::spawn(async move {
             let reason = tokio::select! {
@@ -54,7 +49,6 @@ impl Client {
         Ok(Self { commands, hostname })
     }
 
-    /// Provider hostname for diagnostics, without formatting or allocation.
     pub(crate) fn hostname(&self) -> Option<&str> {
         self.hostname.as_deref()
     }

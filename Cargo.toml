@@ -1,9 +1,9 @@
 [package]
-name = "magicblock-sync"
+name = "magicblock-chainsync"
 
 description = "Base-layer account synchronization for MagicBlock"
 edition = "2021"
-readme = false
+readme = "README.md"
 version = "0.1.0"
 
 [dependencies]
@@ -21,7 +21,7 @@ json = { version = "0.5.8", package = "sonic-rs" }
 engine = { package = "magicblock-engine", path = "../engine/engine" }
 nucleus = { package = "magicblock-engine-nucleus", path = "../engine/nucleus" }
 magicblock-delegation-program-api = { git = "https://github.com/magicblock-labs/delegation-program.git", rev = "fb6668c7b5ffd6a89bedee1d13b16402fd0e65de", default-features = false, features = ["encryption", "instruction"] }
-magicblock-magic-program-api = { path = "../mbv/magic-program-api" }
+magicblock-magic-program-api = { path = "../mbv/programs/magic-interface" }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
@@ -48,9 +48,29 @@ yellowstone-grpc-client = "13.5.1"
 yellowstone-grpc-proto = "12.7.0"
 zstd = "0.13"
 
+[dev-dependencies]
+hyper = { version = "1", features = ["server"] }
+serde_json = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = "0.28"
+engine = { package = "magicblock-engine", path = "../engine/engine", features = ["testkit"] }
+keeper = { package = "magicblock-keeper", path = "../engine/keeper", features = ["testkit"] }
+magicblock-program = { path = "../mbv/programs/magic-program" }
+solana-keypair = "3"
+solana-program-runtime = { path = "../engine/solana/program-runtime" }
+nucleus = { package = "magicblock-engine-nucleus", path = "../engine/nucleus", features = ["testkit"] }
+solana-account = { path = "../engine/solana/account", features = ["testkit"] }
+tokio = { version = "1", features = ["test-util"] }
+yellowstone-grpc-geyser = { git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "5e76c224f693ddb71ee442aa55372a9c4a5f9cee" }
+yellowstone-plugin-proto = { package = "yellowstone-grpc-proto", git = "https://github.com/rpcpool/yellowstone-grpc.git", rev = "5e76c224f693ddb71ee442aa55372a9c4a5f9cee", features = ["account-data-as-bytes"] }
+v42-calculator-interface = { path = "../engine/programs/v42-calculator-interface", features = ["builder"] }
+
 [patch.crates-io]
 agave-transaction-view = { path = "../engine/solana/transaction-view" }
 solana-account = { path = "../engine/solana/account" }
 solana-program-runtime = { path = "../engine/solana/program-runtime" }
 solana-svm = { path = "../engine/solana/svm" }
 solana-transaction-context = { path = "../engine/solana/transaction-context" }
+
+[patch."https://github.com/magicblock-labs/magicblock-engine.git"]
+magicblock-engine-nucleus = { path = "../engine/nucleus" }

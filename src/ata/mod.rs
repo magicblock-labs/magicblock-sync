@@ -19,6 +19,7 @@ struct Eata {
     amount: u64,
 }
 
+/// Identifies restored eATA ownership; raw DLP-owned images require address/layout validation instead.
 pub(crate) fn is_eata(account: &AccountBuilder) -> bool {
     account.read().owner() == EATA_PROGRAM_ID
 }
@@ -150,3 +151,6 @@ fn eata_data(pubkey: Pubkey, account: &AccountBuilder) -> Option<Eata> {
 fn derive_eata(owner: Pubkey, mint: Pubkey) -> Option<(Pubkey, u8)> {
     Pubkey::try_find_program_address(&[owner.as_ref(), mint.as_ref()], &EATA_PROGRAM_ID)
 }
+
+#[cfg(test)]
+mod test;

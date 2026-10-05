@@ -5,8 +5,6 @@ use crate::rpc::{DecodeError, Error as RpcError};
 /// HTTP snapshot failures, retaining provider context and the latest retry cause.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("fetch requires at least one HTTP provider")]
-    NoProviders,
     /// Failure from a configured provider, identified by its input index.
     #[error("HTTP provider {provider}: {source}")]
     Provider {
@@ -107,3 +105,6 @@ impl Outcome {
 
 /// Snapshot requests, provider failover, and shared endpoint cooldowns.
 mod fetcher;
+
+#[cfg(test)]
+mod tests;

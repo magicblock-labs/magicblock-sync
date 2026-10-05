@@ -1,41 +1,18 @@
-//! Synchronizes base-chain accounts into Engine.
-//!
-//! [`ChainSync`] subscribes before fetching missing read-only accounts and payers.
-//! Writable accounts are fetched with their delegation records but not subscribed over
-//! WebSocket. Acknowledged WebSocket subscriptions gain one load-balanced gRPC copy
-//! after 30 minutes of gRPC tracking. An account can remain covered by gRPC alone
-//! if its WebSocket subscription is lost.
-//! Ordinary accounts enter Engine in `Uninit` mode; executable programs enter as
-//! read-only ELF accounts. A background worker applies WebSocket and gRPC events.
-//! A later base-chain update can recreate an undelegated account.
-//! Engine's persisted chain slot tracks confirmed gRPC observations, not
-//! completed materializations. New gRPC sessions replay from two slots behind it;
-//! Yellowstone owns recovery within a session.
+#![doc = include_str!("../README.md")]
 
-/// Missing-account fetch planning and initial materialization.
 mod acquisition;
-/// Post-delegation signer assessment, independent of activation authority.
 mod aml;
-/// Canonical ATA detection and eATA-backed account projection.
 mod ata;
-/// Delegation record parsing and account conversion.
 mod delegation;
-/// Yellowstone subscriptions and lifecycle events.
 mod grpc;
-/// Confirmed HTTP account snapshots.
 mod http;
-/// Private process-wide operation and transport instrumentation.
 mod metrics;
-/// Executable and ProgramData normalization.
 mod program;
-/// Shared RPC wire types and account decoding.
 mod rpc;
-/// Confirmed WebSocket subscription pool.
 mod websocket;
-/// Applies transport updates and adds delayed gRPC subscriptions.
 mod worker;
 
-use std::{borrow::Borrow, sync::Arc, time::Duration};
+use std::{borrow::Borrow, sync::Arc};
 
 use engine::{Engine, EngineError};
 use nucleus::shutdown::{Service, ShutdownManager};
@@ -47,11 +24,8 @@ use url::Url;
 use crate::http::Fetcher;
 use crate::websocket::Pool;
 
-/// Delay before adding a WebSocket subscription to gRPC; also the filter rebuild interval.
-const DUPLICATION_DELAY: Duration = Duration::from_secs(30 * 60);
-
 pub use aml::{Config as AmlConfig, Error as AmlError};
-pub use grpc::{Config as GrpcConfig, Error as GrpcError, StreamConfig as GrpcStreamConfig};
+pub use grpc::{Error as GrpcError, StreamConfig as GrpcStreamConfig};
 pub use http::Error as HttpError;
 pub use rpc::{DecodeError, Error as RpcError};
 pub use websocket::{
@@ -62,47 +36,43 @@ pub use websocket::{
 pub struct ChainSyncConfig {
     /// Checks each distinct post-delegation action signer; `None` disables assessment.
     pub aml: Option<AmlConfig>,
-    /// HTTP snapshot providers.
+    /// HTTP snapshot providers on the same base chain; must be nonempty.
     pub http: Vec<Url>,
     /// WebSocket subscription providers.
     pub websocket: WebSocketConfig,
-    /// Yellowstone update streams and their shared delegation authority.
-    pub grpc: GrpcConfig,
+    /// Yellowstone-compatible streams for delegation events and subscription redundancy.
+    /// Must contain at least one stream.
+    pub grpc: Vec<GrpcStreamConfig>,
 }
 
-/// Selects subscription and companion-fetch behavior in [`ChainSync::sync`].
+/// Transaction role that determines acquisition and live updates in [`ChainSync::sync`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountProperty {
-    /// Fee payer; subscribed over WebSocket during the initial fetch.
+    /// Fee payer; checked for delegation and subscribed unless delegated to this Engine.
     Payer,
     /// Writable transaction account; fetched without a WebSocket subscription.
     Writable,
-    /// Read-only transaction account.
+    /// Read-only transaction account; subscribed unless resolved as delegated to this Engine.
     Readonly,
-    /// Executable program; fetches and subscribes to its derived ProgramData address too.
-    /// After fetching, keeps only ProgramData for Loader V3 or the program for other loaders.
+    /// Executable program; tracks Loader V3 upgrades through ProgramData,
+    /// and other supported loaders through the program account itself.
     Program,
 }
 
-/// One primary account requested for synchronization. ProgramData and delegation
-/// record companions are derived from its property.
+/// An account to acquire, with any companion state required by its transaction role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SyncAccount {
-    /// Primary account address to fetch and materialize.
+pub struct ChainSyncAccount {
+    /// Address under which the account is made available in Engine.
     pub pubkey: Pubkey,
-    /// Role used to select subscription and companion-fetch behavior.
+    /// Role in the transaction that needs this account.
     pub property: AccountProperty,
 }
 
 /// Acquires missing base-chain accounts for Engine and applies live provider updates.
 pub struct ChainSync {
-    /// Assesses action signers without granting delegation or mutation authority.
     aml: Option<aml::Client>,
-    /// Owns account leases and materialization into local state.
     engine: Engine,
-    /// Supplies confirmed snapshots for missing accounts.
     fetcher: Fetcher,
-    /// Subscribes to accounts before their HTTP snapshots are fetched.
     websocket: Pool,
     /// Keeps all gRPC streams alive for the synchronizer's lifetime.
     grpc: Vec<grpc::Client>,
@@ -117,8 +87,6 @@ pub enum Error {
     Subscribe(#[from] WebSocketError),
     #[error("gRPC operation failed: {0}")]
     Grpc(#[from] GrpcError),
-    #[error("at least one gRPC stream is required")]
-    NoGrpcStreams,
     #[error("Engine account operation failed: {0}")]
     Engine(#[from] EngineError),
     #[error("invalid program: {0}")]
@@ -139,76 +107,66 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl ChainSync {
-    /// Sets up HTTP, WebSocket, and gRPC providers and starts applying updates.
-    /// Takes Engine's sole cache-eviction receiver to remove cached mirrors and their subscriptions.
-    /// The worker and transports join Engine's coordinated shutdown.
+    /// Starts account synchronization services under the supplied shutdown manager.
+    ///
+    /// Only one synchronizer may own an Engine's cache-eviction receiver; construction
+    /// fails if it is already taken. Provider connections start in the background,
+    /// so success does not mean they are ready for [`Self::sync`].
+    /// See [`ChainSyncConfig`] for provider requirements.
     pub fn new(
         engine: Engine,
         config: ChainSyncConfig,
         shutdown: &mut ShutdownManager,
     ) -> Result<Arc<Self>> {
         metrics::init();
-        if config.grpc.streams.is_empty() {
-            return Err(Error::NoGrpcStreams);
-        }
         let aml = config.aml.map(aml::Client::new).transpose()?;
         let (websocket, websocket_rx) = Pool::new(config.websocket, shutdown);
         let fetcher = Fetcher::new(config.http, engine.clone())?;
         let (events, grpc_rx) = mpsc::channel(8192);
-        let authority = config.grpc.authority;
-        let mut grpc = Vec::with_capacity(config.grpc.streams.len());
-        for (id, stream) in config.grpc.streams.into_iter().enumerate() {
-            let client = grpc::Client::new(
-                id,
-                stream,
-                authority,
-                engine.clone(),
-                events.clone(),
-                shutdown,
-            )?;
+        let mut grpc = Vec::with_capacity(config.grpc.len());
+        for (id, stream) in config.grpc.into_iter().enumerate() {
+            let client = grpc::Client::new(id, stream, engine.clone(), events.clone(), shutdown)?;
             grpc.push(client);
         }
-        let sync = Arc::new(Self {
+        let chain_sync = Arc::new(Self {
             aml,
             engine,
             fetcher,
             websocket,
             grpc,
         });
-        let evictions = sync.engine.accounts().subscribe_evictions().map_err(EngineError::from)?;
+        let evictions =
+            chain_sync.engine.accounts().subscribe_evictions().map_err(EngineError::from)?;
         let shutdown = shutdown.handle(Service::ChainSyncWorker);
         tokio::spawn(Self::run(
-            Arc::clone(&sync),
+            Arc::clone(&chain_sync),
             websocket_rx,
             grpc_rx,
             evictions,
             shutdown,
         ));
-        Ok(sync)
+        Ok(chain_sync)
     }
 
     /// Fetches and materializes requested accounts that are missing from Engine.
     ///
-    /// Read-only accounts, programs, and payers are subscribed over WebSocket
-    /// before fetching. Writable accounts are fetched without WebSocket subscriptions.
-    /// Programs include ProgramData; writable accounts and payers include their
-    /// derived delegation record. Delegation records are fetched but not subscribed.
-    /// After fetching, Loader V3 keeps the ProgramData subscription; other loaders
-    /// keep the program subscription. A payer's WebSocket subscription is removed
-    /// when its initial snapshot resolves as delegated here.
-    /// Read-only DLP-owned accounts and executable Loader V3 programs are refetched
-    /// with their derived companions before materialization; a read-only subscription
-    /// is also removed when its account resolves as delegated here.
-    /// Canonical token ATAs are resolved with their eATA and delegation record in
-    /// a second HTTP fetch after the ATA layout reveals its owner and mint. A local
-    /// eATA delegation projects onto the ATA; raw eATAs are not materialized.
-    /// Acknowledged WebSocket subscriptions gain one gRPC copy after 30 minutes of tracking.
-    /// A gRPC-only subscription remains covered without a WebSocket copy.
+    /// Resident accounts are left unchanged and gain no new subscriptions.
+    /// [`AccountProperty`] determines which missing accounts receive live updates;
+    /// subscriptions precede the initial snapshot. Required ProgramData, delegation
+    /// records, and post-delegation action dependencies are acquired automatically.
     ///
-    /// An account is resolved as delegated only when its primary and delegation-record
-    /// snapshots are DLP-owned and the record names this Engine's authority.
-    /// Records with the default authority instead produce confined `Magic` accounts.
-    /// Other snapshots retain their fetched owner and mode. HTTP `null` becomes a default account.
+    /// Delegation requires DLP-owned account and record snapshots with an accepted
+    /// authority. This Engine's authority produces a delegated account; the default
+    /// authority produces a confined `Magic` account. Ordinary snapshots enter in
+    /// `Uninit` mode, executable images in `ReadOnly` mode, and HTTP `null` becomes
+    /// a default account at the snapshot slot. Canonical token ATAs may project a
+    /// locally delegated eATA balance; raw eATAs are not materialized.
+    ///
+    /// Success includes dependency acquisition and post-delegation action handling,
+    /// but does not imply completion of any scheduled on-chain rescue. Batches can
+    /// observe different slots, and errors do not roll back earlier materializations.
+    ///
+    /// # Input requirements
     ///
     /// Writable and program pubkeys must be unique; repeated payer and read-only
     /// requests are collapsed. Requested accounts must not overlap a program's
@@ -216,7 +174,7 @@ impl ChainSync {
     pub async fn sync<I>(&self, requests: I) -> Result<()>
     where
         I: IntoIterator,
-        I::Item: Borrow<SyncAccount>,
+        I::Item: Borrow<ChainSyncAccount>,
     {
         let accounts = requests.into_iter().map(|account| *account.borrow()).collect();
         self.sync_waves(accounts).await
@@ -229,19 +187,16 @@ impl ChainSync {
 /// watch ProgramData but materialize its normalized ELF at the local program address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AccountSubscription {
-    /// Remote account address requested from the provider.
     pubkey: Pubkey,
     /// Program address to materialize ProgramData ELF under; `None` updates `pubkey` itself.
     program: Option<Pubkey>,
 }
 
 impl AccountSubscription {
-    /// Local address where this subscription's updates are materialized.
     fn local_pubkey(self) -> Pubkey {
         self.program.unwrap_or(self.pubkey)
     }
 
-    /// Returns a ProgramData subscription whose updates belong to the local program address.
     fn program_data(pubkey: Pubkey) -> Self {
         Self {
             pubkey: get_program_data_address(&pubkey),
@@ -255,3 +210,10 @@ impl AccountSubscription {
         [Self { pubkey, program: None }, Self::program_data(pubkey)]
     }
 }
+
+#[cfg(test)]
+extern crate self as magicblock_chainsync;
+
+#[cfg(test)]
+#[path = "../tests/transport/mod.rs"]
+mod transport;

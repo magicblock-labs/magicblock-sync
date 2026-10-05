@@ -31,13 +31,11 @@ pub struct Snapshot {
 /// Fetches confirmed account batches, retrying transient failures across providers on the same chain.
 /// Callers split requests into batches of at most 100 keys and arrange subscriptions.
 pub struct Fetcher {
-    /// Reusable HTTP connections without implicit redirects or retries.
     client: Client,
     /// Stable endpoint order used for error reporting.
     providers: Vec<Provider>,
     /// Supplies the confirmed chain slot used as the minimum for each HTTP fetch.
     engine: Engine,
-    /// Rotating first candidate for provider selection.
     cursor: AtomicUsize,
     /// Monotonic origin for cooldown timestamps.
     epoch: Instant,
@@ -51,11 +49,7 @@ struct Provider {
 }
 
 impl Fetcher {
-    /// Rejects an empty provider list and shares provider cooldowns across fetches.
     pub fn new(providers: Vec<Url>, engine: Engine) -> Result<Self> {
-        if providers.is_empty() {
-            return Err(Error::NoProviders);
-        }
         let client = Client::builder().redirect(Policy::none()).retry(retry::never()).build()?;
         let providers = providers
             .into_iter()
@@ -75,7 +69,7 @@ impl Fetcher {
     /// This minimum stays fixed across retries; HTTP responses do not advance Engine's chain slot.
     ///
     /// Transient failures retry within a ten-second budget. Malformed responses
-    /// fail immediately. Cancelling stops HTTP I/O, but not synchronous decoding.
+    /// fail immediately.
     pub async fn fetch(&self, keys: &[Pubkey], min_slot: Option<u64>) -> Result<Snapshot> {
         let _timer = metrics::time(Op::HttpFetch);
         // Keep the same minimum slot when changing providers, so a retry cannot

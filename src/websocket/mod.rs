@@ -1,10 +1,9 @@
 //! Streams confirmed account updates through per-provider WebSocket pools.
 //!
-//! Drain the event receiver while awaiting pool operations. Acknowledgement
-//! confirms a subscription, not an initial snapshot. On connection loss,
-//! subscription requests may be retried. Each attempt uses ready capacity
-//! or fails without queuing behind a reconnect.
-//!
+//! Pool callers must drain events while awaiting operations to avoid blocking
+//! acknowledgement delivery. Acknowledgement confirms a subscription, not an
+//! initial snapshot. Requests fail when no socket is ready rather than waiting
+//! for a reconnect; lost subscriptions are not automatically restored.
 
 use crate::{
     rpc::{DecodeError, Error as RpcError},
@@ -71,7 +70,7 @@ pub struct Provider {
 /// Provider settings for confirmed subscriptions; an empty list has no capacity.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
-    /// Provider order determines connection identities.
+    /// Endpoints and their individual capacity limits.
     pub providers: Vec<Provider>,
 }
 
@@ -90,7 +89,8 @@ pub(super) struct ConnectionId {
 pub(super) enum Event {
     /// Server acknowledged a requested account subscription.
     Acknowledged(AccountSubscription),
-    /// The last subscription reference was released, before unsubscribe acknowledgement.
+    /// Explicit release of the last reference, before unsubscribe acknowledgement.
+    /// Revokes buffered-update coverage; the caller owns local account cleanup.
     Removed(Pubkey),
     /// Confirmed account update in `Uninit` mode, before Engine materialization.
     Update {
@@ -108,9 +108,6 @@ pub(super) enum Event {
 
 pub(super) use pool::Pool;
 
-/// Provider capacity, subscription routing, and replacement connections.
 mod pool;
-/// Socket requests, acknowledgements, notifications, and timeouts.
 mod session;
-/// TCP/TLS connection setup and WebSocket upgrade.
 mod transport;
