@@ -166,12 +166,18 @@ impl ChainSync {
     /// but does not imply completion of any scheduled on-chain rescue. Batches can
     /// observe different slots, and errors do not roll back earlier materializations.
     ///
+    /// Returns the number of account entries fetched over HTTP, including companions,
+    /// action dependencies, and null results. Refetches in later acquisition waves
+    /// count again; provider retries do not. Empty or entirely resident requests
+    /// return zero. Background stream work and AML requests are excluded;
+    /// errors do not expose a partial count.
+    ///
     /// # Input requirements
     ///
     /// Writable and program pubkeys must be unique; repeated payer and read-only
     /// requests are collapsed. Requested accounts must not overlap a program's
     /// derived ProgramData address.
-    pub async fn sync<I>(&self, requests: I) -> Result<()>
+    pub async fn sync<I>(&self, requests: I) -> Result<usize>
     where
         I: IntoIterator,
         I::Item: Borrow<ChainSyncAccount>,

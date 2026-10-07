@@ -19,12 +19,13 @@ use crate::{
 
 impl ChainSync {
     /// Acquires action dependencies before activating the delegations that need them.
-    pub(super) async fn sync_waves(&self, mut accounts: Vec<ChainSyncAccount>) -> Result<()> {
+    pub(super) async fn sync_waves(&self, mut accounts: Vec<ChainSyncAccount>) -> Result<usize> {
         let _timer = metrics::time(Op::ChainSync);
+        let mut count = 0;
         accounts.sort_unstable_by_key(|account| account.pubkey);
         accounts.dedup_by_key(|account| account.pubkey);
         // Keep the initial WebSocket subscription while refetching an account with its companion.
-        let mut carried_subscriptions = BTreeSet::new();
+        let mut subs = BTreeSet::new();
         let mut floor = None;
         let mut deferred = Vec::new();
         while !accounts.is_empty() {
@@ -45,21 +46,21 @@ impl ChainSync {
                     end += 1;
                 }
                 let batch = &accounts[start..end];
-                let outcome = match self.sync_batch(batch, &carried_subscriptions, floor).await {
+                let outcome = match self.sync_batch(batch, &subs, floor, &mut count).await {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.unsubscribe(carried_subscriptions).await;
+                        self.unsubscribe(subs).await;
                         return Err(error);
                     }
                 };
                 next_floor = next_floor.max(outcome.promotion_slot);
                 delegations.extend(outcome.delegations);
                 for request in batch {
-                    carried_subscriptions.remove(&request.pubkey);
+                    subs.remove(&request.pubkey);
                 }
                 for ChainSyncAccount { pubkey, property } in outcome.promotions {
                     next.insert(pubkey, property);
-                    carried_subscriptions.insert(pubkey);
+                    subs.insert(pubkey);
                 }
                 start = end;
             }
@@ -71,7 +72,7 @@ impl ChainSync {
                 let (prepared, dependencies) = match self.prepare_delegation(delegation) {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        self.unsubscribe(carried_subscriptions).await;
+                        self.unsubscribe(subs).await;
                         return Err(error);
                     }
                 };
@@ -102,7 +103,7 @@ impl ChainSync {
                 self.unsubscribe([pubkey]).await;
             }
         }
-        Ok(())
+        Ok(count)
     }
 
     /// Acquires missing accounts and reports follow-up work after releasing their leases.
@@ -111,6 +112,7 @@ impl ChainSync {
         batch: &[ChainSyncAccount],
         carried_subscriptions: &BTreeSet<Pubkey>,
         min_slot: Option<u64>,
+        count: &mut usize,
     ) -> Result<BatchOutcome> {
         // Engine rechecks presence under ordered leases, preventing overlapping syncs from
         // fetching the same missing accounts.
@@ -124,9 +126,10 @@ impl ChainSync {
         self.subscribe(&plan.subscriptions).await?;
         let fetched = async {
             let mut snapshot = self.fetcher.fetch(&plan.keys, min_slot).await?;
+            *count += plan.keys.len();
             let prune = plan.subscriptions_to_remove(&snapshot);
             program::normalize_batch(&plan.programs, &mut snapshot.accounts, self.engine.rent())?;
-            let projected = self.fetch_ata_companions(&plan, &snapshot).await?;
+            let projected = self.fetch_ata_companions(&plan, &snapshot, count).await?;
             Ok((snapshot, prune, projected))
         }
         .await;
@@ -155,6 +158,7 @@ impl ChainSync {
         &self,
         plan: &FetchPlan<'_>,
         snapshot: &Snapshot,
+        count: &mut usize,
     ) -> Result<Vec<grpc::Delegation>> {
         let mut atas = Vec::new();
         for pending in &plan.accounts {
@@ -172,6 +176,7 @@ impl ChainSync {
                 keys.push(delegation_record_pda_from_delegated_account(&eata));
             }
             let companions = self.fetcher.fetch(&keys, Some(snapshot.slot)).await?;
+            *count += keys.len();
             for (&(pubkey, eata, base), pair) in
                 chunk.iter().zip(companions.accounts.chunks_exact(2))
             {

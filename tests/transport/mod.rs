@@ -296,7 +296,7 @@ pub async fn acquire(chain_sync: &ChainSync, accounts: &[ChainSyncAccount]) -> R
     loop {
         match chain_sync.sync(accounts).await {
             Err(Error::Subscribe(WebSocketError::Unavailable)) => continue,
-            result => return result,
+            result => return result.map(|_| ()),
         }
     }
 }
