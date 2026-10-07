@@ -8,7 +8,7 @@ use std::{
 };
 
 use nucleus::shutdown::{ShutdownHandle, ShutdownReason};
-use solana_account::{AccountBuilder, StateFlags};
+use solana_account::{AccountBuilder, AccountMode, StateFlags};
 use solana_pubkey::Pubkey;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tracing::error;
@@ -194,6 +194,8 @@ impl ChainSync {
     }
 
     /// Materializes a remote update under its own address, or under the program for ProgramData.
+    /// Ordinary updates are read-only while funded, uninitialized otherwise;
+    /// delegation transitions are supplied by specialized gRPC events.
     async fn apply(
         &self,
         subscription: AccountSubscription,
@@ -211,7 +213,8 @@ impl ChainSync {
             None if account.read().flags().contains(StateFlags::EXECUTABLE) => {
                 program::normalize(account, None, self.engine.rent())?
             }
-            None => account,
+            None if account.read().lamports() > 0 => account.mode(AccountMode::ReadOnly),
+            None => account.mode(AccountMode::Uninit),
         };
         accessor.materialize(account, None).await?;
         Ok(())
